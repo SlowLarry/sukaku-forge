@@ -1,0 +1,619 @@
+//! Stateful application boundary shared by graphical Sukaku Forge clients.
+//!
+//! The session owns the mutable grid and solver. Clients receive immutable
+//! primitive snapshots and opaque hint handles; they never apply an inference
+//! payload supplied by the client.
+
+pub mod port;
+
+use core::array;
+use core::fmt;
+
+use sukaku_forge_core::{
+    CandidateMask, CandidateRemovals, CellId, Digit, Grid, NonConsecutiveMode,
+};
+use sukaku_forge_engine::{
+    Inference, PortGap, PresentationSearchOutcome, SelectedChainProof, Solver,
+};
+use sukaku_forge_presentation::{
+    HintPresentation, UnsupportedPresentation, present, present_with_selected_chain_proof,
+};
+
+/// Opaque identity of an inference retained by one [`Session`].
+///
+/// Clients may compare and return this value, but cannot construct one.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct HintId(u64);
+
+/// Exact frontend-facing state at one session revision.
+///
+/// Values are zero for unresolved cells. Candidate masks use Java-compatible
+/// bits 1 through 9 (`0x03fe` is the full mask).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionSnapshot {
+    pub revision: u64,
+    pub values: [u8; CellId::COUNT],
+    pub candidate_masks: [u16; CellId::COUNT],
+    pub givens: [bool; CellId::COUNT],
+    pub can_undo: bool,
+    pub can_redo: bool,
+}
+
+/// Result of asking the selected compatibility solver for its next inference.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NextHintResponse {
+    pub revision: u64,
+    pub outcome: NextHintOutcome,
+}
+
+/// Exact application effects retained alongside a hint presentation.
+///
+/// The sparse removals preserve producer order. Transport adapters may derive
+/// an elimination count with [`CandidateRemovals::elimination_count`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HintEffects {
+    pub placement: Option<(CellId, Digit)>,
+    pub removals: CandidateRemovals,
+}
+
+impl HintEffects {
+    fn from_inference(inference: &Inference) -> Self {
+        Self {
+            placement: inference.placement_cell().zip(inference.placement_digit()),
+            removals: inference.removals().clone(),
+        }
+    }
+}
+
+/// Complete next-hint result without exposing the retained [`Inference`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum NextHintOutcome {
+    Presented {
+        hint_id: HintId,
+        presentation: HintPresentation,
+        effects: HintEffects,
+    },
+    Unsupported {
+        hint_id: HintId,
+        unsupported: UnsupportedPresentation,
+        effects: HintEffects,
+    },
+    None,
+    Incomplete {
+        gap: PortGap,
+    },
+}
+
+/// Rejected application command. Rejections never mutate the session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionError {
+    StaleRevision { expected: u64, actual: u64 },
+    UnknownHint { hint_id: HintId },
+    NothingToUndo,
+    NothingToRedo,
+    GivenCell { cell: CellId },
+    SolvedCell { cell: CellId },
+    CandidateUnavailable { cell: CellId, digit: Digit },
+    CandidateConflicts { cell: CellId, digit: Digit },
+}
+
+impl fmt::Display for SessionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::StaleRevision { expected, actual } => {
+                write!(
+                    formatter,
+                    "stale session revision {expected}; current revision is {actual}"
+                )
+            }
+            Self::UnknownHint { hint_id } => {
+                write!(
+                    formatter,
+                    "hint {hint_id:?} is not pending for this revision"
+                )
+            }
+            Self::NothingToUndo => formatter.write_str("there is no session change to undo"),
+            Self::NothingToRedo => formatter.write_str("there is no session change to redo"),
+            Self::GivenCell { cell } => write!(formatter, "{cell} is a given cell"),
+            Self::SolvedCell { cell } => write!(formatter, "{cell} already has a value"),
+            Self::CandidateUnavailable { cell, digit } => {
+                write!(formatter, "candidate {digit} is not available in {cell}")
+            }
+            Self::CandidateConflicts { cell, digit } => {
+                write!(
+                    formatter,
+                    "candidate {digit} conflicts with a placed value at {cell}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionError {}
+
+#[derive(Clone, Debug)]
+struct PendingHint {
+    id: HintId,
+    inference: Inference,
+    selected_chain_proof: Option<SelectedChainProof>,
+}
+
+/// One authoritative puzzle editing and solving session.
+#[derive(Clone, Debug)]
+pub struct Session {
+    grid: Grid,
+    solver: Solver,
+    revision: u64,
+    history: Vec<Grid>,
+    future: Vec<Grid>,
+    pending_hint: Option<PendingHint>,
+    next_hint_id: u64,
+}
+
+impl Session {
+    #[must_use]
+    pub const fn new(grid: Grid, solver: Solver) -> Self {
+        Self {
+            grid,
+            solver,
+            revision: 0,
+            history: Vec::new(),
+            future: Vec::new(),
+            pending_hint: None,
+            next_hint_id: 1,
+        }
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> SessionSnapshot {
+        SessionSnapshot {
+            revision: self.revision,
+            values: array::from_fn(|index| self.grid.value(cell(index))),
+            candidate_masks: array::from_fn(|index| self.grid.candidates(cell(index)).bits()),
+            givens: array::from_fn(|index| self.grid.givens().contains(cell(index))),
+            can_undo: !self.history.is_empty(),
+            can_redo: !self.future.is_empty(),
+        }
+    }
+
+    /// Find and retain the next inference for the current revision.
+    ///
+    /// Repeated calls without a mutation reuse the retained inference and its
+    /// opaque ID, avoiding both a repeated search and observable ID churn.
+    #[must_use]
+    pub fn next_hint(&mut self) -> NextHintResponse {
+        if self.pending_hint.is_none() {
+            match self.solver.next_inference_with_selected_proof(&self.grid) {
+                PresentationSearchOutcome::Found(selected) => {
+                    let (inference, selected_chain_proof) = selected.into_parts();
+                    let id = self.allocate_hint_id();
+                    self.pending_hint = Some(PendingHint {
+                        id,
+                        inference,
+                        selected_chain_proof,
+                    });
+                }
+                PresentationSearchOutcome::None => {
+                    return NextHintResponse {
+                        revision: self.revision,
+                        outcome: NextHintOutcome::None,
+                    };
+                }
+                PresentationSearchOutcome::Incomplete(gap) => {
+                    return NextHintResponse {
+                        revision: self.revision,
+                        outcome: NextHintOutcome::Incomplete { gap },
+                    };
+                }
+            }
+        }
+
+        let pending = self
+            .pending_hint
+            .as_ref()
+            .expect("a found inference is retained");
+        let presented = if let Some(proof) = pending.selected_chain_proof.as_ref() {
+            present_with_selected_chain_proof(&self.grid, &pending.inference, proof)
+        } else {
+            present(&self.grid, &pending.inference)
+        };
+        let outcome = match presented {
+            Ok(presentation) => NextHintOutcome::Presented {
+                hint_id: pending.id,
+                presentation,
+                effects: HintEffects::from_inference(&pending.inference),
+            },
+            Err(unsupported) => NextHintOutcome::Unsupported {
+                hint_id: pending.id,
+                unsupported,
+                effects: HintEffects::from_inference(&pending.inference),
+            },
+        };
+        NextHintResponse {
+            revision: self.revision,
+            outcome,
+        }
+    }
+
+    /// Apply the exact retained inference, never a client-supplied effect.
+    pub fn apply_hint(
+        &mut self,
+        expected_revision: u64,
+        hint_id: HintId,
+    ) -> Result<SessionSnapshot, SessionError> {
+        self.require_revision(expected_revision)?;
+        let Some(pending) = self.pending_hint.as_ref() else {
+            return Err(SessionError::UnknownHint { hint_id });
+        };
+        if pending.id != hint_id {
+            return Err(SessionError::UnknownHint { hint_id });
+        }
+
+        let pending = self
+            .pending_hint
+            .take()
+            .expect("the checked pending inference exists");
+        self.push_history();
+        pending.inference.apply(&mut self.grid);
+        self.advance_revision();
+        Ok(self.snapshot())
+    }
+
+    /// Place an available candidate as a value using normal grid propagation.
+    pub fn place_value(
+        &mut self,
+        expected_revision: u64,
+        cell: CellId,
+        digit: Digit,
+    ) -> Result<SessionSnapshot, SessionError> {
+        self.require_revision(expected_revision)?;
+        self.require_editable(cell)?;
+        if !self.grid.candidates(cell).contains(digit) {
+            return Err(SessionError::CandidateUnavailable { cell, digit });
+        }
+        self.push_history();
+        self.grid.place(cell, digit);
+        self.advance_revision();
+        Ok(self.snapshot())
+    }
+
+    /// Toggle a pencilmark while preserving all currently placed constraints.
+    pub fn toggle_candidate(
+        &mut self,
+        expected_revision: u64,
+        cell: CellId,
+        digit: Digit,
+    ) -> Result<SessionSnapshot, SessionError> {
+        self.require_revision(expected_revision)?;
+        self.require_editable(cell)?;
+        let current = self.grid.candidates(cell);
+        let next = if current.contains(digit) {
+            current.without(CandidateMask::of(digit))
+        } else {
+            if !self.candidate_allowed_by_values(cell, digit) {
+                return Err(SessionError::CandidateConflicts { cell, digit });
+            }
+            current.union(CandidateMask::of(digit))
+        };
+        self.push_history();
+        self.grid.set_candidates(cell, next);
+        self.advance_revision();
+        Ok(self.snapshot())
+    }
+
+    /// Restore the previous exact grid, including all candidate masks.
+    pub fn undo(&mut self, expected_revision: u64) -> Result<SessionSnapshot, SessionError> {
+        self.require_revision(expected_revision)?;
+        let Some(previous) = self.history.pop() else {
+            return Err(SessionError::NothingToUndo);
+        };
+        self.future.push(self.grid.clone());
+        self.grid = previous;
+        self.pending_hint = None;
+        self.advance_revision();
+        Ok(self.snapshot())
+    }
+
+    /// Restore the next exact grid that was displaced by [`Session::undo`].
+    pub fn redo(&mut self, expected_revision: u64) -> Result<SessionSnapshot, SessionError> {
+        self.require_revision(expected_revision)?;
+        let Some(next) = self.future.pop() else {
+            return Err(SessionError::NothingToRedo);
+        };
+        self.history.push(self.grid.clone());
+        self.grid = next;
+        self.pending_hint = None;
+        self.advance_revision();
+        Ok(self.snapshot())
+    }
+
+    fn require_revision(&self, expected: u64) -> Result<(), SessionError> {
+        if expected == self.revision {
+            Ok(())
+        } else {
+            Err(SessionError::StaleRevision {
+                expected,
+                actual: self.revision,
+            })
+        }
+    }
+
+    fn require_editable(&self, cell: CellId) -> Result<(), SessionError> {
+        if self.grid.givens().contains(cell) {
+            Err(SessionError::GivenCell { cell })
+        } else if self.grid.value(cell) != 0 {
+            Err(SessionError::SolvedCell { cell })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn candidate_allowed_by_values(&self, source: CellId, digit: Digit) -> bool {
+        if self
+            .grid
+            .topology()
+            .visible_peers(source)
+            .iter()
+            .any(|&raw| self.grid.value(CellId::new(raw).expect("topology peer")) == digit.get())
+        {
+            return false;
+        }
+
+        let Some(neighbors) = self.grid.topology().forbidden_pair_neighbors(source) else {
+            return true;
+        };
+        let mode = self.grid.topology().config().non_consecutive;
+        neighbors.iter().all(|&raw| {
+            let other = self
+                .grid
+                .value(CellId::new(raw).expect("topology neighbor"));
+            other == 0 || !digits_are_forbidden_neighbors(digit.get(), other, mode)
+        })
+    }
+
+    fn push_history(&mut self) {
+        self.history.push(self.grid.clone());
+        self.future.clear();
+        self.pending_hint = None;
+    }
+
+    fn advance_revision(&mut self) {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("session revision space exhausted");
+    }
+
+    fn allocate_hint_id(&mut self) -> HintId {
+        let id = HintId(self.next_hint_id);
+        self.next_hint_id = self
+            .next_hint_id
+            .checked_add(1)
+            .expect("session hint ID space exhausted");
+        id
+    }
+}
+
+fn cell(index: usize) -> CellId {
+    CellId::new(index as u8).expect("81-cell array index")
+}
+
+fn digits_are_forbidden_neighbors(first: u8, second: u8, mode: NonConsecutiveMode) -> bool {
+    let distance = first.abs_diff(second);
+    distance == 1 || mode.is_cyclic() && distance == 8
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use sukaku_forge_core::{ConstraintTopology, Puzzle, VariantConfig};
+    use sukaku_forge_engine::Technique;
+
+    use super::{NextHintOutcome, Session, SessionError, Solver};
+
+    fn classic_session(puzzle: &str) -> Session {
+        let puzzle = Puzzle::parse(puzzle).unwrap();
+        let topology = Arc::new(ConstraintTopology::new(VariantConfig::default()));
+        Session::new(
+            sukaku_forge_core::Grid::from_puzzle(topology, &puzzle),
+            Solver::default(),
+        )
+    }
+
+    fn selected_fcc_session() -> Session {
+        let values = Puzzle::parse(
+            "....4.8.....5.8.14..4.......5....4..4.285.....3.49......5.63.4..4.7.5.6.....84...",
+        )
+        .unwrap();
+        let candidates = Puzzle::parse(
+            "1.3.567.912...67.91.3...7.9123..6......4......2...67.9.......8..23.5.7.9.23.567.9.23..67.9.2...67....3..67.9....5.....2....7.........8..23..67.91...........4.....123.5..8.1....6789...4.....1.3..6...123...7........7.9.2..56....2..5.7.9.2..567.91....67.9....5....1....6789.23..6.....3...7..12...67.....4......2....789.2...67.9...4.....1....67.9.2..............8.....5....1.....7..1....67....3...7.91.3..67.91....67....3......1......8....4.............912...67..12....7...2..5.78.12..5.7..12....7891......89....5....1.......9.....6.....3......12....7.....4.....12....78912.....89...4.....1.......9......7..12...........5....123.....9.....6...123....89123..67.912...6..9..3..67..12......9.......8....4.....1...5.7.9.2....7.912..5.7.9",
+        )
+        .unwrap();
+        let grid = sukaku_forge_core::Grid::from_snapshot(
+            Arc::new(ConstraintTopology::new(VariantConfig {
+                anti_knight: true,
+                ..VariantConfig::default()
+            })),
+            &values,
+            &candidates,
+        )
+        .unwrap();
+        Session::new(grid, Solver::default())
+    }
+
+    #[test]
+    fn supported_hidden_single_round_trips_through_presentation_and_server_apply() {
+        let mut session = classic_session(
+            "12345678.........................................................................",
+        );
+        let response = session.next_hint();
+        assert_eq!(response.revision, 0);
+        let NextHintOutcome::Presented {
+            hint_id,
+            presentation,
+            effects,
+        } = response.outcome
+        else {
+            panic!("hidden single must have a supported presentation");
+        };
+        assert_eq!(presentation.identity.technique, Technique::HiddenSingle);
+        assert_eq!(presentation.views.len(), 1);
+        assert_eq!(presentation.views[0].candidate_marks.len(), 1);
+        assert_eq!(effects.placement.unwrap().0.raw(), 8);
+        assert_eq!(effects.placement.unwrap().1.get(), 9);
+        assert!(effects.removals.is_empty());
+
+        let applied = session.apply_hint(0, hint_id).unwrap();
+        assert_eq!(applied.revision, 1);
+        assert_eq!(applied.values[8], 9);
+        assert!(applied.can_undo);
+        assert!(!applied.can_redo);
+    }
+
+    #[test]
+    fn stale_revision_and_wrong_hint_are_rejected_without_losing_pending_hint() {
+        let mut session = classic_session(
+            "12345678.........................................................................",
+        );
+        let first = session.next_hint();
+        let NextHintOutcome::Presented { hint_id, .. } = first.outcome else {
+            panic!("expected a presented hint");
+        };
+
+        assert_eq!(
+            session.apply_hint(7, hint_id),
+            Err(SessionError::StaleRevision {
+                expected: 7,
+                actual: 0,
+            })
+        );
+
+        let mut other = classic_session(
+            "12345678.........................................................................",
+        );
+        let NextHintOutcome::Presented {
+            hint_id: wrong_id, ..
+        } = other.next_hint().outcome
+        else {
+            panic!("expected another presented hint");
+        };
+        // IDs are session-local, so consume one ID before obtaining a distinct
+        // handle in the other session.
+        other.apply_hint(0, wrong_id).unwrap();
+        other.undo(1).unwrap();
+        let NextHintOutcome::Presented {
+            hint_id: wrong_id, ..
+        } = other.next_hint().outcome
+        else {
+            panic!("expected another presented hint");
+        };
+        assert_ne!(wrong_id, hint_id);
+        assert_eq!(
+            session.apply_hint(0, wrong_id),
+            Err(SessionError::UnknownHint { hint_id: wrong_id })
+        );
+
+        let applied = session.apply_hint(0, hint_id).unwrap();
+        assert_eq!(applied.values[8], 9);
+    }
+
+    #[test]
+    fn undo_and_redo_restore_exact_values_candidates_and_givens() {
+        let mut session = classic_session(
+            "12345678.........................................................................",
+        );
+        let before = session.snapshot();
+        let NextHintOutcome::Presented { hint_id, .. } = session.next_hint().outcome else {
+            panic!("expected a presented hint");
+        };
+        let applied = session.apply_hint(0, hint_id).unwrap();
+
+        let undone = session.undo(1).unwrap();
+        assert_eq!(undone.revision, 2);
+        assert_eq!(undone.values, before.values);
+        assert_eq!(undone.candidate_masks, before.candidate_masks);
+        assert_eq!(undone.givens, before.givens);
+        assert!(undone.can_redo);
+
+        let redone = session.redo(2).unwrap();
+        assert_eq!(redone.revision, 3);
+        assert_eq!(redone.values, applied.values);
+        assert_eq!(redone.candidate_masks, applied.candidate_masks);
+        assert_eq!(redone.givens, applied.givens);
+        assert!(!redone.can_redo);
+    }
+
+    #[test]
+    fn checked_edits_clear_pending_hints_and_participate_in_exact_history() {
+        let mut session = classic_session(&".".repeat(81));
+        let before = session.snapshot();
+        let edited = session
+            .toggle_candidate(
+                0,
+                sukaku_forge_core::CellId::new(0).unwrap(),
+                sukaku_forge_core::Digit::new(9).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(edited.revision, 1);
+        assert_eq!(edited.candidate_masks[0] & (1 << 9), 0);
+        let undone = session.undo(1).unwrap();
+        assert_eq!(undone.candidate_masks, before.candidate_masks);
+        let redone = session.redo(2).unwrap();
+        assert_eq!(redone.candidate_masks, edited.candidate_masks);
+    }
+
+    #[test]
+    fn checked_value_placement_propagates_and_conflicting_candidate_addition_is_rejected() {
+        let mut session = classic_session(&".".repeat(81));
+        let source = sukaku_forge_core::CellId::new(0).unwrap();
+        let peer = sukaku_forge_core::CellId::new(1).unwrap();
+        let five = sukaku_forge_core::Digit::new(5).unwrap();
+
+        let placed = session.place_value(0, source, five).unwrap();
+        assert_eq!(placed.revision, 1);
+        assert_eq!(placed.values[0], 5);
+        assert_eq!(placed.candidate_masks[1] & (1 << 5), 0);
+        assert_eq!(
+            session.toggle_candidate(1, peer, five),
+            Err(SessionError::CandidateConflicts {
+                cell: peer,
+                digit: five,
+            })
+        );
+        assert_eq!(session.revision(), 1, "a rejected edit is not a mutation");
+    }
+
+    #[test]
+    fn selected_fcc_proof_is_presented_once_and_retained_for_the_revision() {
+        let mut session = selected_fcc_session();
+        let first = session.next_hint();
+        let repeated = session.next_hint();
+        assert_eq!(repeated, first, "pending proof and hint ID are reused");
+
+        let NextHintOutcome::Presented {
+            presentation,
+            effects,
+            ..
+        } = first.outcome
+        else {
+            panic!("selected FCC must be presentation-complete");
+        };
+        assert_eq!(
+            presentation.identity.technique,
+            Technique::ForcingChainCycle
+        );
+        assert_eq!(presentation.views.len(), 1);
+        assert_eq!(presentation.views[0].key, "forcing");
+        assert_eq!(presentation.views[0].label, "Forcing chain");
+        assert!(!presentation.views[0].links.is_empty());
+        assert!(effects.placement.is_none());
+        assert_eq!(effects.removals.elimination_count(), 1);
+    }
+}

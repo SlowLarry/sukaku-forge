@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/1to9only/PGExplainer.git",
+  "commit": "2f356d6cffbe45e1e7525c2df9ff383b861ada2d",
+  "tag_baseline": "2022.4.4",
+  "main_class": "sudoku.serate",
+  "jar_sha256": "f6e6e3707ba7e774d15125c886a60efffe15717015983757856b186e5a0df525",
+  "jar_size": 87179,
+  "jar_timestamp": "2022-07-04T08:38:38Z",
+  "java_release": 8
+}
