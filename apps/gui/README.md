@@ -39,6 +39,12 @@ npm run tauri -- dev
 npm run tauri -- build
 ```
 
+The repository's `Windows desktop` GitHub Actions workflow builds both NSIS
+`.exe` and WiX `.msi` installers. Pushes to `main` and manual runs retain them
+as workflow artifacts; matching `v*` tags also create a draft GitHub Release.
+These packages are unsigned until Windows Authenticode signing credentials are
+configured.
+
 Production session state comes only from authoritative Rust snapshots through
 the validated protocol-v2 `ApplicationPort`. The typed Classic fixture remains
 only for test-only renderer, component and session-view coverage.
@@ -62,7 +68,7 @@ session undo belong to the Rust app/session layer.
 The current shell boots a built-in Classic puzzle and supports next/apply,
 value placement, candidate toggling, undo and redo. Value clearing,
 new/open/save, all-hints/Solve, generation, cooperative cancellation and
-distributable packaging remain follow-up work.
+signed releases plus macOS/Linux packaging remain follow-up work.
 
 See [DESIGN.md](DESIGN.md) for the design tokens and
 [../../docs/GUI_ARCHITECTURE.md](../../docs/GUI_ARCHITECTURE.md) for the full

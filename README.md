@@ -82,6 +82,18 @@ make build-pgexplainer
 python3 scripts/benchmark-java-rust.py --runs 3
 ```
 
+## Windows packages
+
+The `Windows desktop` GitHub Actions workflow builds the Tauri `.exe` and
+`.msi` installers on a native Windows runner. Pushes to `main` and manual runs
+store the installers as downloadable workflow artifacts. Pushing a tag that
+exactly matches the application version, such as `v0.1.0`, additionally creates
+a draft GitHub Release with those installers attached.
+
+The packages are currently unsigned development builds. Windows may display a
+SmartScreen warning until an Authenticode certificate is configured for the
+release workflow.
+
 `make build-native` writes a host-tuned binary to
 `target/native/release/sukaku-forge`. It is intended for local rating and
 benchmark runs only: `target-cpu=native` can select instructions unavailable
