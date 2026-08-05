@@ -138,6 +138,9 @@ export function Board({ board, topology, view, selected, candidatesVisible, onSe
           className="sudoku-board"
           viewBox={`0 0 ${BOARD} ${BOARD}`}
           role="grid"
+          aria-rowcount={9}
+          aria-colcount={9}
+          aria-activedescendant={selected ? `sudoku-cell-${selected.row}-${selected.col}` : undefined}
           aria-label={selected ? `Sudoku board, selected row ${selected.row + 1}, column ${selected.col + 1}` : 'Sudoku board, no cell selected'}
           tabIndex={0}
           onPointerDown={handlePointer}
@@ -151,7 +154,7 @@ export function Board({ board, topology, view, selected, candidatesVisible, onSe
             <filter id="selected-glow" x="-30%" y="-30%" width="160%" height="160%"><feDropShadow dx="0" dy="0" stdDeviation="4" floodColor="#1769ff" floodOpacity=".18" /></filter>
           </defs>
 
-          {/* 1. Permanent supported topology supplied by the fixture. */}
+          {/* 1. Permanent supported topology supplied by the active session. */}
           <rect width={BOARD} height={BOARD} className="board-paper" />
           {topology.paths.flatMap((path) => path.cells.map((pathCell) => (
             <rect key={`${path.id}-${cellKey(pathCell)}`} x={pathCell.col * CELL} y={pathCell.row * CELL} width={CELL} height={CELL} className="topology-wash topology-wash--diagonal"><title>{path.label}</title></rect>
@@ -187,7 +190,15 @@ export function Board({ board, topology, view, selected, candidatesVisible, onSe
 
           {/* 5. Values. */}
           {board.values.map((value, index) => value == null ? null : (
-            <text key={`value-${index}`} x={(index % 9) * CELL + CELL / 2} y={Math.floor(index / 9) * CELL + 68} className="cell-value" textAnchor="middle">{value}</text>
+            <text
+              key={`value-${index}`}
+              x={(index % 9) * CELL + CELL / 2}
+              y={Math.floor(index / 9) * CELL + 68}
+              className={`cell-value cell-value--${board.givens?.[index] ? 'given' : 'entered'}`}
+              textAnchor="middle"
+            >
+              {value}
+            </text>
           ))}
 
           {/* 6. Group membership and chain links remain presentation-only layers below candidate glyphs. */}
@@ -238,12 +249,39 @@ export function Board({ board, topology, view, selected, candidatesVisible, onSe
           })}
 
           {/* 8. Selection and pointer target. */}
+          <g className="board-grid-semantics">
+            {Array.from({ length: 9 }, (_, row) => (
+              <g key={`semantic-row-${row}`} role="row" aria-rowindex={row + 1}>
+                {Array.from({ length: 9 }, (_, col) => {
+                  const index = row * 9 + col
+                  const value = board.values[index]
+                  const isGiven = Boolean(board.givens?.[index])
+                  return (
+                    <rect
+                      key={`semantic-cell-${row}-${col}`}
+                      id={`sudoku-cell-${row}-${col}`}
+                      role="gridcell"
+                      aria-colindex={col + 1}
+                      aria-readonly={isGiven || undefined}
+                      aria-selected={selected?.row === row && selected.col === col ? true : undefined}
+                      aria-label={`${cellName({ row, col })}, ${value == null ? 'empty' : `${isGiven ? 'given' : 'entered'} value ${value}`}`}
+                      x={col * CELL}
+                      y={row * CELL}
+                      width={CELL}
+                      height={CELL}
+                      className="board-gridcell-semantic"
+                    />
+                  )
+                })}
+              </g>
+            ))}
+          </g>
           {selected && <rect x={selected.col * CELL + 4} y={selected.row * CELL + 4} width={CELL - 8} height={CELL - 8} rx="5" className="board-selection" filter="url(#selected-glow)" />}
           <rect width={BOARD} height={BOARD} fill="transparent" className="board-hit-target"><title>{selected ? `Selected r${selected.row + 1}c${selected.col + 1}` : 'Select a cell'}</title></rect>
         </svg>
       </div>
       <div className="board-help">
-        <span><kbd>↑↓←→</kbd> Move</span><span><kbd>1–9</kbd> Enter</span><span><kbd>Del</kbd> Clear</span><span><kbd>Esc</kbd> Deselect</span>
+        <span><kbd>↑↓←→</kbd> Move</span><span><kbd>1–9</kbd> Enter</span><span><kbd>M</kbd> Candidates</span><span><kbd>Esc</kbd> Deselect</span>
       </div>
     </section>
   )

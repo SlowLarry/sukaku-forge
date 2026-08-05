@@ -1,21 +1,32 @@
+export type StatusState = 'idle' | 'running' | 'error'
+
 interface StatusBarProps {
+  state: StatusState
   message: string
-  progress: number
+  revision?: string
+  clueCount?: number
 }
 
-export function StatusBar({ message, progress }: StatusBarProps) {
+export function StatusBar({ state, message, revision, clueCount }: StatusBarProps) {
   return (
-    <footer className="status-bar">
-      <span className="status-message" role="status" aria-live="polite" aria-atomic="true"><i aria-hidden="true" /> {message}</span>
-      <span className="puzzle-meta">Puzzle: <strong>Classic Example 02</strong><b />37 clues</span>
-      <div className="analysis-progress">
-        <span>Analyzing…</span>
-        <div className="progress-track" aria-label="Analysis progress" role="progressbar" aria-valuenow={progress} aria-valuemin={0} aria-valuemax={100}>
-          <i style={{ width: `${progress}%` }} />
-        </div>
-        <strong>{progress}%</strong>
-        <button type="button" disabled title="Analysis cancellation is not connected yet">Cancel</button>
-      </div>
+    <footer className="status-bar" data-status-state={state}>
+      <span
+        className="status-message"
+        role={state === 'error' ? 'alert' : 'status'}
+        aria-live={state === 'error' ? 'assertive' : 'polite'}
+        aria-atomic="true"
+      >
+        <i aria-hidden="true" />
+        {message}
+      </span>
+      <span className="puzzle-meta">
+        Revision <strong>{revision ?? '—'}</strong>
+        <b aria-hidden="true" />
+        {clueCount == null ? 'Session not ready' : `${clueCount} given${clueCount === 1 ? '' : 's'}`}
+      </span>
+      <span className="status-mode" aria-hidden="true">
+        {state === 'running' ? 'Working' : state === 'error' ? 'Error' : 'Ready'}
+      </span>
     </footer>
   )
 }

@@ -70,4 +70,32 @@ describe('Board', () => {
     expect(markup).toContain('chain-link chain-link--implication')
     expect(markup).toContain('marker-end="url(#arrow-implication)"')
   })
+
+  it('exposes rows, cells, active selection, and given versus entered values', () => {
+    const values = Array<number | null>(81).fill(null)
+    values[0] = 5
+    values[1] = 4
+    const givens = Array<boolean>(81).fill(false)
+    givens[0] = true
+    const markup = renderToStaticMarkup(
+      <Board
+        board={{ values, candidateMasks: Array<number>(81).fill(0), givens }}
+        topology={{ regions: [], paths: [] }}
+        view={{ id: 'empty', label: 'Empty', candidateMarks: [], cellMarks: [], regions: [], links: [], chainCells: [] }}
+        selected={{ row: 2, col: 3 }}
+        candidatesVisible
+        onSelect={() => undefined}
+        onKeyDown={() => undefined}
+      />,
+    )
+
+    expect(markup.match(/role="row"/g)).toHaveLength(9)
+    expect(markup.match(/role="gridcell"/g)).toHaveLength(81)
+    expect(markup).toContain('aria-activedescendant="sudoku-cell-2-3"')
+    expect(markup).toContain('aria-label="r1c1, given value 5"')
+    expect(markup).toContain('cell-value cell-value--given')
+    expect(markup).toContain('cell-value cell-value--entered')
+    expect(markup).toContain('<kbd>M</kbd> Candidates')
+    expect(markup).not.toContain('<kbd>Del</kbd> Clear')
+  })
 })

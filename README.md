@@ -16,8 +16,10 @@ variant corpus.
 - `sukaku-forge-engine`: ordered logical inference and rating pipeline;
 - `sukaku-forge-presentation`: semantic hint views and versioned wire DTOs;
 - `sukaku-forge-app`: authoritative revisioned GUI sessions;
+- `sukaku-forge-wasm-api`: browser-worker lifetime and JSON-forwarding wrapper;
 - `sukaku-forge`: command-line application;
-- `apps/gui`: the shared React/SVG desktop and browser interface.
+- `apps/gui`: the shared React/SVG desktop and browser interface;
+- `apps/gui/src-tauri`: the native Tauri command shell.
 
 The current compatibility layer includes the ordered topology/state kernel and
 the complete ordinary direct-producer group: Hidden Single, Direct
@@ -75,6 +77,7 @@ cargo build --workspace --release
 make build-native
 make gui-check
 make gui-dev
+make build-web
 make build-pgexplainer
 python3 scripts/benchmark-java-rust.py --runs 3
 ```
@@ -181,9 +184,10 @@ toroidal Ferz/Wazir quirk.
 The GUI is React/TypeScript with a layered SVG board and semantic, color-free
 hint DTOs. A Rust `Session` owns the grid, retained hints, revision checks and
 exact undo/redo; clients replace their full snapshot after each mutation and
-can apply only an opaque server-retained hint ID. The current platform plan
-uses the same dispatcher in a WASM Web Worker for browsers and behind a Tauri
-command for desktop packaging. See
+can apply only an opaque server-retained hint ID. The browser runtime owns the
+dispatcher in a WASM module Worker. The native shell exposes the same
+dispatcher through a Tauri command that runs solver work on the blocking pool.
+See
 [`docs/GUI_ARCHITECTURE.md`](docs/GUI_ARCHITECTURE.md).
 
 ## License

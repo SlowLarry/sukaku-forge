@@ -43,8 +43,14 @@ sukaku-forge-presentation
 sukaku-forge-app
   authoritative session, revisions, retained hints and exact undo/redo
 
+sukaku-forge-wasm-api
+  wasm-bindgen lifetime and JSON-forwarding wrapper
+
 apps/gui
   React/TypeScript chrome and layered SVG renderer
+
+apps/gui/src-tauri
+  native Tauri command shell and blocking application-port dispatch
 ```
 
 Inference effects and explanation evidence remain separate. In particular,

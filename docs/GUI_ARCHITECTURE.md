@@ -50,10 +50,10 @@ mutation commands carry the revision they observed. A hint is represented to
 clients by an opaque decimal-string ID; apply accepts only that retained ID and
 the matching revision, then executes the server-owned `Inference`.
 
-Client-side effects are display-only. Stale replies are ignored using both the
-request ID and revision. A board edit invalidates the pending hint. The fixture
-reducer remains available for isolated renderer tests but is not a production
-Sudoku engine.
+Client-side effects are display-only. Rust rejects requests with stale
+revisions; the React controller ignores responses whose request ID is no longer
+current. A board edit invalidates the pending hint. The legacy test-only
+`boardReducer` and typed renderer fixture are not a production Sudoku engine.
 
 ## Protocol v2
 
@@ -75,12 +75,12 @@ chooses to expose that action.
 The browser build loads Rust/WASM once in a module Worker. Messages contain the
 same protocol JSON used by native tests, keeping synchronous solver work off
 the browser UI thread. Terminating the Worker would destroy the session, so
-Cancel remains disabled until the engine has cooperative cancellation points.
+Cancel is omitted until the engine has cooperative cancellation points.
 
 The desktop build stores `ApplicationPort` behind `Arc<Mutex<_>>`. Its Tauri
 command delegates blocking solver work away from the async runtime and returns
-the same response JSON. Tauri APIs are dynamically imported only by the desktop
-adapter so the browser bundle does not include them.
+the same response JSON. Tauri APIs are isolated in a dynamic chunk loaded only
+when `__TAURI_INTERNALS__` identifies the native runtime.
 
 ## React state
 
@@ -88,21 +88,26 @@ The application receives an asynchronous `ApplicationPort` dependency. It owns
 the latest authoritative snapshot, topology and pending presentation, plus
 ephemeral UI state such as selected cell, view, filters and busy/error status.
 Only one conflicting command is submitted at a time. Get all hints and Solve
-remain disabled until Rust exposes those operations; progress is shown only for
-real running work.
+are not exposed until Rust provides those operations; progress is shown only
+for real running work.
 
-## Delivery order
+## Delivery status
 
-1. Freeze semantic presentation and primitive wire DTOs with Rust and Vitest
-   contract fixtures.
-2. Connect a dependency-injected React session controller to create, next,
-   apply, edit, undo and redo.
-3. Add the WASM Worker adapter and a real browser smoke test.
-4. Add the Tauri adapter over the same dispatcher.
-5. Remove the fixture session from production while retaining renderer stories
-   and focused geometry tests.
-6. Add all-hints collection, persistence, generation and packaging only after
-   the single-hint path is stable.
+The stable single-hint path now includes:
+
+1. semantic presentation and protocol-v2 DTOs frozen by shared Rust/Vitest
+   golden fixtures;
+2. a dependency-injected React controller for create, next, apply, edit, undo
+   and redo;
+3. a WASM module Worker with generated-binding and Node smoke coverage, plus a
+   manual real-browser acceptance pass;
+4. a Tauri adapter over the same dispatcher; and
+5. an authoritative production workspace, with the typed fixture retained only
+   for renderer and geometry tests.
+
+Next work includes value clearing, new/open/save, all-hints collection, Solve,
+persistence, generation, cooperative cancellation, committed browser
+automation and distributable packaging.
 
 Normal Rust tests, clippy, formatting, GUI unit tests, type checking, lint and
 production build are required at every checkpoint. Protocol changes require an

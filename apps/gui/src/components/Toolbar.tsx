@@ -1,28 +1,27 @@
 import {
-  Bolt,
   Check,
-  ChevronDown,
   Eye,
   EyeOff,
-  FilePlus2,
-  FolderOpen,
-  ListTree,
   PencilLine,
   Redo2,
-  Save,
-  Settings,
-  SkipForward,
   Sparkles,
   Undo2,
 } from 'lucide-react'
 import { BrandMark } from './BrandMark'
 
 interface ToolbarProps {
+  busy: boolean
+  sessionReady: boolean
   canUndo: boolean
+  canRedo: boolean
+  canRequestHint: boolean
   canApply: boolean
   candidatesVisible: boolean
   candidateEntry: boolean
+  variantLabel: string
   onUndo: () => void
+  onRedo: () => void
+  onRequestHint: () => void
   onToggleCandidates: () => void
   onToggleCandidateEntry: () => void
   onApply: () => void
@@ -40,12 +39,12 @@ const ToolButton = ({
   icon: React.ReactNode
   disabled?: boolean
   active?: boolean
-  onClick?: () => void
+  onClick: () => void
   title?: string
 }) => (
   <button
     className={`tool-button${active ? ' is-active' : ''}`}
-    disabled={disabled || onClick == null}
+    disabled={disabled}
     onClick={onClick}
     aria-label={title ?? (typeof children === 'string' ? children : undefined)}
     aria-pressed={active == null ? undefined : active}
@@ -58,15 +57,24 @@ const ToolButton = ({
 )
 
 export function Toolbar({
+  busy,
+  sessionReady,
   canUndo,
+  canRedo,
+  canRequestHint,
   canApply,
   candidatesVisible,
   candidateEntry,
+  variantLabel,
   onUndo,
+  onRedo,
+  onRequestHint,
   onToggleCandidates,
   onToggleCandidateEntry,
   onApply,
 }: ToolbarProps) {
+  const boardControlsDisabled = busy || !sessionReady
+
   return (
     <header className="app-header">
       <div className="titlebar">
@@ -76,45 +84,52 @@ export function Toolbar({
         </div>
         <div className="window-dots" aria-hidden="true"><i /><i /><i /></div>
       </div>
-      <div className="toolbar" role="toolbar" aria-label="Puzzle actions">
-        <div className="tool-group">
-          <ToolButton icon={<FilePlus2 />} title="Create a new puzzle">New</ToolButton>
-          <ToolButton icon={<FolderOpen />} title="Open a puzzle">Open</ToolButton>
-          <ToolButton icon={<Save />} title="Save puzzle">Save</ToolButton>
+      <div className="toolbar" role="toolbar" aria-label="Puzzle actions" aria-busy={busy}>
+        <div className="tool-group history-controls">
+          <ToolButton icon={<Undo2 />} disabled={busy || !canUndo} onClick={onUndo}>Undo</ToolButton>
+          <ToolButton icon={<Redo2 />} disabled={busy || !canRedo} onClick={onRedo}>Redo</ToolButton>
         </div>
-        <div className="tool-group compact">
-          <ToolButton icon={<Undo2 />} disabled={!canUndo} onClick={onUndo}>Undo</ToolButton>
-          <ToolButton icon={<Redo2 />} disabled>Redo</ToolButton>
-        </div>
-        <label className="variant-select">
+        <div className="variant-label" aria-label={`Variant: ${variantLabel}`}>
           <span>Variant</span>
-          <button type="button" disabled aria-label="Select Sudoku variant" title="Variant selection is not connected yet">Classic Sudoku <ChevronDown /></button>
-        </label>
+          <strong>{variantLabel}</strong>
+        </div>
         <div className="tool-group board-controls">
           <ToolButton
             icon={<PencilLine />}
             active={candidateEntry}
+            disabled={boardControlsDisabled}
             onClick={onToggleCandidateEntry}
             title="Toggle candidate entry mode (M)"
           >Candidates</ToolButton>
           <button
             className="icon-button"
             onClick={onToggleCandidates}
+            disabled={boardControlsDisabled}
             title={candidatesVisible ? 'Hide candidates' : 'Show candidates'}
-            aria-label={candidatesVisible ? 'Hide candidates' : 'Show candidates'}
+            aria-label="Show candidates"
             aria-pressed={candidatesVisible}
             type="button"
           >
             {candidatesVisible ? <Eye /> : <EyeOff />}
           </button>
-          <button className="icon-button" title="Settings are not connected yet" aria-label="Settings" disabled type="button"><Settings /></button>
         </div>
         <div className="tool-group push-right action-group">
-          <ToolButton icon={<Sparkles />}>Get next hint</ToolButton>
-          <ToolButton icon={<ListTree />}>Get all hints</ToolButton>
-          <button className="primary-button" onClick={onApply} disabled={!canApply} aria-label="Apply selected hint" title={canApply ? 'Apply selected hint' : 'Select an individual hint to apply'} type="button"><Check /> <span>Apply hint</span></button>
-          <ToolButton icon={<SkipForward />}>Solve step</ToolButton>
-          <button className="icon-button overflow-action" title="More solver actions are not connected yet" aria-label="More solver actions" disabled type="button"><Bolt /></button>
+          <ToolButton
+            icon={<Sparkles />}
+            disabled={busy || !canRequestHint}
+            onClick={onRequestHint}
+            title="Get next hint"
+          >Next hint</ToolButton>
+          <button
+            className="primary-button"
+            onClick={onApply}
+            disabled={busy || !canApply}
+            aria-label="Apply active hint"
+            title={canApply ? 'Apply the active server-owned hint' : 'Request an applicable hint first'}
+            type="button"
+          >
+            <Check /> <span>Apply hint</span>
+          </button>
         </div>
       </div>
     </header>
