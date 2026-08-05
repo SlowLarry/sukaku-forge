@@ -1,5 +1,5 @@
 [package]
-name = "sukaku-forge-tauri"
+name = "sukaku-forge"
 version = "0.1.0"
 description = "Native Tauri shell for Sukaku Forge"
 edition = "2024"
