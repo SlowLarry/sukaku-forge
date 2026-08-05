@@ -75,4 +75,4 @@ jobs:
           uploadUpdaterSignatures: false
           uploadWorkflowArtifacts: true
           workflowArtifactNamePattern: sukaku-forge-[version]-windows-[arch]-[bundle]
-          releaseAssetNamePattern: sukaku-forge-[version]-windows-[arch][setup].[ext]
+          releaseAssetNamePattern: sukaku-forge-[version]-windows-[arch][setup][ext]
