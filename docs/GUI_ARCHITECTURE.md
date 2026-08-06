@@ -103,11 +103,23 @@ The stable single-hint path now includes:
    manual real-browser acceptance pass;
 4. a Tauri adapter over the same dispatcher; and
 5. an authoritative production workspace, with the typed fixture retained only
-   for renderer and geometry tests.
+   for renderer and geometry tests;
+6. semantic views for every evidence-backed non-chain family, plus selected
+   proof graphs for static forcing chains, Nishio, MFC, DFC, DFC+ and nested
+   forcing chains; and
+7. a legacy-shaped application menu with value-grid import, backed solver and
+   history actions, compatibility/variant presets and persistent light/dark
+   themes.
 
-Next work includes value clearing, new/open/save, all-hints collection, Solve,
-persistence, generation, cooperative cancellation, committed browser
-automation and distributable packaging.
+Advanced and nested forcing-chain views expose the selected outer proof DAG.
+Inner nested deductions are deliberately represented as typed `Derived` edges
+instead of retaining or inventing thousands of recursive proof graphs in the
+normal rating path.
+
+Next work includes value clearing, filesystem open/save, true all-hints
+collection, automatic Solve/Analyze, complete settings, persistence,
+generation, cooperative cancellation, committed browser automation and
+macOS/Linux packaging.
 
 Normal Rust tests, clippy, formatting, GUI unit tests, type checking, lint and
 production build are required at every checkpoint. Protocol changes require an

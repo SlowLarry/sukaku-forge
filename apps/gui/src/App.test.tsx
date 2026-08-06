@@ -6,6 +6,7 @@ import { boardTopology, initialCandidateMasks, initialValues, primaryHint } from
 import type { SessionControllerView } from './sessionController'
 
 const idleAction = vi.fn(async () => undefined)
+const createAction = vi.fn(async () => true)
 
 const session = (overrides: Partial<SessionControllerView> = {}): SessionControllerView => ({
   snapshot: {
@@ -23,9 +24,10 @@ const session = (overrides: Partial<SessionControllerView> = {}): SessionControl
   pendingRequestId: null,
   pendingCommand: null,
   error: null,
-  createSession: idleAction,
+  createSession: createAction,
   nextHint: idleAction,
   applyHint: idleAction,
+  applyAndNext: idleAction,
   placeValue: idleAction,
   toggleCandidate: idleAction,
   undo: idleAction,
@@ -70,8 +72,11 @@ describe('App', () => {
     expect(markup).toContain('Revision <strong>7</strong>')
     expect(markup).toContain('aria-label="Get next hint"')
     expect(markup).toContain('aria-label="Apply active hint"')
+    expect(markup).toContain('role="menubar"')
+    expect(markup).toContain('>File</button>')
+    expect(markup).toContain('>Options</button>')
     expect(markup).not.toContain('Get all hints')
-    expect(markup).not.toContain('Solve step')
+    expect(markup).toContain('Solve step')
     expect(markup).not.toContain('Open a puzzle')
   })
 

@@ -180,7 +180,7 @@ describe('session controller', () => {
       snapshot: snapshot('0'),
       topology: emptyTopology(),
     })
-    await pending
+    expect(await pending).toBe(true)
 
     expect(controller.getState()).toMatchObject({
       busy: false,
@@ -250,6 +250,88 @@ describe('session controller', () => {
       hintResult: null,
     })
     expect(controller.getState().snapshot?.values[8]).toBe(9)
+  })
+
+  it('does not request another hint when apply-and-next fails', async () => {
+    const port = new FakePort()
+    const controller = createSessionController(port)
+    await initialize(controller, port)
+
+    const next = controller.nextHint()
+    port.respond(1, {
+      response: 'next_hint',
+      revision: '0',
+      outcome: {
+        outcome: 'presented',
+        hint_id: '41',
+        presentation,
+        effects: { placement: { cell: 8, digit: 9 }, removals: [], elimination_count: 0 },
+      },
+    })
+    await next
+
+    const applyAndNext = controller.applyAndNext()
+    expect(port.requests[2]).toMatchObject({ command: 'apply_hint', hint_id: '41' })
+    port.respond(2, {
+      response: 'error',
+      error: { code: 'stale_revision', message: 'the session moved' },
+    })
+    await applyAndNext
+
+    expect(port.requests.map((request) => request.command)).toEqual([
+      'create_session',
+      'next_hint',
+      'apply_hint',
+    ])
+    expect(controller.getState()).toMatchObject({
+      busy: false,
+      error: { code: 'stale_revision' },
+      hint: { id: '41' },
+    })
+  })
+
+  it('requests the next hint only after apply-and-next accepts the new snapshot', async () => {
+    const port = new FakePort()
+    const controller = createSessionController(port)
+    await initialize(controller, port)
+
+    const next = controller.nextHint()
+    port.respond(1, {
+      response: 'next_hint',
+      revision: '0',
+      outcome: {
+        outcome: 'presented',
+        hint_id: '41',
+        presentation,
+        effects: { placement: { cell: 8, digit: 9 }, removals: [], elimination_count: 0 },
+      },
+    })
+    await next
+
+    const applyAndNext = controller.applyAndNext()
+    expect(port.requests).toHaveLength(3)
+    port.respond(2, { response: 'snapshot', snapshot: snapshot('1') })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(port.requests[3]).toMatchObject({
+      command: 'next_hint',
+      expected_revision: '1',
+    })
+    port.respond(3, {
+      response: 'next_hint',
+      revision: '1',
+      outcome: { outcome: 'none' },
+    })
+    await applyAndNext
+
+    expect(controller.getState()).toMatchObject({
+      busy: false,
+      snapshot: { revision: '1' },
+      hint: null,
+      hintResult: { kind: 'none' },
+      error: null,
+    })
   })
 
   it('sends value/candidate edits and undo/redo at the latest authoritative revision', async () => {
@@ -351,9 +433,11 @@ describe('session controller', () => {
     const port = new FakePort()
     const controller = createSessionController(port)
     const first = controller.createSession('1'.repeat(81))
-    await controller.createSession('2'.repeat(81))
+    const overlappingAccepted = await controller.createSession('2'.repeat(81))
 
+    expect(overlappingAccepted).toBe(false)
     expect(port.requests).toHaveLength(1)
+    expect(port.requests.map((request) => request.command)).toEqual(['create_session'])
     expect(controller.getState()).toMatchObject({
       busy: true,
       pendingCommand: 'create_session',
@@ -366,6 +450,7 @@ describe('session controller', () => {
     })
     await first
 
+    expect(port.requests).toHaveLength(1)
     expect(controller.getState()).toMatchObject({
       snapshot: { revision: '10' },
       topology: { regions: [{ label: 'First topology' }] },

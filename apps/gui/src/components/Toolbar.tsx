@@ -4,12 +4,14 @@ import {
   EyeOff,
   PencilLine,
   Redo2,
+  SkipForward,
   Sparkles,
   Undo2,
 } from 'lucide-react'
 import { BrandMark } from './BrandMark'
 
 interface ToolbarProps {
+  menubar?: React.ReactNode
   busy: boolean
   sessionReady: boolean
   canUndo: boolean
@@ -25,6 +27,7 @@ interface ToolbarProps {
   onToggleCandidates: () => void
   onToggleCandidateEntry: () => void
   onApply: () => void
+  onApplyAndContinue: () => void
 }
 
 const ToolButton = ({
@@ -57,6 +60,7 @@ const ToolButton = ({
 )
 
 export function Toolbar({
+  menubar,
   busy,
   sessionReady,
   canUndo,
@@ -72,6 +76,7 @@ export function Toolbar({
   onToggleCandidates,
   onToggleCandidateEntry,
   onApply,
+  onApplyAndContinue,
 }: ToolbarProps) {
   const boardControlsDisabled = busy || !sessionReady
 
@@ -84,6 +89,7 @@ export function Toolbar({
         </div>
         <div className="window-dots" aria-hidden="true"><i /><i /><i /></div>
       </div>
+      {menubar}
       <div className="toolbar" role="toolbar" aria-label="Puzzle actions" aria-busy={busy}>
         <div className="tool-group history-controls">
           <ToolButton icon={<Undo2 />} disabled={busy || !canUndo} onClick={onUndo}>Undo</ToolButton>
@@ -130,6 +136,12 @@ export function Toolbar({
           >
             <Check /> <span>Apply hint</span>
           </button>
+          <ToolButton
+            icon={<SkipForward />}
+            disabled={busy || !canApply}
+            onClick={onApplyAndContinue}
+            title="Apply the active hint and request the next"
+          >Solve step</ToolButton>
         </div>
       </div>
     </header>

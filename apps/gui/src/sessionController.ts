@@ -139,9 +139,10 @@ export interface CreateSessionOptions {
 }
 
 export interface SessionControllerActions {
-  createSession(puzzle: string, options?: CreateSessionOptions): Promise<void>
+  createSession(puzzle: string, options?: CreateSessionOptions): Promise<boolean>
   nextHint(): Promise<void>
   applyHint(): Promise<void>
+  applyAndNext(): Promise<void>
   placeValue(cell: CellRef, digit: number): Promise<void>
   toggleCandidate(candidate: CandidateRef): Promise<void>
   undo(): Promise<void>
@@ -181,7 +182,7 @@ class InjectedSessionController implements SessionController {
       ...(options.variant == null ? {} : { variant: options.variant }),
       ...(options.engine == null ? {} : { engine: options.engine }),
     }
-    await this.dispatch(command, 'session_created')
+    return this.dispatch(command, 'session_created')
   }
 
   nextHint = async () => {
@@ -205,6 +206,29 @@ class InjectedSessionController implements SessionController {
       return
     }
     await this.dispatch({ command: 'apply_hint', expected_revision: revision, hint_id: hintId }, 'snapshot')
+  }
+
+  applyAndNext = async () => {
+    const revision = this.currentRevision()
+    if (revision == null) return
+    const hintResult = this.state.hintResult
+    const hintId = hintResult?.kind === 'presented' || hintResult?.kind === 'unsupported'
+      ? hintResult.hintId
+      : null
+    if (hintId == null) {
+      this.publish({
+        type: 'local-error',
+        error: controllerError('no_active_hint', 'request a presented hint before applying it'),
+      })
+      return
+    }
+
+    const applied = await this.dispatch(
+      { command: 'apply_hint', expected_revision: revision, hint_id: hintId },
+      'snapshot',
+    )
+    if (!applied) return
+    await this.nextHint()
   }
 
   placeValue = async (cell: CellRef, digit: number) => {
@@ -257,7 +281,7 @@ class InjectedSessionController implements SessionController {
     return requestId
   }
 
-  private async dispatch(command: ApplicationCommandDto, expectedResponse: ExpectedResponse) {
+  private async dispatch(command: ApplicationCommandDto, expectedResponse: ExpectedResponse): Promise<boolean> {
     if (this.state.busy) {
       this.publish({
         type: 'local-error',
@@ -266,7 +290,7 @@ class InjectedSessionController implements SessionController {
           `${this.state.pendingCommand ?? 'another command'} is already in progress`,
         ),
       })
-      return
+      return false
     }
 
     const requestId = this.allocateRequestId()
@@ -286,10 +310,10 @@ class InjectedSessionController implements SessionController {
         requestId,
         error: controllerError('transport_error', errorMessage(error)),
       })
-      return
+      return false
     }
 
-    if (!this.isCurrent(requestId)) return
+    if (!this.isCurrent(requestId)) return false
     if (response.request_id !== requestId) {
       this.publish({
         type: 'request-failed',
@@ -299,11 +323,11 @@ class InjectedSessionController implements SessionController {
           `response ${response.request_id} does not match request ${requestId}`,
         ),
       })
-      return
+      return false
     }
     if (response.response === 'error') {
       this.publish({ type: 'request-failed', requestId, error: response.error })
-      return
+      return false
     }
     if (response.response !== expectedResponse) {
       this.publish({
@@ -314,10 +338,11 @@ class InjectedSessionController implements SessionController {
           `${command.command} received ${response.response}; expected ${expectedResponse}`,
         ),
       })
-      return
+      return false
     }
 
     this.acceptResponse(requestId, response)
+    return !this.state.busy && this.state.error == null
   }
 
   private acceptResponse(
@@ -438,6 +463,7 @@ export function useSessionController(port: ApplicationPort): SessionControllerVi
     createSession: controller.createSession,
     nextHint: controller.nextHint,
     applyHint: controller.applyHint,
+    applyAndNext: controller.applyAndNext,
     placeValue: controller.placeValue,
     toggleCandidate: controller.toggleCandidate,
     undo: controller.undo,

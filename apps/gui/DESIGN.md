@@ -1,14 +1,14 @@
 # GUI design-system inventory
 
 This vertical slice implements the accepted 1580 × 1000 layout and design-token
-contract. Renderer and accessibility tests pin the code-native structure.
+contract. Renderer, interaction, and accessibility tests pin the code-native
+structure.
 
 ## Color system
 
-- Application and panel surfaces are true white (`#ffffff`). The small title-bar field uses cool slate `#f7f9fc`; no warm/off-white substitution is allowed.
-- Primary text is ink slate `#101828`, secondary text `#475467`, and quiet text `#667085`.
-- Dividers use `#d9e0ea`; control borders use `#cfd7e4`.
-- Primary action/selection is cobalt `#0b63f6`; its quiet fill is `#eaf2ff`.
+- Light mode uses white application/panel/board surfaces with cool slate chrome; dark mode supplies an equivalent deep-slate surface stack. Both modes use the same semantic CSS variables rather than component-local colors.
+- Light primary text is ink slate `#101828`; dark primary text is cool white `#f2f4f7`. Secondary and quiet text, dividers, grid strokes, values, candidates, and candidate halos all switch through theme tokens.
+- Primary action/selection is cobalt in light mode and a higher-luminance blue in dark mode. The explicit choice is persisted in versioned local storage; otherwise startup follows `prefers-color-scheme`.
 - Semantic Sudoku overlays are role-based: positive green `#12933b`, negative/elimination red `#e22b35`, auxiliary blue `#0b70c9`, grouped orange `#ed8b00`, and selected cobalt `#1769ff`. Technique data never supplies literal colors.
 - Permanent classic regions use a crisp dark boundary. The topology model also supports overlay regions and paths, but the fixture intentionally stays Classic so its givens and exact candidate masks remain honest. Hint-region fills are a separate, more saturated SVG layer.
 
@@ -21,14 +21,20 @@ contract. Renderer and accessibility tests pin the code-native structure.
 ## Geometry and density
 
 - Spacing scale: 4, 6, 8, 12, 16, 20, 24, 32 px.
-- Title bar 42 px; main toolbar 54 px; ordinary controls 34–36 px; status bar 34 px.
+- Title bar 42 px; application menubar 30 px; main toolbar 54 px; ordinary controls 34–36 px; status bar 34 px.
 - Panels are open rails separated by 1 px dividers. Controls use 5–7 px radii; panels do not become floating rounded cards.
-- Shadows are limited to the app frame, focused board cell, and popup-like controls. The core workspace is flat.
+- Shadows are limited to the app frame, focused board cell, menus, and modal dialogs. The core workspace is flat.
 - Board labels sit outside a square SVG. Fine grid lines are 1 px and classic block boundaries are 3 px. Board values are 40 px and candidates 17 px at the 900-unit design scale.
+
+## Command surfaces
+
+- The top-level order follows the legacy desktop vocabulary: File, Edit, Tools, Options, Variants, Help. Menus expose only actions backed by the current application-port/session surface.
+- Menu triggers and items use the WAI-ARIA menubar/menu roles with arrow, Home/End, and Escape navigation. Import and About are labelled modal dialogs with focus entry, Escape dismissal, and a contained Tab order.
+- Changing rating mode or a variant preset recreates the session from the tracked value grid. Those choices are disabled after an edit until undo returns to the original state; no client-side snapshot is treated as authoritative.
 
 ## SVG board layer order
 
-1. True-white board paper and permanent topology region washes, when supplied.
+1. Theme-owned board paper and permanent topology region washes, when supplied.
 2. Semantic hint-region backgrounds.
 3. Semantic cell fills/outlines.
 4. Fine grid and topology-supplied region/path boundaries (classic boxes in this fixture).

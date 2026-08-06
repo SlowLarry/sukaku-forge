@@ -2,7 +2,7 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import App from './App'
+import App, { DEFAULT_PUZZLE } from './App'
 import type {
   ApplicationPort,
   ApplicationRequestDto,
@@ -23,7 +23,11 @@ const deferred = <T,>(): Deferred<T> => {
   return { promise, resolve }
 }
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  window.localStorage.clear()
+  delete document.documentElement.dataset.theme
+})
 
 const responseAt = (index: number): ApplicationResponseDto => {
   const raw = structuredClone(golden.steps[index]!.response)
@@ -190,5 +194,144 @@ describe('live application flow', () => {
     })
     await waitFor(() => expect(currentRevision()).toBe('2'))
     expect(candidateCount()).toBe(candidatesBefore - 1)
+  })
+
+  it('imports canonical value grids, starts blank puzzles, switches theme, and opens About', async () => {
+    const initial = responseAt(0)
+    const dispatch = vi.fn(async (request: ApplicationRequestDto): Promise<ApplicationResponseDto> => {
+      if (request.command !== 'create_session') throw new Error(`unexpected command ${request.command}`)
+      return correlated(initial, request.request_id)
+    })
+
+    render(<App port={{ dispatch }} />)
+    await screen.findByRole('grid')
+
+    const fileMenu = screen.getByRole('menuitem', { name: 'File' })
+    fireEvent.click(fileMenu)
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Import 81-character string…' }))
+    fireEvent.keyDown(screen.getByRole('dialog', { name: 'Import value grid' }), { key: 'Escape' })
+    expect(document.activeElement).toBe(fileMenu)
+
+    fireEvent.click(fileMenu)
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Import 81-character string…' }))
+    fireEvent.change(screen.getByLabelText('81-character puzzle'), { target: { value: '0'.repeat(81) } })
+    fireEvent.click(screen.getByRole('button', { name: 'Import puzzle' }))
+
+    await waitFor(() => expect(dispatch).toHaveBeenCalledTimes(2))
+    expect(dispatch.mock.calls[1]?.[0]).toMatchObject({
+      command: 'create_session',
+      puzzle: '.'.repeat(81),
+    })
+
+    fireEvent.click(screen.getByRole('menuitem', { name: 'File' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'New blank puzzle' }))
+    await waitFor(() => expect(dispatch).toHaveBeenCalledTimes(3))
+    expect(dispatch.mock.calls[2]?.[0]).toMatchObject({
+      command: 'create_session',
+      puzzle: '.'.repeat(81),
+    })
+
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Options' }))
+    fireEvent.click(screen.getByRole('menuitemradio', { name: 'Dark theme' }))
+    expect(document.querySelector('.app-shell')?.getAttribute('data-theme')).toBe('dark')
+    expect(document.documentElement.dataset.theme).toBe('dark')
+    expect(window.localStorage.getItem('sukaku-forge:theme:v1')).toBe('dark')
+
+    const helpMenu = screen.getByRole('menuitem', { name: 'Help' })
+    fireEvent.click(helpMenu)
+    fireEvent.click(screen.getByRole('menuitem', { name: 'About Sukaku Forge' }))
+    expect(screen.getByRole('dialog', { name: 'About Sukaku Forge' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+    expect(screen.queryByRole('dialog', { name: 'About Sukaku Forge' })).toBeNull()
+    expect(document.activeElement).toBe(helpMenu)
+  })
+
+  it('recreates an unedited session for supported variant and rating choices', async () => {
+    const initial = responseAt(0)
+    const dispatch = vi.fn(async (request: ApplicationRequestDto): Promise<ApplicationResponseDto> => {
+      if (request.command !== 'create_session') throw new Error(`unexpected command ${request.command}`)
+      const response = correlated(initial, request.request_id)
+      if (response.response !== 'session_created') throw new Error('expected session-created fixture')
+      response.topology.variant.anti_knight = request.variant?.anti_knight ?? false
+      response.topology.variant.sudoku_x = request.variant?.sudoku_x ?? false
+      return response
+    })
+
+    render(<App port={{ dispatch }} />)
+    await screen.findByRole('grid')
+
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Variants' }))
+    fireEvent.click(screen.getByRole('menuitemradio', { name: 'Anti-knight' }))
+    await waitFor(() => expect(dispatch).toHaveBeenCalledTimes(2))
+    expect(dispatch.mock.calls[1]?.[0]).toMatchObject({
+      command: 'create_session',
+      variant: { blocks: true, anti_knight: true, sudoku_x: false },
+      engine: { rating_mode: 'original' },
+    })
+    await waitFor(() => expect(screen.getByLabelText('Variant: Anti-knight').textContent).toContain('Anti-knight'))
+
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Options' }))
+    fireEvent.click(screen.getByRole('menuitemradio', { name: 'Revised rating' }))
+    await waitFor(() => expect(dispatch).toHaveBeenCalledTimes(3))
+    expect(dispatch.mock.calls[2]?.[0]).toMatchObject({
+      command: 'create_session',
+      variant: { blocks: true, anti_knight: true, sudoku_x: false },
+      engine: { rating_mode: 'revised' },
+    })
+  })
+
+  it('keeps the accepted puzzle and rating mode when session recreation fails', async () => {
+    const initial = responseAt(0)
+    let createCount = 0
+    const dispatch = vi.fn(async (request: ApplicationRequestDto): Promise<ApplicationResponseDto> => {
+      if (request.command !== 'create_session') throw new Error(`unexpected command ${request.command}`)
+      createCount += 1
+      if (createCount === 2 || createCount === 4) {
+        return {
+          protocol_version: 2,
+          request_id: request.request_id,
+          response: 'error',
+          error: {
+            code: createCount === 2 ? 'invalid_puzzle' : 'engine_configuration_failed',
+            message: 'session recreation rejected',
+          },
+        }
+      }
+
+      const response = correlated(initial, request.request_id)
+      if (response.response !== 'session_created') throw new Error('expected session-created fixture')
+      response.topology.variant.anti_knight = request.variant?.anti_knight ?? false
+      response.topology.variant.sudoku_x = request.variant?.sudoku_x ?? false
+      return response
+    })
+
+    render(<App port={{ dispatch }} />)
+    await screen.findByRole('grid')
+
+    fireEvent.click(screen.getByRole('menuitem', { name: 'File' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Import 81-character string…' }))
+    fireEvent.change(screen.getByLabelText('81-character puzzle'), { target: { value: '1'.repeat(81) } })
+    fireEvent.click(screen.getByRole('button', { name: 'Import puzzle' }))
+    await waitFor(() => expect(dispatch).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('alert').textContent).toContain('invalid_puzzle')
+
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Variants' }))
+    fireEvent.click(screen.getByRole('menuitemradio', { name: 'Anti-knight' }))
+    await waitFor(() => expect(dispatch).toHaveBeenCalledTimes(3))
+    expect(dispatch.mock.calls[2]?.[0]).toMatchObject({
+      command: 'create_session',
+      puzzle: DEFAULT_PUZZLE,
+      engine: { rating_mode: 'original' },
+    })
+    await waitFor(() => expect(screen.getByLabelText('Variant: Anti-knight').textContent).toContain('Anti-knight'))
+
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Options' }))
+    fireEvent.click(screen.getByRole('menuitemradio', { name: 'Revised rating' }))
+    await waitFor(() => expect(dispatch).toHaveBeenCalledTimes(4))
+    expect(screen.getByRole('alert').textContent).toContain('engine_configuration_failed')
+
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Options' }))
+    expect(screen.getByRole('menuitemradio', { name: 'Original rating' }).getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByRole('menuitemradio', { name: 'Revised rating' }).getAttribute('aria-checked')).toBe('false')
   })
 })

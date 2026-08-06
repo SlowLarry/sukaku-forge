@@ -426,7 +426,7 @@ impl Implications {
         }
     }
 
-    fn for_each_off_with_cause(
+    pub(crate) fn for_each_off_with_cause(
         &self,
         source_key: u16,
         y_enabled: bool,
@@ -451,6 +451,19 @@ impl Implications {
         let candidate = candidate_from_key(source_key);
         for &(target, _) in self.weak_off.entries(candidate) {
             emit(target);
+        }
+    }
+
+    /// Emit Java-ordered dynamic weak implications together with the exact
+    /// weak-link cause retained by the immutable implication table.
+    pub(crate) fn for_each_weak_off_with_cause(
+        &self,
+        source_key: u16,
+        mut emit: impl FnMut(u16, OnCause),
+    ) {
+        let candidate = candidate_from_key(source_key);
+        for &(target, cause) in self.weak_off.entries(candidate) {
+            emit(target, cause);
         }
     }
 

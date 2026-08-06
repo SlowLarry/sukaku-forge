@@ -151,7 +151,7 @@ export function Board({ board, topology, view, selected, candidatesVisible, onSe
             <marker id="arrow-strong" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="var(--overlay-positive)" /></marker>
             <marker id="arrow-weak" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="var(--overlay-negative)" /></marker>
             <marker id="arrow-implication" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="var(--overlay-auxiliary)" /></marker>
-            <filter id="selected-glow" x="-30%" y="-30%" width="160%" height="160%"><feDropShadow dx="0" dy="0" stdDeviation="4" floodColor="#1769ff" floodOpacity=".18" /></filter>
+            <filter id="selected-glow" x="-30%" y="-30%" width="160%" height="160%"><feDropShadow dx="0" dy="0" stdDeviation="4" floodColor="var(--overlay-selected)" floodOpacity=".18" /></filter>
           </defs>
 
           {/* 1. Permanent supported topology supplied by the active session. */}

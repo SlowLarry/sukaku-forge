@@ -18,6 +18,10 @@ use crate::nested_chains::{
     ChainProof, FullChainFingerprint, NestedHint, NestedHintCollector, OnCause, ProofArena,
     ProofKind, ProofNode, ProofTarget,
 };
+use crate::presentation_proof::{
+    ChainCause, ChainNodeId, ChainProofNode, ChainProofParent, ChainProofView, ChainProofViewKind,
+    ChainState, MultipleForcingChainWithProof, SelectedChainProof,
+};
 use crate::unique_loops::find_unique_loop;
 use crate::{EngineConfig, Evidence, Inference, MultipleChainKind, Rating, Technique};
 
@@ -273,10 +277,18 @@ impl Arena {
         self.nodes[usize::try_from(node).expect("multiple-chain node index")].key
     }
 
+    fn node(&self, node: u32) -> &Node {
+        &self.nodes[usize::try_from(node).expect("multiple-chain node index")]
+    }
+
     fn parent_range(&self, node: u32) -> std::ops::Range<usize> {
-        let entry = &self.nodes[usize::try_from(node).expect("multiple-chain node index")];
+        let entry = self.node(node);
         let start = usize::try_from(entry.parent_start).expect("parent start");
         start..start + usize::from(entry.parent_count)
+    }
+
+    fn parents(&self, node: u32) -> &[u32] {
+        &self.parents[self.parent_range(node)]
     }
 
     /// Java de-duplicates ancestry by potential key for each branch target.
@@ -562,6 +574,62 @@ impl Branch {
         source_digit: Digit,
         source_on: bool,
     ) -> Result<Option<Contradiction>, LegacyFcPlusBoundary> {
+        self.run_impl::<false>(
+            working,
+            implications,
+            region_types,
+            state,
+            inner_cache,
+            mode,
+            config,
+            source_cell,
+            source_digit,
+            source_on,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_with_proof(
+        &mut self,
+        working: &mut Grid,
+        implications: &Implications,
+        region_types: &[usize],
+        state: &mut DynamicState,
+        inner_cache: &mut InnerChainCache,
+        mode: MultiMode,
+        config: EngineConfig,
+        source_cell: CellId,
+        source_digit: Digit,
+        source_on: bool,
+    ) -> Result<Option<Contradiction>, LegacyFcPlusBoundary> {
+        self.run_impl::<true>(
+            working,
+            implications,
+            region_types,
+            state,
+            inner_cache,
+            mode,
+            config,
+            source_cell,
+            source_digit,
+            source_on,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_impl<const CAPTURE_CAUSES: bool>(
+        &mut self,
+        working: &mut Grid,
+        implications: &Implications,
+        region_types: &[usize],
+        state: &mut DynamicState,
+        inner_cache: &mut InnerChainCache,
+        mode: MultiMode,
+        config: EngineConfig,
+        source_cell: CellId,
+        source_digit: Digit,
+        source_on: bool,
+    ) -> Result<Option<Contradiction>, LegacyFcPlusBoundary> {
         self.clear();
         state.begin();
         let source_key = potential_key(source_cell, source_digit, source_on);
@@ -574,7 +642,7 @@ impl Branch {
             self.pending_off.push_back(source);
         }
 
-        let contradiction = self.propagate(
+        let contradiction = self.propagate::<CAPTURE_CAUSES>(
             working,
             implications,
             region_types,
@@ -588,7 +656,7 @@ impl Branch {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn propagate(
+    fn propagate<const CAPTURE_CAUSES: bool>(
         &mut self,
         grid: &mut Grid,
         implications: &Implications,
@@ -602,10 +670,18 @@ impl Branch {
             // Java gives every newly queued ON consequence precedence over
             // even the oldest pending OFF consequence.
             if let Some(parent) = self.pending_on.pop_front() {
-                self.collect_weak_keys(grid, implications, mode, parent);
+                self.collect_weak_keys::<CAPTURE_CAUSES>(grid, implications, mode, parent);
                 for index in 0..self.generated_keys.len() {
                     let target_key = self.generated_keys[index];
-                    let target = self.arena.child(target_key, parent);
+                    let target = if CAPTURE_CAUSES {
+                        self.arena.child_with_cause(
+                            target_key,
+                            parent,
+                            self.generated_causes[index],
+                        )
+                    } else {
+                        self.arena.child(target_key, parent)
+                    };
                     let opposite = self.to_on.node(target_key ^ 1);
                     if opposite != NO_NODE {
                         return Ok(Some(Contradiction {
@@ -659,7 +735,7 @@ impl Branch {
         }
     }
 
-    fn collect_weak_keys(
+    fn collect_weak_keys<const CAPTURE_CAUSES: bool>(
         &mut self,
         grid: &Grid,
         implications: &Implications,
@@ -667,9 +743,21 @@ impl Branch {
         parent: u32,
     ) {
         self.generated_keys.clear();
+        if CAPTURE_CAUSES {
+            self.generated_causes.clear();
+        }
         let parent_key = self.arena.key(parent);
         if mode == MultiMode::Static {
-            implications.for_each_off(parent_key, true, |key| self.generated_keys.push(key));
+            if CAPTURE_CAUSES {
+                implications.for_each_off_with_cause(parent_key, true, |key, cause| {
+                    self.generated_keys.push(key);
+                    self.generated_causes.push(cause);
+                });
+            } else {
+                implications.for_each_off(parent_key, true, |key| {
+                    self.generated_keys.push(key);
+                });
+            }
             return;
         }
 
@@ -678,14 +766,27 @@ impl Branch {
             if digit != source_digit {
                 self.generated_keys
                     .push(potential_key(source_cell, digit, false));
+                if CAPTURE_CAUSES {
+                    self.generated_causes.push(OnCause::NakedSingle);
+                }
             }
         }
-        implications.for_each_weak_off(parent_key, |key| {
-            let (cell, digit) = decode_candidate(key);
-            if grid.candidates(cell).contains(digit) {
-                self.generated_keys.push(key);
-            }
-        });
+        if CAPTURE_CAUSES {
+            implications.for_each_weak_off_with_cause(parent_key, |key, cause| {
+                let (cell, digit) = decode_candidate(key);
+                if grid.candidates(cell).contains(digit) {
+                    self.generated_keys.push(key);
+                    self.generated_causes.push(cause);
+                }
+            });
+        } else {
+            implications.for_each_weak_off(parent_key, |key| {
+                let (cell, digit) = decode_candidate(key);
+                if grid.candidates(cell).contains(digit) {
+                    self.generated_keys.push(key);
+                }
+            });
+        }
     }
 
     fn collect_strong_nodes(
@@ -1578,11 +1679,37 @@ pub fn find_multiple_forcing_chain(grid: &Grid, config: EngineConfig) -> Option<
         .expect("static multiple chains cannot reach an FCPlus boundary")
 }
 
+/// Find Java's first ranked static Multiple Forcing Chain and replay only its
+/// selected outer branches into presentation proof views.
+#[must_use]
+pub fn find_multiple_forcing_chain_with_proof(
+    grid: &Grid,
+    config: EngineConfig,
+) -> Option<MultipleForcingChainWithProof> {
+    let inference = find_multiple_forcing_chain(grid, config)?;
+    let proof = replay_selected_multi_proof(grid, config, MultiMode::Static, &inference)
+        .expect("static selected replay cannot reach an FCPlus boundary");
+    Some(MultipleForcingChainWithProof::new(inference, proof))
+}
+
 /// Find Java's first ranked level-0 Dynamic Forcing Chain.
 #[must_use]
 pub fn find_dynamic_forcing_chain(grid: &Grid, config: EngineConfig) -> Option<Inference> {
     find_multi_chain_checked(grid, config, MultiMode::Dynamic)
         .expect("level-zero dynamic chains cannot reach an FCPlus boundary")
+}
+
+/// Find Java's first ranked level-zero Dynamic Forcing Chain and replay only
+/// its selected outer branches into presentation proof views.
+#[must_use]
+pub fn find_dynamic_forcing_chain_with_proof(
+    grid: &Grid,
+    config: EngineConfig,
+) -> Option<MultipleForcingChainWithProof> {
+    let inference = find_dynamic_forcing_chain(grid, config)?;
+    let proof = replay_selected_multi_proof(grid, config, MultiMode::Dynamic, &inference)
+        .expect("level-zero selected replay cannot reach an FCPlus boundary");
+    Some(MultipleForcingChainWithProof::new(inference, proof))
 }
 
 /// Find Java's first ranked level-1 Dynamic Forcing Chain (+).
@@ -1602,6 +1729,30 @@ pub fn find_dynamic_forcing_chain_plus_checked(
     config: EngineConfig,
 ) -> Result<Option<Inference>, LegacyFcPlusBoundary> {
     find_multi_chain_checked(grid, config, MultiMode::DynamicPlus)
+}
+
+/// Find Java's first ranked level-one Dynamic Forcing Chain (+) and replay
+/// only its selected outer branches into presentation proof views.
+#[must_use]
+pub fn find_dynamic_forcing_chain_plus_with_proof(
+    grid: &Grid,
+    config: EngineConfig,
+) -> Option<MultipleForcingChainWithProof> {
+    find_dynamic_forcing_chain_plus_with_proof_checked(grid, config)
+        .expect("legacy Java FCPlus=2 boundary; use the checked detailed DFC+ finder")
+}
+
+/// Checked presentation entry point for Java's historically broken FCPlus=2
+/// tail. Discovery and selected replay surface the same legacy boundary.
+pub fn find_dynamic_forcing_chain_plus_with_proof_checked(
+    grid: &Grid,
+    config: EngineConfig,
+) -> Result<Option<MultipleForcingChainWithProof>, LegacyFcPlusBoundary> {
+    let Some(inference) = find_dynamic_forcing_chain_plus_checked(grid, config)? else {
+        return Ok(None);
+    };
+    let proof = replay_selected_multi_proof(grid, config, MultiMode::DynamicPlus, &inference)?;
+    Ok(Some(MultipleForcingChainWithProof::new(inference, proof)))
 }
 
 /// Find Java's nested dynamic chain family. Levels 2 and 3 ignore
@@ -1638,6 +1789,380 @@ pub fn find_nested_forcing_chain_checked(
             nesting_limit,
         },
     )
+}
+
+/// Find Java's selected nested Dynamic Forcing Chain and replay only its
+/// outer DAG. Inner chaining deductions remain collapsed `Derived` edges.
+#[must_use]
+pub fn find_nested_forcing_chain_with_proof(
+    grid: &Grid,
+    config: EngineConfig,
+    level: u8,
+    nesting_limit: u8,
+) -> Option<MultipleForcingChainWithProof> {
+    find_nested_forcing_chain_with_proof_checked(grid, config, level, nesting_limit)
+        .expect("legacy Java FCPlus=2 boundary; use the checked detailed nested finder")
+}
+
+/// Checked nested presentation entry point with the exact producer level and
+/// level-four nesting cap required to replay the selected outer branches.
+pub fn find_nested_forcing_chain_with_proof_checked(
+    grid: &Grid,
+    config: EngineConfig,
+    level: u8,
+    nesting_limit: u8,
+) -> Result<Option<MultipleForcingChainWithProof>, LegacyFcPlusBoundary> {
+    let Some(inference) = find_nested_forcing_chain_checked(grid, config, level, nesting_limit)?
+    else {
+        return Ok(None);
+    };
+    let proof = replay_selected_multi_proof(
+        grid,
+        config,
+        MultiMode::Nested {
+            level,
+            nesting_limit,
+        },
+        &inference,
+    )?;
+    Ok(Some(MultipleForcingChainWithProof::new(inference, proof)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_selected_branch(
+    branch: &mut Branch,
+    working: &mut Grid,
+    implications: &Implications,
+    region_types: &[usize],
+    state: &mut DynamicState,
+    inner_cache: &mut InnerChainCache,
+    mode: MultiMode,
+    config: EngineConfig,
+    source_cell: CellId,
+    source_digit: Digit,
+    source_on: bool,
+) -> Result<Option<Contradiction>, LegacyFcPlusBoundary> {
+    branch.run_with_proof(
+        working,
+        implications,
+        region_types,
+        state,
+        inner_cache,
+        mode,
+        config,
+        source_cell,
+        source_digit,
+        source_on,
+    )
+}
+
+fn replay_selected_multi_proof(
+    grid: &Grid,
+    config: EngineConfig,
+    mode: MultiMode,
+    inference: &Inference,
+) -> Result<SelectedChainProof, LegacyFcPlusBoundary> {
+    let Evidence::MultipleForcingChain {
+        dynamic,
+        level,
+        kind,
+        ..
+    } = inference.evidence()
+    else {
+        unreachable!("selected multi-chain inference evidence")
+    };
+    assert_eq!(dynamic, mode.is_dynamic(), "selected multi-chain mode");
+    assert_eq!(level, mode.level(), "selected multi-chain level");
+
+    let implications = if mode == MultiMode::Static {
+        Implications::new(grid, config)
+    } else {
+        Implications::weak_only(grid, config)
+    };
+    let region_types = active_region_types(grid, config);
+    let mut working = grid.clone();
+    let mut workspace = MultiWorkspace::new();
+    let mut inner_cache = InnerChainCache::default();
+
+    let views = match kind {
+        MultipleChainKind::Contradiction {
+            source_cell,
+            source_digit,
+            source_on,
+            target_cell,
+            target_digit,
+        } => {
+            assert!(
+                mode.is_dynamic(),
+                "static MFC contradiction is not published"
+            );
+            let contradiction = run_selected_branch(
+                &mut workspace.off_branch,
+                &mut working,
+                &implications,
+                &region_types,
+                &mut workspace.state,
+                &mut inner_cache,
+                mode,
+                config,
+                source_cell,
+                source_digit,
+                source_on,
+            )?
+            .expect("ranked dynamic contradiction is reproducible");
+            assert_eq!(
+                workspace.off_branch.arena.key(contradiction.on),
+                potential_key(target_cell, target_digit, true),
+                "selected contradiction ON target",
+            );
+            assert_eq!(
+                workspace.off_branch.arena.key(contradiction.off),
+                potential_key(target_cell, target_digit, false),
+                "selected contradiction OFF target",
+            );
+            vec![
+                materialize_multi_view(
+                    grid,
+                    &workspace.off_branch.arena,
+                    contradiction.on,
+                    ChainProofViewKind::ContradictionOn,
+                ),
+                materialize_multi_view(
+                    grid,
+                    &workspace.off_branch.arena,
+                    contradiction.off,
+                    ChainProofViewKind::ContradictionOff,
+                ),
+            ]
+        }
+        MultipleChainKind::Double {
+            source_cell,
+            source_digit,
+            target_cell,
+            target_digit,
+            target_on,
+        } => {
+            assert!(
+                mode.is_dynamic(),
+                "static MFC double chain is not published"
+            );
+            run_selected_branch(
+                &mut workspace.cell_branches[0],
+                &mut working,
+                &implications,
+                &region_types,
+                &mut workspace.state,
+                &mut inner_cache,
+                mode,
+                config,
+                source_cell,
+                source_digit,
+                true,
+            )?;
+            run_selected_branch(
+                &mut workspace.off_branch,
+                &mut working,
+                &implications,
+                &region_types,
+                &mut workspace.state,
+                &mut inner_cache,
+                mode,
+                config,
+                source_cell,
+                source_digit,
+                false,
+            )?;
+            let key = potential_key(target_cell, target_digit, target_on);
+            let on_target = workspace.cell_branches[0].target_node(key, target_on);
+            let off_target = workspace.off_branch.target_node(key, target_on);
+            assert_ne!(on_target, NO_NODE, "selected ON-assumption target");
+            assert_ne!(off_target, NO_NODE, "selected OFF-assumption target");
+            vec![
+                materialize_multi_view(
+                    grid,
+                    &workspace.cell_branches[0].arena,
+                    on_target,
+                    ChainProofViewKind::AssumptionOn,
+                ),
+                materialize_multi_view(
+                    grid,
+                    &workspace.off_branch.arena,
+                    off_target,
+                    ChainProofViewKind::AssumptionOff,
+                ),
+            ]
+        }
+        MultipleChainKind::Cell {
+            source_cell,
+            target_cell,
+            target_digit,
+            target_on,
+        } => {
+            let key = potential_key(target_cell, target_digit, target_on);
+            let values = grid.candidates(source_cell);
+            let mut result =
+                Vec::with_capacity(usize::try_from(values.count()).expect("cell branch count"));
+            for (branch_index, source_digit) in values.iter().enumerate() {
+                let branch = &mut workspace.cell_branches[branch_index];
+                run_selected_branch(
+                    branch,
+                    &mut working,
+                    &implications,
+                    &region_types,
+                    &mut workspace.state,
+                    &mut inner_cache,
+                    mode,
+                    config,
+                    source_cell,
+                    source_digit,
+                    true,
+                )?;
+                let target = branch.target_node(key, target_on);
+                assert_ne!(target, NO_NODE, "selected cell-branch target");
+                result.push(materialize_multi_view(
+                    grid,
+                    &branch.arena,
+                    target,
+                    ChainProofViewKind::CellBranch {
+                        branch: u8::try_from(branch_index).expect("cell branch index"),
+                    },
+                ));
+            }
+            result
+        }
+        MultipleChainKind::Region {
+            source_region,
+            source_digit,
+            target_cell,
+            target_digit,
+            target_on,
+        } => {
+            let key = potential_key(target_cell, target_digit, target_on);
+            let positions = grid.region_candidate_positions(source_region, source_digit);
+            let region_cells = grid.topology().region_cells(source_region);
+            let mut result = Vec::with_capacity(
+                usize::try_from(positions.count()).expect("region branch count"),
+            );
+            for (branch_index, position) in positions.iter().enumerate() {
+                let source_cell = CellId::new(region_cells[usize::from(position)])
+                    .expect("selected region branch cell");
+                let branch = &mut workspace.cell_branches[branch_index];
+                run_selected_branch(
+                    branch,
+                    &mut working,
+                    &implications,
+                    &region_types,
+                    &mut workspace.state,
+                    &mut inner_cache,
+                    mode,
+                    config,
+                    source_cell,
+                    source_digit,
+                    true,
+                )?;
+                let target = branch.target_node(key, target_on);
+                assert_ne!(target, NO_NODE, "selected region-branch target");
+                result.push(materialize_multi_view(
+                    grid,
+                    &branch.arena,
+                    target,
+                    ChainProofViewKind::RegionBranch {
+                        branch: u8::try_from(branch_index).expect("region branch index"),
+                    },
+                ));
+            }
+            result
+        }
+    };
+    Ok(SelectedChainProof::new(views))
+}
+
+fn materialize_multi_view(
+    grid: &Grid,
+    arena: &Arena,
+    terminal: u32,
+    kind: ChainProofViewKind,
+) -> ChainProofView {
+    let mut view_index_by_key = [NO_NODE; KEY_COUNT];
+    let mut ordered_nodes = Vec::new();
+    let mut pending = VecDeque::new();
+    let terminal_key = arena.key(terminal);
+    view_index_by_key[usize::from(terminal_key)] = 0;
+    pending.push_back(terminal);
+    let mut next_index = 1_u32;
+
+    while let Some(node) = pending.pop_front() {
+        ordered_nodes.push(node);
+        for &parent in arena.parents(node) {
+            let parent_key = arena.key(parent);
+            let slot = &mut view_index_by_key[usize::from(parent_key)];
+            if *slot == NO_NODE {
+                *slot = next_index;
+                next_index = next_index
+                    .checked_add(1)
+                    .expect("selected multi-chain proof node count");
+                pending.push_back(parent);
+            }
+        }
+    }
+
+    let nodes = ordered_nodes
+        .into_iter()
+        .map(|node_id| {
+            let node = arena.node(node_id);
+            let (cell, digit) = decode_candidate(node.key);
+            let mut parents = Vec::with_capacity(usize::from(node.parent_count));
+            for &parent in arena.parents(node_id) {
+                let parent_index = view_index_by_key[usize::from(arena.key(parent))];
+                debug_assert_ne!(parent_index, NO_NODE);
+                let proof_parent = ChainProofParent::new(
+                    ChainNodeId::from_index(
+                        usize::try_from(parent_index).expect("selected multi-chain parent index"),
+                    ),
+                    multi_chain_cause(grid, arena, node_id, parent),
+                );
+                if !parents.contains(&proof_parent) {
+                    parents.push(proof_parent);
+                }
+            }
+            ChainProofNode::new(
+                cell,
+                digit,
+                if is_on(node.key) {
+                    ChainState::On
+                } else {
+                    ChainState::Off
+                },
+                parents.into_boxed_slice(),
+            )
+        })
+        .collect();
+    ChainProofView::new(kind, nodes)
+}
+
+fn multi_chain_cause(grid: &Grid, arena: &Arena, node: u32, parent: u32) -> ChainCause {
+    match arena.node(node).on_cause {
+        OnCause::None => ChainCause::Derived,
+        OnCause::HiddenRegion(type_index) => {
+            let (cell, _) = decode_candidate(arena.key(node));
+            let region_index = grid
+                .topology()
+                .cell_region_index(cell, usize::from(type_index))
+                .expect("multi-chain cause region contains its potential");
+            ChainCause::Region(
+                RegionId::new(type_index, region_index).expect("multi-chain cause region id"),
+            )
+        }
+        OnCause::NakedSingle => {
+            let (cell, _) = decode_candidate(arena.key(node));
+            let (parent_cell, _) = decode_candidate(arena.key(parent));
+            if cell == parent_cell {
+                ChainCause::Cell
+            } else {
+                ChainCause::Visibility
+            }
+        }
+    }
 }
 
 fn find_multi_chain_checked(
@@ -2354,21 +2879,61 @@ mod tests {
     use std::sync::Arc;
 
     use sukaku_forge_core::{
-        CandidateMask, CellId, ConstraintTopology, Digit, Grid, Puzzle, VariantConfig,
+        CandidateMask, CellId, ConstraintTopology, Digit, Grid, Puzzle, RegionId, VariantConfig,
     };
 
     use super::{
         Branch, DynamicState, GridStateKey, Implications, InnerChainCache, LegacyFcPlusBoundary,
         MultiMode, active_region_types, collect_multiple_chain_proofs, find_dynamic_forcing_chain,
         find_dynamic_forcing_chain_plus, find_dynamic_forcing_chain_plus_checked,
-        find_multiple_forcing_chain, find_nested_forcing_chain, first_broken_fcplus_two_family,
-        legacy_hash_map_cell_order,
+        find_dynamic_forcing_chain_plus_with_proof_checked, find_dynamic_forcing_chain_with_proof,
+        find_multiple_forcing_chain, find_multiple_forcing_chain_with_proof,
+        find_nested_forcing_chain, find_nested_forcing_chain_with_proof_checked,
+        first_broken_fcplus_two_family, legacy_hash_map_cell_order,
     };
     use crate::{
-        EngineConfig, Evidence, MultipleChainKind, Rating, RatingMode, SearchOutcome, Solver,
+        ChainCause, ChainProofView, ChainProofViewKind, ChainState, EngineConfig, Evidence,
+        MultipleChainKind, Rating, RatingMode, SearchOutcome, Solver,
     };
 
+    type ProofNodeShape = (u8, u8, ChainState, Vec<(usize, ChainCause)>);
+
+    fn proof_shape(view: &ChainProofView) -> Vec<ProofNodeShape> {
+        view.nodes()
+            .iter()
+            .map(|node| {
+                (
+                    node.cell().raw(),
+                    node.digit().get(),
+                    node.state(),
+                    node.parents()
+                        .iter()
+                        .map(|parent| (parent.node().index(), parent.cause()))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn region(type_index: u8, region_index: u8) -> ChainCause {
+        ChainCause::Region(RegionId::new(type_index, region_index).unwrap())
+    }
+
+    fn has_derived_edge(proof: &crate::SelectedChainProof) -> bool {
+        proof.views().iter().any(|view| {
+            view.nodes().iter().any(|node| {
+                node.parents()
+                    .iter()
+                    .any(|parent| parent.cause() == ChainCause::Derived)
+            })
+        })
+    }
+
     fn sparse_snapshot(entries: &[(u8, &str)]) -> Grid {
+        sparse_snapshot_with_variant(entries, VariantConfig::default())
+    }
+
+    fn sparse_snapshot_with_variant(entries: &[(u8, &str)], variant: VariantConfig) -> Grid {
         let values = Puzzle::parse(&".".repeat(81)).unwrap();
         let mut slots = vec![".........".to_owned(); 81];
         for &(raw, digits) in entries {
@@ -2380,7 +2945,7 @@ mod tests {
         }
         let candidates = Puzzle::parse(&slots.concat()).unwrap();
         Grid::from_snapshot(
-            Arc::new(ConstraintTopology::new(VariantConfig::default())),
+            Arc::new(ConstraintTopology::new(variant)),
             &values,
             &candidates,
         )
@@ -2739,6 +3304,27 @@ mod tests {
         let mut grid = sparse_snapshot(&[(0, "123"), (1, "24"), (2, "25"), (10, "26")]);
         let inference = find_multiple_forcing_chain(&grid, EngineConfig::default())
             .expect("region forcing chain");
+        let detailed = find_multiple_forcing_chain_with_proof(&grid, EngineConfig::default())
+            .expect("selected region forcing proof");
+        assert_eq!(detailed.inference(), &inference);
+        let views = detailed.proof().views();
+        assert_eq!(
+            views.iter().map(ChainProofView::kind).collect::<Vec<_>>(),
+            [
+                ChainProofViewKind::RegionBranch { branch: 0 },
+                ChainProofViewKind::RegionBranch { branch: 1 },
+                ChainProofViewKind::RegionBranch { branch: 2 },
+            ]
+        );
+        for (branch, source_cell) in [0_u8, 1, 2].into_iter().enumerate() {
+            assert_eq!(
+                proof_shape(&views[branch]),
+                [
+                    (10, 2, ChainState::Off, vec![(1, region(0, 0))]),
+                    (source_cell, 2, ChainState::On, vec![]),
+                ]
+            );
+        }
         assert_eq!(inference.rating(), Rating::from_tenths(80));
         assert_eq!(inference.name(), "Region Forcing Chains");
         assert_eq!(inference.short_name(), "RFC");
@@ -2828,12 +3414,126 @@ mod tests {
 
         let inference = find_dynamic_forcing_chain(&grid, EngineConfig::default())
             .expect("first dynamic contradiction");
+        let detailed = find_dynamic_forcing_chain_with_proof(&grid, EngineConfig::default())
+            .expect("selected dynamic contradiction proof");
+        assert_eq!(detailed.inference(), &inference);
+        let views = detailed.proof().views();
+        assert_eq!(
+            views.iter().map(ChainProofView::kind).collect::<Vec<_>>(),
+            [
+                ChainProofViewKind::ContradictionOn,
+                ChainProofViewKind::ContradictionOff,
+            ]
+        );
+        assert_eq!(
+            proof_shape(&views[0]),
+            [
+                (
+                    21,
+                    1,
+                    ChainState::On,
+                    vec![(1, region(1, 2)), (2, region(1, 2))],
+                ),
+                (20, 1, ChainState::Off, vec![(3, region(0, 0))]),
+                (19, 1, ChainState::Off, vec![(3, region(0, 0))]),
+                (0, 1, ChainState::On, vec![]),
+            ]
+        );
+        assert_eq!(
+            proof_shape(&views[1]),
+            [
+                (21, 1, ChainState::Off, vec![(1, region(0, 1))]),
+                (
+                    12,
+                    1,
+                    ChainState::On,
+                    vec![(2, region(1, 1)), (3, region(1, 1))],
+                ),
+                (11, 1, ChainState::Off, vec![(4, region(0, 0))]),
+                (10, 1, ChainState::Off, vec![(4, region(0, 0))]),
+                (0, 1, ChainState::On, vec![]),
+            ]
+        );
         assert_eq!(inference.rating(), Rating::from_tenths(87));
         assert_eq!(inference.name(), "Dynamic Contradiction Forcing Chains");
         assert_eq!(inference.short_name(), "DCFC");
         assert_eq!(
             inference.description(grid.topology()),
             "Contradiction Forcing Chain: r1c1.1 on ==> r3c4.1 both on & off"
+        );
+    }
+
+    #[test]
+    fn dynamic_weak_anti_knight_cause_survives_selected_materialization() {
+        let grid = sparse_snapshot_with_variant(
+            &[(4, "12"), (15, "1")],
+            VariantConfig {
+                anti_knight: true,
+                ..VariantConfig::default()
+            },
+        );
+        let config = EngineConfig::default();
+        let implications = Implications::weak_only(&grid, config);
+        let region_types = active_region_types(&grid, config);
+        let mut working = grid.clone();
+        let mut state = DynamicState::new();
+        let mut branch = Branch::new();
+        let mut inner_cache = InnerChainCache::default();
+        branch
+            .run(
+                &mut working,
+                &implications,
+                &region_types,
+                &mut state,
+                &mut inner_cache,
+                MultiMode::Dynamic,
+                config,
+                CellId::new(4).unwrap(),
+                Digit::new(1).unwrap(),
+                true,
+            )
+            .expect("level zero has no FCPlus boundary");
+        let key = super::potential_key(CellId::new(15).unwrap(), Digit::new(1).unwrap(), false);
+        let compact_target = branch.target_node(key, false);
+        assert_ne!(compact_target, super::NO_NODE);
+        assert_eq!(
+            branch.arena.node(compact_target).on_cause,
+            super::OnCause::None
+        );
+
+        branch
+            .run_with_proof(
+                &mut working,
+                &implications,
+                &region_types,
+                &mut state,
+                &mut inner_cache,
+                MultiMode::Dynamic,
+                config,
+                CellId::new(4).unwrap(),
+                Digit::new(1).unwrap(),
+                true,
+            )
+            .expect("level zero has no FCPlus boundary");
+
+        let target = branch.target_node(key, false);
+        assert_ne!(target, super::NO_NODE);
+        assert_eq!(
+            branch.arena.node(target).on_cause,
+            super::OnCause::NakedSingle
+        );
+        let view = super::materialize_multi_view(
+            &grid,
+            &branch.arena,
+            target,
+            ChainProofViewKind::AssumptionOn,
+        );
+        assert_eq!(
+            proof_shape(&view),
+            [
+                (15, 1, ChainState::Off, vec![(1, ChainCause::Visibility)],),
+                (4, 1, ChainState::On, vec![]),
+            ]
         );
     }
 
@@ -2938,6 +3638,24 @@ mod tests {
         assert!(find_dynamic_forcing_chain(&grid, EngineConfig::default()).is_none());
         let inference = find_dynamic_forcing_chain_plus(&grid, EngineConfig::default())
             .expect("first level-one DFC+ hint");
+        let detailed =
+            find_dynamic_forcing_chain_plus_with_proof_checked(&grid, EngineConfig::default())
+                .expect("checked DFC+ proof search")
+                .expect("selected DFC+ proof");
+        assert_eq!(detailed.inference(), &inference);
+        assert_eq!(
+            detailed
+                .proof()
+                .views()
+                .iter()
+                .map(ChainProofView::kind)
+                .collect::<Vec<_>>(),
+            [
+                ChainProofViewKind::AssumptionOn,
+                ChainProofViewKind::AssumptionOff,
+            ]
+        );
+        assert!(has_derived_edge(detailed.proof()));
         assert_eq!(inference.rating(), Rating::from_tenths(95));
         assert_eq!(inference.name(), "Dynamic Double Forcing Chains (+)");
         assert_eq!(inference.short_name(), "DdFC+");
@@ -2967,6 +3685,24 @@ mod tests {
         );
         let inference = find_nested_forcing_chain(&grid, EngineConfig::default(), 2, 0)
             .expect("first level-two nested DFC hint");
+        let detailed =
+            find_nested_forcing_chain_with_proof_checked(&grid, EngineConfig::default(), 2, 0)
+                .expect("checked level-two proof search")
+                .expect("selected level-two proof");
+        assert_eq!(detailed.inference(), &inference);
+        assert_eq!(
+            detailed
+                .proof()
+                .views()
+                .iter()
+                .map(ChainProofView::kind)
+                .collect::<Vec<_>>(),
+            [
+                ChainProofViewKind::ContradictionOn,
+                ChainProofViewKind::ContradictionOff,
+            ]
+        );
+        assert!(has_derived_edge(detailed.proof()));
         assert_eq!(inference.rating(), Rating::from_tenths(104));
         assert_eq!(
             inference.name(),
@@ -3151,6 +3887,12 @@ mod tests {
         let grid = nested_snapshot(LEVEL_FOUR_CANDIDATES);
         let inference = find_nested_forcing_chain(&grid, EngineConfig::default(), 4, 0)
             .expect("first level-four nested DFC hint");
+        let detailed =
+            find_nested_forcing_chain_with_proof_checked(&grid, EngineConfig::default(), 4, 0)
+                .expect("checked level-four proof search")
+                .expect("selected level-four proof");
+        assert_eq!(detailed.inference(), &inference);
+        assert!(has_derived_edge(detailed.proof()));
         assert_eq!(inference.rating(), Rating::from_tenths(117));
         assert_eq!(
             inference.name(),

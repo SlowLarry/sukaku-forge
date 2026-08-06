@@ -18,6 +18,7 @@ const props = {
   onToggleCandidates: vi.fn(),
   onToggleCandidateEntry: vi.fn(),
   onApply: vi.fn(),
+  onApplyAndContinue: vi.fn(),
 }
 
 describe('Toolbar', () => {
@@ -28,11 +29,11 @@ describe('Toolbar', () => {
     expect(markup).toContain('>Redo</span>')
     expect(markup).toContain('>Next hint</span>')
     expect(markup).toContain('>Apply hint</span>')
+    expect(markup).toContain('>Solve step</span>')
     expect(markup).toContain('Variant: Classic Sudoku')
     expect(markup).toContain('aria-label="Show candidates" aria-pressed="true"')
     expect(markup).not.toContain('>New</span>')
     expect(markup).not.toContain('Get all hints')
-    expect(markup).not.toContain('Solve step')
   })
 
   it('disables every engine-mutating action while busy', () => {

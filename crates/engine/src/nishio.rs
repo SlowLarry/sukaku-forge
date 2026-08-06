@@ -5,6 +5,11 @@ use sukaku_forge_core::{CandidateMask, CandidateRemovalsBuilder, CellId, Digit, 
 use crate::forcing_chains::{
     Implications, KEY_COUNT, active_region_types, decode_candidate, is_on, potential_key,
 };
+use crate::nested_chains::OnCause;
+use crate::presentation_proof::{
+    ChainCause, ChainNodeId, ChainProofNode, ChainProofParent, ChainProofView, ChainProofViewKind,
+    ChainState, NishioForcingChainWithProof, SelectedChainProof,
+};
 use crate::{EngineConfig, Evidence, Inference, Rating, Technique};
 
 const NO_NODE: u32 = u32::MAX;
@@ -24,6 +29,9 @@ struct DynamicNode {
 struct DynamicArena {
     nodes: Vec<DynamicNode>,
     parents: Vec<u32>,
+    /// Populated only by the selected replay path. Compact ranking retains
+    /// the original node layout and does no presentation-cause storage.
+    causes: Vec<ChainCause>,
     ancestor_stamps: [u16; KEY_COUNT],
     ancestor_generation: u16,
     traversal: Vec<u32>,
@@ -34,6 +42,7 @@ impl DynamicArena {
         Self {
             nodes: Vec::with_capacity(128),
             parents: Vec::with_capacity(192),
+            causes: Vec::new(),
             ancestor_stamps: [0; KEY_COUNT],
             ancestor_generation: 0,
             traversal: Vec::with_capacity(64),
@@ -43,17 +52,28 @@ impl DynamicArena {
     fn clear(&mut self) {
         self.nodes.clear();
         self.parents.clear();
+        self.causes.clear();
     }
 
-    fn root(&mut self, key: u16) -> u32 {
-        self.push(key, &[])
+    fn root<const CAPTURE_CAUSES: bool>(&mut self, key: u16) -> u32 {
+        self.push::<CAPTURE_CAUSES>(key, &[], ChainCause::None)
     }
 
-    fn child(&mut self, key: u16, parent: u32) -> u32 {
-        self.push(key, &[parent])
+    fn child<const CAPTURE_CAUSES: bool>(
+        &mut self,
+        key: u16,
+        parent: u32,
+        cause: ChainCause,
+    ) -> u32 {
+        self.push::<CAPTURE_CAUSES>(key, &[parent], cause)
     }
 
-    fn push(&mut self, key: u16, parents: &[u32]) -> u32 {
+    fn push<const CAPTURE_CAUSES: bool>(
+        &mut self,
+        key: u16,
+        parents: &[u32],
+        cause: ChainCause,
+    ) -> u32 {
         let node = u32::try_from(self.nodes.len()).expect("dynamic implication node index");
         let parent_start =
             u32::try_from(self.parents.len()).expect("dynamic implication parent index");
@@ -64,6 +84,12 @@ impl DynamicArena {
             parent_start,
             parent_count,
         });
+        if CAPTURE_CAUSES {
+            debug_assert_eq!(self.causes.len() + 1, self.nodes.len());
+            self.causes.push(cause);
+        } else {
+            debug_assert!(self.causes.is_empty());
+        }
         node
     }
 
@@ -88,10 +114,23 @@ impl DynamicArena {
         self.nodes[usize::try_from(node).expect("dynamic implication node index")].key
     }
 
+    fn node(&self, node: u32) -> DynamicNode {
+        self.nodes[usize::try_from(node).expect("dynamic implication node index")]
+    }
+
     fn parent_range(&self, node: u32) -> std::ops::Range<usize> {
-        let entry = self.nodes[usize::try_from(node).expect("dynamic implication node index")];
+        let entry = self.node(node);
         let start = usize::try_from(entry.parent_start).expect("parent start");
         start..start + usize::from(entry.parent_count)
+    }
+
+    fn parents(&self, node: u32) -> &[u32] {
+        &self.parents[self.parent_range(node)]
+    }
+
+    fn cause(&self, node: u32) -> ChainCause {
+        debug_assert_eq!(self.causes.len(), self.nodes.len());
+        self.causes[usize::try_from(node).expect("dynamic implication node index")]
     }
 
     /// Java de-duplicates each terminal's ancestry by potential key, and then
@@ -118,6 +157,93 @@ impl DynamicArena {
         }
         result
     }
+}
+
+fn nishio_chain_cause(grid: &Grid, source_key: u16, target_key: u16, cause: OnCause) -> ChainCause {
+    let (source_cell, source_digit) = decode_candidate(source_key);
+    let (target_cell, target_digit) = decode_candidate(target_key);
+    match cause {
+        OnCause::None => ChainCause::None,
+        OnCause::HiddenRegion(type_index) => {
+            debug_assert_eq!(source_digit, target_digit);
+            let region_index = grid
+                .topology()
+                .cell_region_index(target_cell, usize::from(type_index))
+                .expect("Nishio cause region contains target");
+            ChainCause::Region(
+                RegionId::new(type_index, region_index).expect("Nishio cause region"),
+            )
+        }
+        OnCause::NakedSingle => {
+            if source_cell == target_cell {
+                ChainCause::Cell
+            } else {
+                ChainCause::Visibility
+            }
+        }
+    }
+}
+
+fn materialize_nishio_view(
+    arena: &DynamicArena,
+    terminal: u32,
+    kind: ChainProofViewKind,
+) -> ChainProofView {
+    let mut view_index_by_key = [NO_NODE; KEY_COUNT];
+    let mut ordered_nodes = Vec::new();
+    let mut pending = VecDeque::new();
+    let terminal_key = arena.key(terminal);
+    view_index_by_key[usize::from(terminal_key)] = 0;
+    pending.push_back(terminal);
+    let mut next_index = 1_u32;
+
+    while let Some(node) = pending.pop_front() {
+        ordered_nodes.push(node);
+        for &parent in arena.parents(node) {
+            let parent_key = arena.key(parent);
+            let slot = &mut view_index_by_key[usize::from(parent_key)];
+            if *slot == NO_NODE {
+                *slot = next_index;
+                next_index = next_index
+                    .checked_add(1)
+                    .expect("selected Nishio proof node count");
+                pending.push_back(parent);
+            }
+        }
+    }
+
+    let nodes = ordered_nodes
+        .into_iter()
+        .map(|node_id| {
+            let node = arena.node(node_id);
+            let (cell, digit) = decode_candidate(node.key);
+            let mut parents = Vec::with_capacity(usize::from(node.parent_count));
+            for &parent in arena.parents(node_id) {
+                let parent_index = view_index_by_key[usize::from(arena.key(parent))];
+                debug_assert_ne!(parent_index, NO_NODE);
+                let parent = ChainProofParent::new(
+                    ChainNodeId::from_index(
+                        usize::try_from(parent_index).expect("selected Nishio parent index"),
+                    ),
+                    arena.cause(node_id),
+                );
+                if !parents.contains(&parent) {
+                    parents.push(parent);
+                }
+            }
+            ChainProofNode::new(
+                cell,
+                digit,
+                if is_on(node.key) {
+                    ChainState::On
+                } else {
+                    ChainState::Off
+                },
+                parents.into_boxed_slice(),
+            )
+        })
+        .collect();
+    ChainProofView::new(kind, nodes)
 }
 
 /// Candidate-removal journal for one dynamic implication closure.
@@ -245,10 +371,48 @@ impl DynamicChainWorkspace {
         source_digit: Digit,
         source_on: bool,
     ) -> Option<(u32, u32)> {
+        self.contradiction_impl::<false>(
+            grid,
+            implications,
+            region_types,
+            source_cell,
+            source_digit,
+            source_on,
+        )
+    }
+
+    fn contradiction_with_proof(
+        &mut self,
+        grid: &mut Grid,
+        implications: &Implications,
+        region_types: &[usize],
+        source_cell: CellId,
+        source_digit: Digit,
+        source_on: bool,
+    ) -> Option<(u32, u32)> {
+        self.contradiction_impl::<true>(
+            grid,
+            implications,
+            region_types,
+            source_cell,
+            source_digit,
+            source_on,
+        )
+    }
+
+    fn contradiction_impl<const CAPTURE_CAUSES: bool>(
+        &mut self,
+        grid: &mut Grid,
+        implications: &Implications,
+        region_types: &[usize],
+        source_cell: CellId,
+        source_digit: Digit,
+        source_on: bool,
+    ) -> Option<(u32, u32)> {
         self.clear();
         self.state.begin();
         let source_key = potential_key(source_cell, source_digit, source_on);
-        let source = self.arena.root(source_key);
+        let source = self.arena.root::<CAPTURE_CAUSES>(source_key);
         self.remember(source);
         if source_on {
             self.pending_on.push_back(source);
@@ -256,12 +420,12 @@ impl DynamicChainWorkspace {
             self.pending_off.push_back(source);
         }
 
-        let result = self.propagate(grid, implications, region_types);
+        let result = self.propagate::<CAPTURE_CAUSES>(grid, implications, region_types);
         self.state.restore(grid);
         result
     }
 
-    fn propagate(
+    fn propagate<const CAPTURE_CAUSES: bool>(
         &mut self,
         grid: &mut Grid,
         implications: &Implications,
@@ -273,7 +437,7 @@ impl DynamicChainWorkspace {
             if let Some(parent) = self.pending_on.pop_front() {
                 let parent_key = self.arena.key(parent);
                 let mut contradiction = None;
-                implications.for_each_weak_off(parent_key, |target_key| {
+                let mut emit = |target_key, cause: Option<OnCause>| {
                     if contradiction.is_some() {
                         return;
                     }
@@ -281,14 +445,35 @@ impl DynamicChainWorkspace {
                     if !grid.candidates(target_cell).contains(target_digit) {
                         return;
                     }
-                    let target = self.arena.child(target_key, parent);
+                    let cause = if CAPTURE_CAUSES {
+                        nishio_chain_cause(
+                            grid,
+                            parent_key,
+                            target_key,
+                            cause.expect("selected Nishio weak cause"),
+                        )
+                    } else {
+                        ChainCause::None
+                    };
+                    let target = self
+                        .arena
+                        .child::<CAPTURE_CAUSES>(target_key, parent, cause);
                     let opposite = self.node_by_key[usize::from(target_key ^ 1)];
                     if opposite != NO_NODE {
                         contradiction = Some((opposite, target));
                     } else if self.remember(target) {
                         self.pending_off.push_back(target);
                     }
-                });
+                };
+                if CAPTURE_CAUSES {
+                    implications.for_each_weak_off_with_cause(parent_key, |target_key, cause| {
+                        emit(target_key, Some(cause));
+                    });
+                } else {
+                    implications.for_each_weak_off(parent_key, |target_key| {
+                        emit(target_key, None);
+                    });
+                }
                 if contradiction.is_some() {
                     return contradiction;
                 }
@@ -296,7 +481,7 @@ impl DynamicChainWorkspace {
             }
 
             if let Some(parent) = self.pending_off.pop_front() {
-                self.collect_strong_nodes(grid, region_types, parent);
+                self.collect_strong_nodes::<CAPTURE_CAUSES>(grid, region_types, parent);
                 let parent_key = self.arena.key(parent);
                 self.state.remove(grid, parent_key, parent);
                 let strong_count = self.strong_nodes.len();
@@ -318,7 +503,12 @@ impl DynamicChainWorkspace {
         }
     }
 
-    fn collect_strong_nodes(&mut self, grid: &Grid, region_types: &[usize], parent: u32) {
+    fn collect_strong_nodes<const CAPTURE_CAUSES: bool>(
+        &mut self,
+        grid: &Grid,
+        region_types: &[usize],
+        parent: u32,
+    ) {
         self.strong_nodes.clear();
         let parent_key = self.arena.key(parent);
         let (source_cell, digit) = decode_candidate(parent_key);
@@ -349,7 +539,9 @@ impl DynamicChainWorkspace {
             self.strong_cell_stamps[target_cell.index()] = generation;
 
             let target_key = potential_key(target_cell, digit, true);
-            let target = self.arena.child(target_key, parent);
+            let target =
+                self.arena
+                    .child::<CAPTURE_CAUSES>(target_key, parent, ChainCause::Region(region));
             for &raw_cell in topology.region_cells(region) {
                 let cell = CellId::new(raw_cell).expect("dynamic-chain region cell");
                 if self.state.original_mask(grid, cell).contains(digit)
@@ -369,6 +561,13 @@ struct RankedNishio {
     inference: Inference,
     java_difficulty: f64,
     complexity: u16,
+}
+
+#[derive(Clone, Copy)]
+struct NishioProofLocator {
+    source_cell: CellId,
+    source_digit: Digit,
+    source_on: bool,
 }
 
 impl RankedNishio {
@@ -463,6 +662,119 @@ pub fn find_nishio_forcing_chain(grid: &Grid, config: EngineConfig) -> Option<In
     best.map(|candidate| candidate.inference)
 }
 
+/// Find Java's first ranked Nishio chain and materialize only its selected
+/// contradiction proof.
+///
+/// The compact finder above remains the rating path. This opt-in GUI finder
+/// retains only the winning source coordinates while ranking, then replays
+/// that one assumption to copy the target-ON and target-OFF ancestor DAGs.
+#[must_use]
+pub fn find_nishio_forcing_chain_with_proof(
+    grid: &Grid,
+    config: EngineConfig,
+) -> Option<NishioForcingChainWithProof> {
+    let implications = Implications::weak_only(grid, config);
+    let region_types = active_region_types(grid, config);
+    let mut working = grid.clone();
+    let mut workspace = DynamicChainWorkspace::new();
+    let mut best: Option<(RankedNishio, NishioProofLocator)> = None;
+
+    for raw_cell in 0_u8..81 {
+        let cell = CellId::new(raw_cell).expect("cell index loop");
+        if grid.value(cell) != 0 || grid.candidates(cell).count() <= 1 {
+            continue;
+        }
+        for digit in grid.candidates(cell).iter() {
+            for source_on in [true, false] {
+                let Some((terminal_on, terminal_off)) = workspace.contradiction(
+                    &mut working,
+                    &implications,
+                    &region_types,
+                    cell,
+                    digit,
+                    source_on,
+                ) else {
+                    continue;
+                };
+                let contradiction_key = workspace.arena.key(terminal_off);
+                debug_assert_eq!(contradiction_key ^ 1, workspace.arena.key(terminal_on));
+                let (target_cell, target_digit) = decode_candidate(contradiction_key);
+                let complexity = workspace
+                    .arena
+                    .ancestor_count(terminal_on)
+                    .checked_add(workspace.arena.ancestor_count(terminal_off))
+                    .expect("Nishio complexity");
+                let (rating, java_difficulty) = nishio_rating(complexity);
+                let evidence = Evidence::NishioForcingChain {
+                    source_cell: cell,
+                    source_digit: digit,
+                    source_on,
+                    target_cell,
+                    target_digit,
+                    complexity,
+                };
+                let inference = if source_on {
+                    let mut removals = CandidateRemovalsBuilder::with_capacity(1);
+                    removals.add(cell, CandidateMask::of(digit));
+                    Inference::elimination(
+                        Technique::NishioForcingChain,
+                        rating,
+                        removals.build(),
+                        evidence,
+                    )
+                } else {
+                    Inference::placement(
+                        Technique::NishioForcingChain,
+                        rating,
+                        cell,
+                        digit,
+                        evidence,
+                    )
+                };
+                let candidate = RankedNishio {
+                    inference,
+                    java_difficulty,
+                    complexity,
+                };
+                if best
+                    .as_ref()
+                    .is_none_or(|(current, _)| candidate.precedes(current))
+                {
+                    best = Some((
+                        candidate,
+                        NishioProofLocator {
+                            source_cell: cell,
+                            source_digit: digit,
+                            source_on,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+
+    let (winner, locator) = best?;
+    let (terminal_on, terminal_off) = workspace
+        .contradiction_with_proof(
+            &mut working,
+            &implications,
+            &region_types,
+            locator.source_cell,
+            locator.source_digit,
+            locator.source_on,
+        )
+        .expect("ranked Nishio contradiction is reproducible");
+    let proof = SelectedChainProof::new(vec![
+        materialize_nishio_view(&workspace.arena, terminal_on, ChainProofViewKind::NishioOn),
+        materialize_nishio_view(
+            &workspace.arena,
+            terminal_off,
+            ChainProofViewKind::NishioOff,
+        ),
+    ]);
+    Some(NishioForcingChainWithProof::new(winner.inference, proof))
+}
+
 fn nishio_rating(complexity: u16) -> (Rating, f64) {
     let length = i32::from(complexity) - 2;
     let mut ceiling = 4_i32;
@@ -491,11 +803,39 @@ mod tests {
     use std::sync::Arc;
 
     use sukaku_forge_core::{
-        CandidateMask, CellId, ConstraintTopology, Grid, Puzzle, VariantConfig,
+        CandidateMask, CellId, ConstraintTopology, Digit, Grid, Puzzle, RegionId, VariantConfig,
     };
 
-    use super::{find_nishio_forcing_chain, nishio_rating};
-    use crate::{EngineConfig, Evidence, Rating};
+    use super::{
+        DynamicChainWorkspace, Implications, active_region_types, find_nishio_forcing_chain,
+        find_nishio_forcing_chain_with_proof, nishio_rating,
+    };
+    use crate::{
+        ChainCause, ChainProofView, ChainProofViewKind, ChainState, EngineConfig, Evidence, Rating,
+    };
+
+    type ProofNodeShape = (u8, u8, ChainState, Vec<(usize, ChainCause)>);
+
+    fn proof_shape(view: &ChainProofView) -> Vec<ProofNodeShape> {
+        view.nodes()
+            .iter()
+            .map(|node| {
+                (
+                    node.cell().raw(),
+                    node.digit().get(),
+                    node.state(),
+                    node.parents()
+                        .iter()
+                        .map(|parent| (parent.node().index(), parent.cause()))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn region(type_index: u8, region_index: u8) -> ChainCause {
+        ChainCause::Region(RegionId::new(type_index, region_index).unwrap())
+    }
 
     fn sparse_snapshot(entries: &[(u8, &str)]) -> Grid {
         let values = Puzzle::parse(&".".repeat(81)).unwrap();
@@ -538,6 +878,28 @@ mod tests {
         let mut grid = sparse_snapshot(&[(0, "78"), (1, "79"), (9, "79")]);
         let inference = find_nishio_forcing_chain(&grid, EngineConfig::default())
             .expect("Nishio forcing chain");
+        let detailed = find_nishio_forcing_chain_with_proof(&grid, EngineConfig::default())
+            .expect("selected Nishio proof");
+        assert_eq!(detailed.inference(), &inference);
+        let views = detailed.proof().views();
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].kind(), ChainProofViewKind::NishioOn);
+        assert_eq!(views[1].kind(), ChainProofViewKind::NishioOff);
+        assert_eq!(
+            proof_shape(&views[0]),
+            [
+                (9, 7, ChainState::On, vec![(1, region(2, 0))]),
+                (0, 7, ChainState::Off, vec![]),
+            ]
+        );
+        assert_eq!(
+            proof_shape(&views[1]),
+            [
+                (9, 7, ChainState::Off, vec![(1, region(0, 0))]),
+                (1, 7, ChainState::On, vec![(2, region(1, 0))]),
+                (0, 7, ChainState::Off, vec![]),
+            ]
+        );
         assert_eq!(inference.rating(), Rating::from_tenths(75));
         assert_eq!(inference.name(), "Nishio Forcing Chains");
         assert_eq!(inference.short_name(), "NFC");
@@ -554,6 +916,47 @@ mod tests {
         assert_eq!(
             grid.candidates(CellId::new(0).unwrap()),
             CandidateMask::EMPTY
+        );
+    }
+
+    #[test]
+    fn compact_closure_does_not_capture_presentation_causes() {
+        let grid = sparse_snapshot(&[(0, "78"), (1, "79"), (9, "79")]);
+        let config = EngineConfig::default();
+        let implications = Implications::weak_only(&grid, config);
+        let region_types = active_region_types(&grid, config);
+        let mut workspace = DynamicChainWorkspace::new();
+        let mut working = grid.clone();
+
+        workspace
+            .contradiction(
+                &mut working,
+                &implications,
+                &region_types,
+                CellId::new(0).unwrap(),
+                Digit::new(7).unwrap(),
+                false,
+            )
+            .expect("compact Nishio contradiction");
+        assert!(workspace.arena.causes.is_empty());
+
+        workspace
+            .contradiction_with_proof(
+                &mut working,
+                &implications,
+                &region_types,
+                CellId::new(0).unwrap(),
+                Digit::new(7).unwrap(),
+                false,
+            )
+            .expect("selected Nishio contradiction");
+        assert_eq!(workspace.arena.causes.len(), workspace.arena.nodes.len());
+        assert!(
+            workspace
+                .arena
+                .causes
+                .iter()
+                .any(|cause| *cause != ChainCause::None)
         );
     }
 
@@ -601,6 +1004,43 @@ mod tests {
         );
         let inference = find_nishio_forcing_chain(&grid, EngineConfig::default())
             .expect("anti-knight Nishio chain");
+        let detailed = find_nishio_forcing_chain_with_proof(&grid, EngineConfig::default())
+            .expect("selected anti-knight Nishio proof");
+        assert_eq!(detailed.inference(), &inference);
+        let views = detailed.proof().views();
+        assert_eq!(
+            views.iter().map(ChainProofView::kind).collect::<Vec<_>>(),
+            [ChainProofViewKind::NishioOn, ChainProofViewKind::NishioOff]
+        );
+        assert_eq!(
+            proof_shape(&views[0]),
+            [
+                (
+                    22,
+                    3,
+                    ChainState::On,
+                    vec![(1, region(0, 1)), (2, region(0, 1))],
+                ),
+                (21, 3, ChainState::Off, vec![(3, ChainCause::Visibility)],),
+                (3, 3, ChainState::Off, vec![(3, region(1, 0))]),
+                (2, 3, ChainState::On, vec![]),
+            ]
+        );
+        assert_eq!(
+            proof_shape(&views[1]),
+            [
+                (22, 3, ChainState::Off, vec![(1, ChainCause::Visibility)],),
+                (
+                    15,
+                    3,
+                    ChainState::On,
+                    vec![(2, region(1, 1)), (3, region(1, 1))],
+                ),
+                (11, 3, ChainState::Off, vec![(4, region(0, 0))]),
+                (9, 3, ChainState::Off, vec![(4, region(0, 0))]),
+                (2, 3, ChainState::On, vec![]),
+            ]
+        );
         assert_eq!(inference.rating(), Rating::from_tenths(77));
         assert_eq!(
             inference.description(grid.topology()),
@@ -636,6 +1076,25 @@ mod tests {
         );
         let inference = find_nishio_forcing_chain(&grid, EngineConfig::default())
             .expect("long anti-knight Nishio chain");
+        let detailed = find_nishio_forcing_chain_with_proof(&grid, EngineConfig::default())
+            .expect("selected long anti-knight Nishio proof");
+        assert_eq!(detailed.inference(), &inference);
+        let views = detailed.proof().views();
+        assert_eq!((views[0].nodes().len(), views[1].nodes().len()), (21, 23));
+        assert_eq!(
+            views[0].nodes()[12]
+                .parents()
+                .iter()
+                .map(|parent| (parent.node().index(), parent.cause()))
+                .collect::<Vec<_>>(),
+            [
+                (16, region(0, 8)),
+                (17, region(0, 8)),
+                (18, region(0, 8)),
+                (19, region(0, 8)),
+                (20, region(0, 8)),
+            ]
+        );
         assert_eq!(inference.rating(), Rating::from_tenths(82));
         assert_eq!(
             inference.description(grid.topology()),

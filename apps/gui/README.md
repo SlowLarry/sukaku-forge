@@ -65,10 +65,17 @@ request ID. The adapters only transport protocol JSON. The mock state reducer
 is not a Sudoku constraint engine; checked edits, topology rebuilds and exact
 session undo belong to the Rust app/session layer.
 
-The current shell boots a built-in Classic puzzle and supports next/apply,
-value placement, candidate toggling, undo and redo. Value clearing,
-new/open/save, all-hints/Solve, generation, cooperative cancellation and
-signed releases plus macOS/Linux packaging remain follow-up work.
+The current shell boots a built-in Classic puzzle and exposes the legacy-style
+`File / Edit / Tools / Options / Variants / Help` menubar. It supports blank
+puzzles, 81-character value-grid import (`.` or `0` for empty cells),
+next/apply/apply-and-next, value and candidate entry, candidate visibility,
+undo/redo, persistent light/dark themes, original/revised rating mode, and
+Classic, Anti-knight, and Sudoku X session presets. Solver settings can be
+changed only while the session is at its original puzzle state, because the
+change recreates the authoritative Rust session.
+
+Value clearing, filesystem open/save, all-hints/Solve, generation, cooperative
+cancellation, signed releases, and macOS/Linux packaging remain follow-up work.
 
 See [DESIGN.md](DESIGN.md) for the design tokens and
 [../../docs/GUI_ARCHITECTURE.md](../../docs/GUI_ARCHITECTURE.md) for the full

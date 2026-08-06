@@ -2,8 +2,8 @@
 //!
 //! The normal solver and rating path deliberately keep only compact
 //! [`Inference`](crate::Inference) evidence. These types are populated only by
-//! the presentation-oriented search entry points after the winning static
-//! forcing-chain candidate has been ranked.
+//! presentation-oriented search entry points after the winning chaining
+//! candidate has been ranked.
 
 use sukaku_forge_core::{CellId, Digit, RegionId};
 
@@ -34,6 +34,9 @@ pub enum ChainCause {
     Region(RegionId),
     /// The implication follows from a non-region visibility constraint.
     Visibility,
+    /// One advanced or nested deduction is collapsed to its outer dependency
+    /// edges; the inner proof is intentionally not materialized.
+    Derived,
 }
 
 /// A node identity scoped to one [`ChainProofView`].
@@ -131,13 +134,26 @@ pub enum ChainProofViewKind {
     Forcing,
     CycleForward,
     CycleReverse,
+    NishioOn,
+    NishioOff,
+    /// One cell-forcing outer branch, with Java's zero-based digit ordinal.
+    CellBranch {
+        branch: u8,
+    },
+    /// One region-forcing outer branch, with Java's zero-based cell ordinal.
+    RegionBranch {
+        branch: u8,
+    },
+    AssumptionOn,
+    AssumptionOff,
+    ContradictionOn,
+    ContradictionOff,
 }
 
 /// One target-first, breadth-first legacy chain view.
 ///
-/// Parents always refer to nodes later in `nodes` for the current static,
-/// single-parent chains. Keeping explicit IDs makes the contract usable by
-/// future multi-parent proof materializers without changing traversal order.
+/// Parents always refer to nodes later in `nodes`. Explicit IDs preserve
+/// Java's ordered multi-parent dynamic implication graphs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChainProofView {
     kind: ChainProofViewKind,
@@ -176,10 +192,12 @@ impl ChainProofView {
     }
 }
 
-/// Full flat presentation proof for one selected static FCC winner.
+/// Full flat presentation proof for one selected chaining winner.
 ///
 /// Forcing chains contain one `Forcing` view. Bidirectional cycles contain a
 /// `CycleForward` view followed by Java's complemented `CycleReverse` view.
+/// Nishio contradictions contain target-ON and target-OFF views.
+/// Multiple chains contain Java-ordered outer branch or contradiction views.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectedChainProof {
     views: Box<[ChainProofView]>,
@@ -187,7 +205,7 @@ pub struct SelectedChainProof {
 
 impl SelectedChainProof {
     pub(crate) fn new(views: Vec<ChainProofView>) -> Self {
-        debug_assert!(matches!(views.len(), 1 | 2));
+        debug_assert!(!views.is_empty());
         Self {
             views: views.into_boxed_slice(),
         }
@@ -196,6 +214,64 @@ impl SelectedChainProof {
     #[must_use]
     pub fn views(&self) -> &[ChainProofView] {
         &self.views
+    }
+}
+
+/// One selected Nishio inference paired with its opt-in contradiction proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NishioForcingChainWithProof {
+    inference: Inference,
+    proof: SelectedChainProof,
+}
+
+impl NishioForcingChainWithProof {
+    pub(crate) const fn new(inference: Inference, proof: SelectedChainProof) -> Self {
+        Self { inference, proof }
+    }
+
+    #[must_use]
+    pub const fn inference(&self) -> &Inference {
+        &self.inference
+    }
+
+    #[must_use]
+    pub const fn proof(&self) -> &SelectedChainProof {
+        &self.proof
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Inference, SelectedChainProof) {
+        (self.inference, self.proof)
+    }
+}
+
+/// One selected Multiple or Dynamic Forcing Chain paired with its opt-in outer
+/// proof views. Advanced and nested deductions may be retained as collapsed
+/// derived edges rather than expanded inner proofs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultipleForcingChainWithProof {
+    inference: Inference,
+    proof: SelectedChainProof,
+}
+
+impl MultipleForcingChainWithProof {
+    pub(crate) const fn new(inference: Inference, proof: SelectedChainProof) -> Self {
+        Self { inference, proof }
+    }
+
+    #[must_use]
+    pub const fn inference(&self) -> &Inference {
+        &self.inference
+    }
+
+    #[must_use]
+    pub const fn proof(&self) -> &SelectedChainProof {
+        &self.proof
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Inference, SelectedChainProof) {
+        (self.inference, self.proof)
     }
 }
 

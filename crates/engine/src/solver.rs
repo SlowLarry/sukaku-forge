@@ -8,14 +8,17 @@ use crate::{
     NonConsecutiveHintKind, Rating, RatingResult, RatingTracker, SearchPolicy, Technique,
     TechniqueGate, find_aligned_pair_exclusion, find_aligned_triplet_exclusion, find_alphabet_wing,
     find_bivalue_universal_grave, find_direct_hidden_set, find_direct_locking,
-    find_dynamic_forcing_chain, find_dynamic_forcing_chain_plus_checked, find_fish,
-    find_forcing_cell_ferz_non_consecutive, find_forcing_cell_non_consecutive,
+    find_dynamic_forcing_chain, find_dynamic_forcing_chain_plus_checked,
+    find_dynamic_forcing_chain_plus_with_proof_checked, find_dynamic_forcing_chain_with_proof,
+    find_fish, find_forcing_cell_ferz_non_consecutive, find_forcing_cell_non_consecutive,
     find_forcing_chain_cycle, find_forcing_chain_cycle_with_proof, find_four_strong_links,
     find_generalized_intersections, find_hidden_set, find_hidden_single,
     find_locked_ferz_non_consecutive, find_locked_non_consecutive, find_locking,
-    find_multiple_forcing_chain, find_naked_set, find_naked_single,
-    find_nested_forcing_chain_checked, find_nishio_forcing_chain, find_three_strong_links,
-    find_two_strong_links, find_unique_loop, find_wing,
+    find_multiple_forcing_chain, find_multiple_forcing_chain_with_proof, find_naked_set,
+    find_naked_single, find_nested_forcing_chain_checked,
+    find_nested_forcing_chain_with_proof_checked, find_nishio_forcing_chain,
+    find_nishio_forcing_chain_with_proof, find_three_strong_links, find_two_strong_links,
+    find_unique_loop, find_wing,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -761,13 +764,13 @@ impl Solver {
         SearchOutcome::Incomplete(PortGap::IndirectTechniques)
     }
 
-    /// Select the next inference and materialize a proof only for a static FCC
-    /// winner.
+    /// Select the next inference and materialize proof views only for the
+    /// winning chain-family hint.
     ///
     /// This walks the same producer registry as [`Self::next_inference`] once.
-    /// Ordinary producers use their compact finders; only the FCC slot calls
-    /// the opt-in detailed finder. The compact method remains a separate,
-    /// unchanged path used by rating.
+    /// Ordinary producers use their compact finders; supported chain slots
+    /// call opt-in detailed finders only when reached. The compact method
+    /// remains a separate, unchanged path used by rating.
     #[must_use]
     pub fn next_inference_with_selected_proof(&self, grid: &Grid) -> PresentationSearchOutcome {
         if grid.is_solved() {
@@ -846,17 +849,40 @@ impl Solver {
                     (find_aligned_triplet_exclusion(grid), None)
                 }
                 ProducerKind::NishioForcingChain => {
-                    (find_nishio_forcing_chain(grid, self.config), None)
+                    if let Some(detailed) = find_nishio_forcing_chain_with_proof(grid, self.config)
+                    {
+                        let (inference, proof) = detailed.into_parts();
+                        (Some(inference), Some(proof))
+                    } else {
+                        (None, None)
+                    }
                 }
                 ProducerKind::MultipleForcingChain => {
-                    (find_multiple_forcing_chain(grid, self.config), None)
+                    if let Some(detailed) =
+                        find_multiple_forcing_chain_with_proof(grid, self.config)
+                    {
+                        let (inference, proof) = detailed.into_parts();
+                        (Some(inference), Some(proof))
+                    } else {
+                        (None, None)
+                    }
                 }
                 ProducerKind::DynamicForcingChain => {
-                    (find_dynamic_forcing_chain(grid, self.config), None)
+                    if let Some(detailed) = find_dynamic_forcing_chain_with_proof(grid, self.config)
+                    {
+                        let (inference, proof) = detailed.into_parts();
+                        (Some(inference), Some(proof))
+                    } else {
+                        (None, None)
+                    }
                 }
                 ProducerKind::DynamicForcingChainPlus => {
-                    match find_dynamic_forcing_chain_plus_checked(grid, self.config) {
-                        Ok(inference) => (inference, None),
+                    match find_dynamic_forcing_chain_plus_with_proof_checked(grid, self.config) {
+                        Ok(Some(detailed)) => {
+                            let (inference, proof) = detailed.into_parts();
+                            (Some(inference), Some(proof))
+                        }
+                        Ok(None) => (None, None),
                         Err(boundary) => {
                             return PresentationSearchOutcome::Incomplete(PortGap::LegacyFcPlus2(
                                 boundary,
@@ -868,9 +894,17 @@ impl Solver {
                     level,
                     nesting_limit,
                 } => {
-                    match find_nested_forcing_chain_checked(grid, self.config, level, nesting_limit)
-                    {
-                        Ok(inference) => (inference, None),
+                    match find_nested_forcing_chain_with_proof_checked(
+                        grid,
+                        self.config,
+                        level,
+                        nesting_limit,
+                    ) {
+                        Ok(Some(detailed)) => {
+                            let (inference, proof) = detailed.into_parts();
+                            (Some(inference), Some(proof))
+                        }
+                        Ok(None) => (None, None),
                         Err(boundary) => {
                             return PresentationSearchOutcome::Incomplete(PortGap::LegacyFcPlus2(
                                 boundary,
@@ -1082,6 +1116,129 @@ mod tests {
     }
 
     #[test]
+    fn presentation_search_matches_compact_nishio_and_keeps_both_targets() {
+        let values = Puzzle::parse(
+            "....4.8.....5.8.14..4.......5....4..4.285.....3.49......5.63.4..4.7.5.6.....84...",
+        )
+        .unwrap();
+        let candidates = Puzzle::parse(
+            "1.3.567.912...67.91.3...7.9123..6......4......2...67.9.......8..23.5.7.9.23.567.9.23..67.9.2...67....3..67.9....5.....2....7.........8..23..67.91...........4.....123.5..8.1....6789...4.....1.3..6...123...7........7.9.2..56....2..5.7.9.2..567.91....67.9....5....1....6789.23..6.....3...7..12...67.....4......2....789.2...67.9...4.....1....67.9.2..............8.....5....1.....7..1....67....3...7.91.3..67.91....67....3......1......8....4.............912...67..12....7...2..5.78.12..5.7..12....7.91......89....5....1.......9.....6.....3......12....7.....4.....12....78912.....89...4.....1.......9......7..12...........5....123.....9.....6...123....89123..67.912...6..9..3..67..12......9.......8....4.....1...5.7.9.2....7.912..5.7.9",
+        )
+        .unwrap();
+        let grid = Grid::from_snapshot(
+            Arc::new(ConstraintTopology::new(VariantConfig {
+                anti_knight: true,
+                ..VariantConfig::default()
+            })),
+            &values,
+            &candidates,
+        )
+        .unwrap();
+        let solver = Solver::default();
+        let SearchOutcome::Found(compact) = solver.next_inference(&grid) else {
+            panic!("compact Nishio fixture");
+        };
+        let PresentationSearchOutcome::Found(detailed) =
+            solver.next_inference_with_selected_proof(&grid)
+        else {
+            panic!("presentation Nishio fixture");
+        };
+
+        assert_eq!(detailed.inference(), &compact);
+        assert_eq!(compact.technique(), Technique::NishioForcingChain);
+        let proof = detailed
+            .selected_chain_proof()
+            .expect("Nishio has selected proof");
+        assert_eq!(proof.views().len(), 2);
+        assert_eq!(proof.views()[0].kind(), ChainProofViewKind::NishioOn);
+        assert_eq!(proof.views()[1].kind(), ChainProofViewKind::NishioOff);
+        assert_eq!(
+            proof.views()[0].nodes()[0].cell(),
+            proof.views()[1].nodes()[0].cell()
+        );
+        assert_eq!(
+            proof.views()[0].nodes()[0].digit(),
+            proof.views()[1].nodes()[0].digit()
+        );
+        assert!(proof.views()[0].nodes()[0].state().is_on());
+        assert!(!proof.views()[1].nodes()[0].state().is_on());
+    }
+
+    #[test]
+    fn presentation_search_matches_compact_multiple_and_level_zero_dynamic() {
+        let mut grid = Grid::from_puzzle(
+            Arc::new(ConstraintTopology::new(VariantConfig::default())),
+            &Puzzle::parse(
+                "100000002520070049009000500000689000000703000090105030640010025010000070900000008",
+            )
+            .unwrap(),
+        );
+        let solver = Solver::default();
+        for step in 1..=7 {
+            let SearchOutcome::Found(inference) = solver.next_inference(&grid) else {
+                panic!("classic trace setup step {step}");
+            };
+            inference.apply(&mut grid);
+        }
+
+        let SearchOutcome::Found(compact_multiple) = solver.next_inference(&grid) else {
+            panic!("compact MFC fixture");
+        };
+        let PresentationSearchOutcome::Found(detailed_multiple) =
+            solver.next_inference_with_selected_proof(&grid)
+        else {
+            panic!("presentation MFC fixture");
+        };
+        assert_eq!(detailed_multiple.inference(), &compact_multiple);
+        assert_eq!(
+            compact_multiple.technique(),
+            Technique::MultipleForcingChain
+        );
+        let multiple_proof = detailed_multiple
+            .selected_chain_proof()
+            .expect("MFC has selected proof");
+        assert!(!multiple_proof.views().is_empty());
+        for (branch, view) in multiple_proof.views().iter().enumerate() {
+            assert_eq!(
+                view.kind(),
+                ChainProofViewKind::CellBranch {
+                    branch: u8::try_from(branch).expect("MFC branch index"),
+                }
+            );
+        }
+        compact_multiple.apply(&mut grid);
+
+        let SearchOutcome::Found(second_multiple) = solver.next_inference(&grid) else {
+            panic!("second compact MFC fixture");
+        };
+        assert_eq!(second_multiple.technique(), Technique::MultipleForcingChain);
+        second_multiple.apply(&mut grid);
+
+        let SearchOutcome::Found(compact_dynamic) = solver.next_inference(&grid) else {
+            panic!("compact level-zero DFC fixture");
+        };
+        let PresentationSearchOutcome::Found(detailed_dynamic) =
+            solver.next_inference_with_selected_proof(&grid)
+        else {
+            panic!("presentation level-zero DFC fixture");
+        };
+        assert_eq!(detailed_dynamic.inference(), &compact_dynamic);
+        assert_eq!(compact_dynamic.technique(), Technique::DynamicForcingChain);
+        let dynamic_proof = detailed_dynamic
+            .selected_chain_proof()
+            .expect("level-zero DFC has selected proof");
+        assert_eq!(dynamic_proof.views().len(), 2);
+        assert_eq!(
+            dynamic_proof.views()[0].kind(),
+            ChainProofViewKind::ContradictionOn
+        );
+        assert_eq!(
+            dynamic_proof.views()[1].kind(),
+            ChainProofViewKind::ContradictionOff
+        );
+    }
+
+    #[test]
     fn original_registry_preserves_java_order() {
         let kinds = Solver::default()
             .producer_specs(&empty_grid(VariantConfig::default()))
@@ -1272,14 +1429,20 @@ mod tests {
             Arc::new(ConstraintTopology::new(VariantConfig::default())),
             &puzzle,
         );
-        let outcome = Solver::new(EngineConfig {
+        let solver = Solver::new(EngineConfig {
             forcing_chain_plus: 2,
             ..EngineConfig::default()
-        })
-        .next_inference(&grid);
+        });
+        let outcome = solver.next_inference(&grid);
         assert_eq!(
             outcome,
             SearchOutcome::Incomplete(PortGap::LegacyFcPlus2(LegacyFcPlusBoundary::UniqueLoops))
+        );
+        assert_eq!(
+            solver.next_inference_with_selected_proof(&grid),
+            PresentationSearchOutcome::Incomplete(PortGap::LegacyFcPlus2(
+                LegacyFcPlusBoundary::UniqueLoops,
+            ))
         );
     }
 

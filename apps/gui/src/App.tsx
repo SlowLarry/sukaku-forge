@@ -1,6 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import type { ApplicationPort, HintEffectsDto } from './applicationPort'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type {
+  ApplicationPort,
+  HintEffectsDto,
+  RatingModeDto,
+  VariantInputDto,
+} from './applicationPort'
+import { AppMenu, type VariantPreset } from './components/AppMenu'
 import { Board } from './components/Board'
+import { AboutDialog, ImportPuzzleDialog } from './components/Dialogs'
 import { Explanation } from './components/Explanation'
 import { HintBrowser, type HintBrowserItem } from './components/HintBrowser'
 import { StatusBar, type StatusState } from './components/StatusBar'
@@ -8,7 +15,9 @@ import { Toolbar } from './components/Toolbar'
 import { ViewTabs } from './components/ViewTabs'
 import type { BoardTopology, CellRef, HintPresentation, HintView } from './model'
 import { cellName } from './model'
+import { BLANK_PUZZLE, canonicalValueGrid } from './puzzleInput'
 import { type HintResult, type SessionControllerView, useSessionController } from './sessionController'
+import { applyDocumentTheme, persistTheme, preferredTheme, type Theme } from './theme'
 
 export const DEFAULT_PUZZLE = '53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79'
 
@@ -25,15 +34,30 @@ const emptyHintView: HintView = {
 interface AppProps {
   port: ApplicationPort
   initialPuzzle?: string
+  initialTheme?: Theme
 }
 
 interface SessionWorkspaceProps {
   session: SessionControllerView
+  initialPuzzle?: string
+  initialTheme?: Theme
 }
 
 interface StatusDescriptor {
   state: StatusState
   message: string
+}
+
+const VARIANT_PRESETS = {
+  classic: { blocks: true, anti_knight: false, sudoku_x: false },
+  'anti-knight': { blocks: true, anti_knight: true, sudoku_x: false },
+  'sudoku-x': { blocks: true, anti_knight: false, sudoku_x: true },
+} satisfies Record<VariantPreset, VariantInputDto>
+
+const variantPresetFromTopology = (topology: BoardTopology | null): VariantPreset => {
+  if (topology?.variant?.antiKnight) return 'anti-knight'
+  if (topology?.variant?.sudokuX) return 'sudoku-x'
+  return 'classic'
 }
 
 const titleFromKey = (value: string) => value
@@ -188,12 +212,23 @@ function HintOutcomeDetails({ hint, result }: { hint: HintPresentation | null; r
   )
 }
 
-export function SessionWorkspace({ session }: SessionWorkspaceProps) {
+export function SessionWorkspace({
+  session,
+  initialPuzzle = DEFAULT_PUZZLE,
+  initialTheme,
+}: SessionWorkspaceProps) {
   const [selectedCell, setSelectedCell] = useState<CellRef | null>(null)
   const [selectedViewId, setSelectedViewId] = useState('')
   const [candidatesVisible, setCandidatesVisible] = useState(true)
   const [candidateEntry, setCandidateEntry] = useState(false)
   const [localNotice, setLocalNotice] = useState<string | null>(null)
+  const [theme, setTheme] = useState<Theme>(() => initialTheme ?? preferredTheme())
+  const [ratingMode, setRatingMode] = useState<RatingModeDto>('original')
+  const [sessionPuzzle, setSessionPuzzle] = useState(() => canonicalValueGrid(initialPuzzle))
+  const [importOpen, setImportOpen] = useState(false)
+  const [aboutOpen, setAboutOpen] = useState(false)
+  const importReturnFocus = useRef<HTMLButtonElement | null>(null)
+  const aboutReturnFocus = useRef<HTMLButtonElement | null>(null)
 
   const selectedView = session.hint?.views.find((view) => view.id === selectedViewId)
     ?? session.hint?.views[0]
@@ -203,15 +238,91 @@ export function SessionWorkspace({ session }: SessionWorkspaceProps) {
     [session.hint, session.hintResult],
   )
   const status = statusDescriptor(session, localNotice)
+  const sessionBusy = session.busy
+  const createSession = session.createSession
   const sessionReady = session.snapshot != null && session.topology != null
   const canApply = session.hintResult?.kind === 'presented' || session.hintResult?.kind === 'unsupported'
+  const variantPreset = variantPresetFromTopology(session.topology)
+  const canReconfigure = sessionReady && !session.busy && !session.snapshot?.canUndo
   const clueCount = session.snapshot?.givens?.filter(Boolean).length
 
-  const run = (action: () => Promise<void>) => {
-    if (session.busy) return
+  const run = useCallback((action: () => Promise<void>) => {
+    if (sessionBusy) return
     setLocalNotice(null)
     void action()
-  }
+  }, [sessionBusy])
+
+  const startSession = useCallback((
+    puzzle: string,
+    preset: VariantPreset,
+    mode: RatingModeDto,
+    notice: string,
+  ) => {
+    if (sessionBusy) return Promise.resolve(false)
+    setLocalNotice(null)
+    return createSession(puzzle, {
+      variant: VARIANT_PRESETS[preset],
+      engine: { rating_mode: mode },
+    }).then((accepted) => {
+      if (!accepted) return false
+      setSessionPuzzle(puzzle)
+      setRatingMode(mode)
+      setSelectedCell(null)
+      setSelectedViewId('')
+      setLocalNotice(notice)
+      return true
+    })
+  }, [createSession, sessionBusy])
+
+  const handleNew = useCallback(() => {
+    void startSession(BLANK_PUZZLE, variantPreset, ratingMode, 'Started a blank puzzle.')
+  }, [ratingMode, startSession, variantPreset])
+
+  const handleImport = useCallback((puzzle: string) => {
+    setImportOpen(false)
+    void startSession(puzzle, variantPreset, ratingMode, 'Imported an 81-character puzzle.')
+  }, [ratingMode, startSession, variantPreset])
+
+  const handleTheme = useCallback((nextTheme: Theme) => {
+    setTheme(nextTheme)
+    persistTheme(nextTheme)
+    applyDocumentTheme(nextTheme)
+  }, [])
+
+  const handleRatingMode = useCallback((mode: RatingModeDto) => {
+    if (!canReconfigure || mode === ratingMode) return
+    void startSession(sessionPuzzle, variantPreset, mode, `Using ${mode} ratings.`)
+  }, [canReconfigure, ratingMode, sessionPuzzle, startSession, variantPreset])
+
+  const handleVariantPreset = useCallback((preset: VariantPreset) => {
+    if (!canReconfigure || preset === variantPreset) return
+    void startSession(sessionPuzzle, preset, ratingMode, `Started the ${preset} variant.`)
+  }, [canReconfigure, ratingMode, sessionPuzzle, startSession, variantPreset])
+
+  const handleApplyAndContinue = useCallback(() => {
+    run(session.applyAndNext)
+  }, [run, session.applyAndNext])
+
+  const handleUndo = useCallback(() => run(session.undo), [run, session.undo])
+  const handleRedo = useCallback(() => run(session.redo), [run, session.redo])
+  const handleNextHint = useCallback(() => run(session.nextHint), [run, session.nextHint])
+  const handleApply = useCallback(() => run(session.applyHint), [run, session.applyHint])
+  const handleToggleCandidates = useCallback(() => {
+    setCandidatesVisible((current) => !current)
+  }, [])
+  const handleToggleCandidateEntry = useCallback(() => {
+    setCandidateEntry((current) => !current)
+  }, [])
+  const handleOpenImport = useCallback((returnFocus: HTMLButtonElement | null) => {
+    importReturnFocus.current = returnFocus
+    setImportOpen(true)
+  }, [])
+  const handleOpenAbout = useCallback((returnFocus: HTMLButtonElement | null) => {
+    aboutReturnFocus.current = returnFocus
+    setAboutOpen(true)
+  }, [])
+  const handleCloseImport = useCallback(() => setImportOpen(false), [])
+  const handleCloseAbout = useCallback(() => setAboutOpen(false), [])
 
   const handleBoardKey = (event: React.KeyboardEvent) => {
     if (event.altKey || event.ctrlKey || event.metaKey) return
@@ -279,9 +390,41 @@ export function SessionWorkspace({ session }: SessionWorkspaceProps) {
     }
   }
 
+  const menubar = (
+    <AppMenu
+      busy={session.busy}
+      sessionReady={sessionReady}
+      canUndo={Boolean(session.snapshot?.canUndo)}
+      canRedo={Boolean(session.snapshot?.canRedo)}
+      canRequestHint={session.snapshot != null}
+      canApply={canApply}
+      candidatesVisible={candidatesVisible}
+      candidateEntry={candidateEntry}
+      theme={theme}
+      ratingMode={ratingMode}
+      variantPreset={variantPreset}
+      canReconfigure={canReconfigure}
+      onNew={handleNew}
+      onImport={handleOpenImport}
+      onUndo={handleUndo}
+      onRedo={handleRedo}
+      onNextHint={handleNextHint}
+      onApply={handleApply}
+      onApplyAndNext={handleApplyAndContinue}
+      onToggleCandidates={handleToggleCandidates}
+      onToggleCandidateEntry={handleToggleCandidateEntry}
+      onTheme={handleTheme}
+      onRatingMode={handleRatingMode}
+      onVariantPreset={handleVariantPreset}
+      onAbout={handleOpenAbout}
+    />
+  )
+
   return (
-    <div className="app-shell">
+    <>
+    <div className="app-shell" data-theme={theme}>
       <Toolbar
+        menubar={menubar}
         busy={session.busy}
         sessionReady={sessionReady}
         canUndo={Boolean(session.snapshot?.canUndo)}
@@ -291,12 +434,13 @@ export function SessionWorkspace({ session }: SessionWorkspaceProps) {
         candidatesVisible={candidatesVisible}
         candidateEntry={candidateEntry}
         variantLabel={variantLabel(session.topology)}
-        onUndo={() => run(session.undo)}
-        onRedo={() => run(session.redo)}
-        onRequestHint={() => run(session.nextHint)}
-        onToggleCandidates={() => setCandidatesVisible((current) => !current)}
-        onToggleCandidateEntry={() => setCandidateEntry((current) => !current)}
-        onApply={() => run(session.applyHint)}
+        onUndo={handleUndo}
+        onRedo={handleRedo}
+        onRequestHint={handleNextHint}
+        onToggleCandidates={handleToggleCandidates}
+        onToggleCandidateEntry={handleToggleCandidateEntry}
+        onApply={handleApply}
+        onApplyAndContinue={handleApplyAndContinue}
       />
       <main className="workspace" aria-busy={session.busy}>
         <div className="board-pane">
@@ -341,19 +485,29 @@ export function SessionWorkspace({ session }: SessionWorkspaceProps) {
         clueCount={clueCount}
       />
     </div>
+    {importOpen && (
+      <ImportPuzzleDialog
+        onClose={handleCloseImport}
+        onImport={handleImport}
+        returnFocus={importReturnFocus.current}
+      />
+    )}
+    {aboutOpen && <AboutDialog onClose={handleCloseAbout} returnFocus={aboutReturnFocus.current} />}
+    </>
   )
 }
 
-export default function App({ port, initialPuzzle = DEFAULT_PUZZLE }: AppProps) {
+export default function App({ port, initialPuzzle = DEFAULT_PUZZLE, initialTheme }: AppProps) {
   const session = useSessionController(port)
   const createSession = session.createSession
   const startedSession = useRef<{ port: ApplicationPort; puzzle: string } | null>(null)
+  const canonicalPuzzle = canonicalValueGrid(initialPuzzle)
 
   useEffect(() => {
-    if (startedSession.current?.port === port && startedSession.current.puzzle === initialPuzzle) return
-    startedSession.current = { port, puzzle: initialPuzzle }
-    void createSession(initialPuzzle)
-  }, [createSession, initialPuzzle, port])
+    if (startedSession.current?.port === port && startedSession.current.puzzle === canonicalPuzzle) return
+    startedSession.current = { port, puzzle: canonicalPuzzle }
+    void createSession(canonicalPuzzle)
+  }, [canonicalPuzzle, createSession, port])
 
-  return <SessionWorkspace session={session} />
+  return <SessionWorkspace session={session} initialPuzzle={canonicalPuzzle} initialTheme={initialTheme} />
 }

@@ -32,10 +32,13 @@ pub use inference::{
 };
 pub use multiple_chains::{
     LegacyFcPlusBoundary, find_dynamic_forcing_chain, find_dynamic_forcing_chain_plus,
-    find_dynamic_forcing_chain_plus_checked, find_multiple_forcing_chain,
-    find_nested_forcing_chain, find_nested_forcing_chain_checked,
+    find_dynamic_forcing_chain_plus_checked, find_dynamic_forcing_chain_plus_with_proof,
+    find_dynamic_forcing_chain_plus_with_proof_checked, find_dynamic_forcing_chain_with_proof,
+    find_multiple_forcing_chain, find_multiple_forcing_chain_with_proof, find_nested_forcing_chain,
+    find_nested_forcing_chain_checked, find_nested_forcing_chain_with_proof,
+    find_nested_forcing_chain_with_proof_checked,
 };
-pub use nishio::find_nishio_forcing_chain;
+pub use nishio::{find_nishio_forcing_chain, find_nishio_forcing_chain_with_proof};
 pub use non_consecutive::{
     NonConsecutiveCellSequence, NonConsecutiveDigitSequence, NonConsecutiveGeometry,
     NonConsecutiveHint, NonConsecutiveHintKind, find_forcing_cell_ferz_non_consecutive,
@@ -44,7 +47,8 @@ pub use non_consecutive::{
 };
 pub use presentation_proof::{
     ChainCause, ChainNodeId, ChainProofNode, ChainProofParent, ChainProofView, ChainProofViewKind,
-    ChainState, ForcingChainWithProof, SelectedChainProof,
+    ChainState, ForcingChainWithProof, MultipleForcingChainWithProof, NishioForcingChainWithProof,
+    SelectedChainProof,
 };
 pub use producers::{
     find_direct_hidden_set, find_direct_locking, find_generalized_intersections,
