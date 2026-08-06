@@ -6,12 +6,14 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "build:pages": "tsc -b && vite build --base /sukaku-forge/ && npm run verify:pages",
     "build:web": "cd ../.. && make build-web",
     "lint": "eslint .",
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",
-    "typecheck": "tsc -b"
+    "typecheck": "tsc -b",
+    "verify:pages": "node scripts/verify-pages-build.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",

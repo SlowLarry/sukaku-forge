@@ -10,6 +10,8 @@ future techniques and optimizations.
 
 ## Downloads
 
+Web UI deployment target: [slowlarry.github.io/sukaku-forge](https://slowlarry.github.io/sukaku-forge/).
+
 Windows `.exe` and `.msi` packages are built by the
 [Windows desktop workflow](https://github.com/SlowLarry/sukaku-forge/actions/workflows/windows-desktop.yml).
 Version tags create draft GitHub Releases. Current development packages are
