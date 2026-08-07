@@ -159,6 +159,7 @@ button:disabled { cursor: default; opacity: .42; }
 
 .brand { display: flex; align-items: center; gap: 10px; font-size: 19px; font-weight: 700; letter-spacing: -.025em; }
 .brand-mark { width: 27px; height: 27px; color: var(--accent); }
+.brand-version { margin-left: -3px; color: var(--ink-quiet); font-size: 10px; font-weight: 600; letter-spacing: .02em; }
 .window-dots { display: flex; gap: 17px; align-items: center; }
 .window-dots i { display: block; width: 11px; height: 11px; border: 1.5px solid var(--window-control); }
 .window-dots i:first-child { width: 12px; height: 1px; border: 0; background: var(--window-control); }
@@ -341,6 +342,7 @@ button:disabled { cursor: default; opacity: .42; }
 .about-copy { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 10px; margin-top: 19px; color: var(--ink-soft); }
 .about-copy svg { width: 25px; height: 25px; color: var(--accent); }
 .about-copy p { margin: 1px 0 0; font-size: 13px; line-height: 1.6; }
+.about-copy .about-version { margin: 0 0 4px; color: var(--ink); font-size: 12px; font-weight: 700; }
 
 .workspace {
   min-height: 0;

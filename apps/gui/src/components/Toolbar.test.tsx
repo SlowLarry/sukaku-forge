@@ -1,5 +1,6 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
+import { APP_VERSION } from '../appVersion'
 import { Toolbar } from './Toolbar'
 
 const props = {
@@ -35,6 +36,7 @@ describe('Toolbar', () => {
     expect(markup).toContain('>Apply hint</span>')
     expect(markup).toContain('>Solve step</span>')
     expect(markup).toContain('Variant: Classic Sudoku')
+    expect(markup).toContain(`v${APP_VERSION}`)
     expect(markup).toContain('aria-label="Show candidates" aria-pressed="true"')
     expect(markup).not.toContain('>New</span>')
   })

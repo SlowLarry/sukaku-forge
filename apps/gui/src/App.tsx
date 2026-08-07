@@ -50,15 +50,37 @@ interface StatusDescriptor {
   message: string
 }
 
+const CLASSIC_VARIANT = {
+  blocks: true,
+  disjoint_groups: false,
+  sudoku_x: false,
+  anti_ferz: false,
+  anti_knight: false,
+  non_consecutive: 'off',
+  forbidden_pairs: false,
+} satisfies VariantInputDto
+
 const VARIANT_PRESETS = {
-  classic: { blocks: true, anti_knight: false, sudoku_x: false },
-  'anti-knight': { blocks: true, anti_knight: true, sudoku_x: false },
-  'sudoku-x': { blocks: true, anti_knight: false, sudoku_x: true },
+  classic: CLASSIC_VARIANT,
+  'sudoku-x': { ...CLASSIC_VARIANT, sudoku_x: true },
+  'anti-knight': { ...CLASSIC_VARIANT, anti_knight: true },
+  'anti-king': { ...CLASSIC_VARIANT, anti_ferz: true },
+  'non-consecutive': {
+    ...CLASSIC_VARIANT,
+    non_consecutive: 'orthogonal',
+    forbidden_pairs: true,
+  },
+  'disjoint-groups': { ...CLASSIC_VARIANT, disjoint_groups: true },
 } satisfies Record<VariantPreset, VariantInputDto>
 
 const variantPresetFromTopology = (topology: BoardTopology | null): VariantPreset => {
-  if (topology?.variant?.antiKnight) return 'anti-knight'
-  if (topology?.variant?.sudokuX) return 'sudoku-x'
+  const variant = topology?.variant
+  if (!variant) return 'classic'
+  if (variant.sudokuX) return 'sudoku-x'
+  if (variant.antiKnight) return 'anti-knight'
+  if (variant.antiFerz) return 'anti-king'
+  if (variant.nonConsecutive !== 'off') return 'non-consecutive'
+  if (variant.disjointGroups) return 'disjoint-groups'
   return 'classic'
 }
 
@@ -127,11 +149,11 @@ const variantLabel = (topology: BoardTopology | null) => {
     variant.girandola && 'Girandola',
     variant.asterisk && 'Asterisk',
     variant.centerDot && 'Center dot',
-    variant.antiFerz && 'Anti-ferz',
+    variant.antiFerz && 'Anti-king',
     variant.antiKnight && 'Anti-knight',
     variant.toroidal && 'Toroidal',
     variant.nonConsecutive !== 'off' && 'Non-consecutive',
-    variant.forbiddenPairs && 'Forbidden pairs',
+    variant.forbiddenPairs && variant.nonConsecutive === 'off' && 'Forbidden pairs',
   ].filter((label): label is string => Boolean(label))
 
   if (variant.blocks && additions.length === 0) return 'Classic Sudoku'

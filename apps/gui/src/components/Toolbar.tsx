@@ -9,6 +9,7 @@ import {
   Sparkles,
   Undo2,
 } from 'lucide-react'
+import { APP_VERSION } from '../appVersion'
 import { BrandMark } from './BrandMark'
 
 interface ToolbarProps {
@@ -91,6 +92,7 @@ export function Toolbar({
         <div className="brand">
           <BrandMark />
           <span>Sukaku Forge</span>
+          <small className="brand-version">v{APP_VERSION}</small>
         </div>
         <div className="window-dots" aria-hidden="true"><i /><i /><i /></div>
       </div>

@@ -64,6 +64,29 @@ describe('AppMenu', () => {
     await waitFor(() => expect(document.activeElement).toBe(file))
   })
 
+  it('switches open top-level menus on hover without opening a closed menubar', () => {
+    render(<AppMenu {...props()} />)
+    const file = screen.getByRole('menuitem', { name: 'File' })
+    const edit = screen.getByRole('menuitem', { name: 'Edit' })
+    const tools = screen.getByRole('menuitem', { name: 'Tools' })
+
+    fireEvent.mouseEnter(edit)
+    expect(file.getAttribute('aria-expanded')).toBe('false')
+    expect(edit.getAttribute('aria-expanded')).toBe('false')
+
+    fireEvent.click(file)
+    expect(file.getAttribute('aria-expanded')).toBe('true')
+
+    fireEvent.mouseEnter(edit)
+    expect(file.getAttribute('aria-expanded')).toBe('false')
+    expect(edit.getAttribute('aria-expanded')).toBe('true')
+    expect(document.activeElement).toBe(edit)
+
+    fireEvent.mouseEnter(tools)
+    expect(edit.getAttribute('aria-expanded')).toBe('false')
+    expect(tools.getAttribute('aria-expanded')).toBe('true')
+  })
+
   it('exposes check/radio state and dispatches the selected working action', () => {
     const actions = props()
     render(<AppMenu {...actions} />)
@@ -87,5 +110,28 @@ describe('AppMenu', () => {
 
     expect(actions.onAllHints).toHaveBeenCalledOnce()
     expect(actions.onNextHint).not.toHaveBeenCalled()
+  })
+
+  it('exposes the supported variant presets and dispatches the selected preset', () => {
+    const actions = props()
+    render(<AppMenu {...actions} />)
+
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Variants' }))
+    const labels = [
+      'Classic Sudoku',
+      'Sudoku X',
+      'Anti-knight',
+      'Anti-king',
+      'Non-consecutive',
+      'Disjoint groups',
+    ]
+    const variantMenu = document.getElementById('variants-application-menu')
+    expect(Array.from(
+      variantMenu?.querySelectorAll('[role="menuitemradio"]') ?? [],
+      (item) => item.querySelector('span:last-child')?.textContent,
+    )).toEqual(labels)
+
+    fireEvent.click(screen.getByRole('menuitemradio', { name: 'Anti-king' }))
+    expect(actions.onVariantPreset).toHaveBeenCalledWith('anti-king')
   })
 })

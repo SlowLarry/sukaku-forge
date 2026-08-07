@@ -3,11 +3,13 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import App, { DEFAULT_PUZZLE } from './App'
+import { APP_VERSION } from './appVersion'
 import type {
   ApplicationPort,
   ApplicationRequestDto,
   ApplicationResponseDto,
   SessionSnapshotDto,
+  VariantInputDto,
 } from './applicationPort'
 import { parseApplicationResponse } from './applicationPort'
 import golden from './fixtures/protocol-v3-hidden-single.json'
@@ -54,6 +56,13 @@ const currentRevision = () => document.querySelector('.puzzle-meta strong')?.tex
 const valueCount = () => document.querySelectorAll('.cell-value').length
 const candidateCount = () => document.querySelectorAll('.candidate').length
 
+const mirrorRequestedVariant = (
+  response: Extract<ApplicationResponseDto, { response: 'session_created' }>,
+  variant: VariantInputDto | undefined,
+) => {
+  response.topology.variant = { ...response.topology.variant, ...variant }
+}
+
 describe('live application flow', () => {
   it('waits for authoritative create/apply snapshots and wires next, undo, and redo', async () => {
     const create = deferred<ApplicationResponseDto>()
@@ -95,6 +104,9 @@ describe('live application flow', () => {
     await waitFor(() => expect(dispatch).toHaveBeenCalledTimes(1))
     expect(screen.queryByRole('grid')).toBeNull()
     expect(screen.getByText('Starting puzzle session')).toBeTruthy()
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Variants' }))
+    expect(screen.getByRole('menuitemradio', { name: 'Classic Sudoku' }).getAttribute('aria-checked')).toBe('true')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Variants' }))
 
     await act(async () => {
       create.resolve(correlated(initial, 1))
@@ -385,6 +397,7 @@ describe('live application flow', () => {
     fireEvent.click(helpMenu)
     fireEvent.click(screen.getByRole('menuitem', { name: 'About Sukaku Forge' }))
     expect(screen.getByRole('dialog', { name: 'About Sukaku Forge' })).toBeTruthy()
+    expect(screen.getByText(`Version ${APP_VERSION}`)).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Close' }))
     expect(screen.queryByRole('dialog', { name: 'About Sukaku Forge' })).toBeNull()
     expect(document.activeElement).toBe(helpMenu)
@@ -396,30 +409,56 @@ describe('live application flow', () => {
       if (request.command !== 'create_session') throw new Error(`unexpected command ${request.command}`)
       const response = correlated(initial, request.request_id)
       if (response.response !== 'session_created') throw new Error('expected session-created fixture')
-      response.topology.variant.anti_knight = request.variant?.anti_knight ?? false
-      response.topology.variant.sudoku_x = request.variant?.sudoku_x ?? false
+      mirrorRequestedVariant(response, request.variant)
       return response
     })
 
     render(<App port={{ dispatch }} />)
     await screen.findByRole('grid')
 
-    fireEvent.click(screen.getByRole('menuitem', { name: 'Variants' }))
-    fireEvent.click(screen.getByRole('menuitemradio', { name: 'Anti-knight' }))
-    await waitFor(() => expect(dispatch).toHaveBeenCalledTimes(2))
-    expect(dispatch.mock.calls[1]?.[0]).toMatchObject({
-      command: 'create_session',
-      variant: { blocks: true, anti_knight: true, sudoku_x: false },
-      engine: { rating_mode: 'original' },
-    })
-    await waitFor(() => expect(screen.getByLabelText('Variant: Anti-knight').textContent).toContain('Anti-knight'))
+    const classicVariant = {
+      blocks: true,
+      disjoint_groups: false,
+      sudoku_x: false,
+      anti_ferz: false,
+      anti_knight: false,
+      non_consecutive: 'off',
+      forbidden_pairs: false,
+    } as const
+    const choices = [
+      ['Sudoku X', { ...classicVariant, sudoku_x: true }],
+      ['Anti-knight', { ...classicVariant, anti_knight: true }],
+      ['Anti-king', { ...classicVariant, anti_ferz: true }],
+      ['Non-consecutive', {
+        ...classicVariant,
+        non_consecutive: 'orthogonal' as const,
+        forbidden_pairs: true,
+      }],
+      ['Disjoint groups', { ...classicVariant, disjoint_groups: true }],
+    ] as const
+
+    for (const [index, [label, variant]] of choices.entries()) {
+      fireEvent.click(screen.getByRole('menuitem', { name: 'Variants' }))
+      fireEvent.click(screen.getByRole('menuitemradio', { name: label }))
+      await waitFor(() => expect(dispatch).toHaveBeenCalledTimes(index + 2))
+      expect(dispatch.mock.calls[index + 1]?.[0]).toMatchObject({
+        command: 'create_session',
+        variant,
+        engine: { rating_mode: 'original' },
+      })
+      await waitFor(() => expect(screen.getByLabelText(`Variant: ${label}`).textContent).toContain(label))
+
+      fireEvent.click(screen.getByRole('menuitem', { name: 'Variants' }))
+      expect(screen.getByRole('menuitemradio', { name: label }).getAttribute('aria-checked')).toBe('true')
+      fireEvent.click(screen.getByRole('menuitem', { name: 'Variants' }))
+    }
 
     fireEvent.click(screen.getByRole('menuitem', { name: 'Options' }))
     fireEvent.click(screen.getByRole('menuitemradio', { name: 'Revised rating' }))
-    await waitFor(() => expect(dispatch).toHaveBeenCalledTimes(3))
-    expect(dispatch.mock.calls[2]?.[0]).toMatchObject({
+    await waitFor(() => expect(dispatch).toHaveBeenCalledTimes(7))
+    expect(dispatch.mock.calls[6]?.[0]).toMatchObject({
       command: 'create_session',
-      variant: { blocks: true, anti_knight: true, sudoku_x: false },
+      variant: { ...classicVariant, disjoint_groups: true },
       engine: { rating_mode: 'revised' },
     })
   })
@@ -444,8 +483,7 @@ describe('live application flow', () => {
 
       const response = correlated(initial, request.request_id)
       if (response.response !== 'session_created') throw new Error('expected session-created fixture')
-      response.topology.variant.anti_knight = request.variant?.anti_knight ?? false
-      response.topology.variant.sudoku_x = request.variant?.sudoku_x ?? false
+      mirrorRequestedVariant(response, request.variant)
       return response
     })
 

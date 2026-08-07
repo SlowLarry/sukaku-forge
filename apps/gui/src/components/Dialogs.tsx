@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react'
 import { Info, Upload, X } from 'lucide-react'
+import { APP_VERSION } from '../appVersion'
 import { normalizeValueGrid } from '../puzzleInput'
 
 interface DialogFrameProps {
@@ -148,10 +149,13 @@ export function AboutDialog({ onClose, returnFocus }: { onClose: () => void; ret
     >
       <div className="about-copy">
         <Info aria-hidden="true" />
-        <p>
-          Sukaku Forge keeps solver state authoritative in Rust while React renders the board,
-          explanations, and semantic hint visualizations.
-        </p>
+        <div>
+          <p className="about-version">Version {APP_VERSION}</p>
+          <p>
+            Sukaku Forge keeps solver state authoritative in Rust while React renders the board,
+            explanations, and semantic hint visualizations.
+          </p>
+        </div>
       </div>
       <footer className="dialog-actions">
         <button ref={closeButton} type="button" className="primary-button" onClick={onClose}>Close</button>

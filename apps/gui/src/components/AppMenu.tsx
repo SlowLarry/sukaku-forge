@@ -2,7 +2,13 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { RatingModeDto } from '../applicationPort'
 import type { Theme } from '../theme'
 
-export type VariantPreset = 'classic' | 'anti-knight' | 'sudoku-x'
+export type VariantPreset =
+  | 'classic'
+  | 'sudoku-x'
+  | 'anti-knight'
+  | 'anti-king'
+  | 'non-consecutive'
+  | 'disjoint-groups'
 type CheckableRole = 'menuitemcheckbox' | 'menuitemradio'
 
 type MenuId = 'file' | 'edit' | 'tools' | 'options' | 'variants' | 'help'
@@ -40,12 +46,13 @@ interface ApplicationMenuProps {
   open: boolean
   triggerRef: (element: HTMLButtonElement | null) => void
   onToggle: () => void
+  onHover: () => void
   onMove: (direction: -1 | 1) => void
   onClose: (restoreFocus?: boolean) => void
   children: React.ReactNode
 }
 
-function ApplicationMenu({ id, label, open, triggerRef, onToggle, onMove, onClose, children }: ApplicationMenuProps) {
+function ApplicationMenu({ id, label, open, triggerRef, onToggle, onHover, onMove, onClose, children }: ApplicationMenuProps) {
   const focusEdge = (edge: 'first' | 'last') => {
     const menu = document.querySelector<HTMLElement>(`[data-menu-panel="${id}"]`)
     const actions = menu ? Array.from(menu.querySelectorAll<HTMLButtonElement>('button:not(:disabled)')) : []
@@ -100,6 +107,7 @@ function ApplicationMenu({ id, label, open, triggerRef, onToggle, onMove, onClos
         aria-expanded={open}
         aria-controls={`${id}-application-menu`}
         onClick={onToggle}
+        onMouseEnter={onHover}
         onKeyDown={handleTriggerKeyDown}
       >
         {label}
@@ -221,6 +229,11 @@ export function AppMenu({
     open: openMenu === id,
     triggerRef: (element: HTMLButtonElement | null) => { triggers.current[id] = element },
     onToggle: () => setOpenMenu((current) => current === id ? null : id),
+    onHover: () => {
+      if (openMenu == null || openMenu === id) return
+      setOpenMenu(id)
+      triggers.current[id]?.focus({ preventScroll: true })
+    },
     onMove: (direction: -1 | 1) => moveMenu(id, direction),
     onClose: closeMenu,
   })
@@ -289,6 +302,13 @@ export function AppMenu({
           >Classic Sudoku</MenuAction>
           <MenuAction
             role="menuitemradio"
+            checked={variantPreset === 'sudoku-x'}
+            disabled={!canReconfigure}
+            title={configurationTitle}
+            onSelect={() => select(() => onVariantPreset('sudoku-x'))}
+          >Sudoku X</MenuAction>
+          <MenuAction
+            role="menuitemradio"
             checked={variantPreset === 'anti-knight'}
             disabled={!canReconfigure}
             title={configurationTitle}
@@ -296,11 +316,25 @@ export function AppMenu({
           >Anti-knight</MenuAction>
           <MenuAction
             role="menuitemradio"
-            checked={variantPreset === 'sudoku-x'}
+            checked={variantPreset === 'anti-king'}
             disabled={!canReconfigure}
             title={configurationTitle}
-            onSelect={() => select(() => onVariantPreset('sudoku-x'))}
-          >Sudoku X</MenuAction>
+            onSelect={() => select(() => onVariantPreset('anti-king'))}
+          >Anti-king</MenuAction>
+          <MenuAction
+            role="menuitemradio"
+            checked={variantPreset === 'non-consecutive'}
+            disabled={!canReconfigure}
+            title={configurationTitle}
+            onSelect={() => select(() => onVariantPreset('non-consecutive'))}
+          >Non-consecutive</MenuAction>
+          <MenuAction
+            role="menuitemradio"
+            checked={variantPreset === 'disjoint-groups'}
+            disabled={!canReconfigure}
+            title={configurationTitle}
+            onSelect={() => select(() => onVariantPreset('disjoint-groups'))}
+          >Disjoint groups</MenuAction>
         </ApplicationMenu>
         <ApplicationMenu {...menuProps('help', 'Help')}>
           <MenuAction
