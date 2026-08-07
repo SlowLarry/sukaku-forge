@@ -86,7 +86,8 @@ make build-rater-native
 ```
 
 The binary accepts one positional 81-character grid or a batch of nonempty
-stdin lines. `.` and `0` are empty cells. Its default output matches serate:
+stdin lines. `.` and `0` are empty cells. Its default output uses serate's
+layout:
 
 ```text
 ER/EP/ED
@@ -107,7 +108,7 @@ their corrected implementations rather than knowingly restoring the old
 bugs. Other contradiction and forcing-chain techniques do not rely on a
 uniqueness assumption.
 
-The compatibility contract covers unsolved 81-character value grids. The old
+The supported input contract covers unsolved 81-character value grids. The old
 serate formatter emitted a Java numeric-conversion artifact for an already
 solved grid; this focused product normalizes that non-rating case to
 `0.0/0.0/0.0`.
@@ -133,10 +134,10 @@ contributors do not silently depend on a sibling Java checkout.
 
 The dedicated path already reuses one immutable topology per batch, freezes a
 static producer array instead of allocating/gating the general registry each
-step, consumes each grid without cloning it, and tracks only three numeric
-ratings without allocating technique names. Hidden/set family traversal and
-Locking family pairs use static tables and lazy stack-only iterators rather
-than allocating order vectors on every probe.
+step, passes the top-level grid directly into the rating loop, and tracks only
+three numeric ratings without allocating technique names. Hidden/set family
+traversal and Locking family pairs use static tables and lazy stack-only
+iterators rather than allocating order vectors on every probe.
 
 Further work may replace the general grid/topology, inference payloads,
 implication construction, workspaces and caches freely. Each change remains
