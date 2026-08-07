@@ -55,6 +55,21 @@ JAR completed it in 761.22 seconds. Both emitted `11.8/1.2/1.2`, a measured
 warm-up, not a corpus average; both were pinned to one CPU, Java was forced to
 one thread, and Rust used its corrected, uniqueness-off default.
 
+That `22.7×` result is the retained 0.5.0-versus-Java comparison. Separately,
+the optimized 0.6.0 code candidate was measured against the preserved native
+0.5.0 Rust binary. The isolated and protected benchmark artifact was built
+immediately before the metadata bump and therefore still identified itself as
+0.5.0. Materializing only the winning chain result removed 912 allocations on
+the 10.5 case (runtime neutral); a shared exact-state negative forcing-chain
+cache and scratch storage improved its focused run from 3.559 to 2.644 seconds
+(`25.7%`, with about 0.57 MiB of negative-cache key payload at the observed
+capacity);
+delta-aware nested scans added `3.4%`; and a first fixed 9×9 Classic cache
+phase added about `0.3%` on 9.8 and `1.6%` on 10.5. End to end, the final 0.6.0
+native build reduced the hardest-ten same-core batch from 121.453 to 102.688
+seconds (`15.4%`) with identical ratings; the pre-bump protected 11.8 one-shot
+fell from 32.891 to 28.949 seconds (`12.0%`) and still emitted `11.8/1.2/1.2`.
+
 See the [Classic-rater documentation](docs/CLASSIC_RATER.md) for the precise
 correctness policy, optimized build profiles, batch formatting, oracle pin,
 and guarded benchmark harness.

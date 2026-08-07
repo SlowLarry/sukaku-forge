@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use sukaku_forge_core::{
     CandidateMask, CandidateRemovals, CandidateRemovalsBuilder, CellId, CellMask, Digit, Grid,
-    PositionMask, REGION_TYPE_COUNT, RegionId,
+    PositionMask, REGION_TYPE_COUNT, RegionId, VariantConfig,
 };
 
 use crate::aligned_exclusion::find_aligned_triplet_exclusion;
@@ -58,6 +58,11 @@ std::thread_local! {
     /// Lets regression tests run the real SE121 search entry points with only
     /// the post-1.2.1 target-order correction disabled.
     static APPLY_SE121_ORDER_CORRECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// Full scanning remains available only for exact A/B regression tests.
+    /// Production always uses the corrected-SE121 delta path when eligible.
+    static APPLY_SE121_DELTA_SCAN: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static FIRST_DRAFT_OFFERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RANKED_TARGET_MATERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Exact mutable-grid identity for inner-chain memoization. Topology and
@@ -85,6 +90,14 @@ type CachedInnerResult = Result<Arc<[NestedHint]>, LegacyFcPlusBoundary>;
 #[derive(Default)]
 struct InnerChainCache {
     forcing: HashMap<GridStateKey, Arc<[NestedHint]>>,
+    /// Exact SE121 inner-FCC states known to have no hint. Unlike positive
+    /// proof slices, these compact keys are safe to retain for the lifetime
+    /// of one rating session and across outer producer scopes.
+    se121_forcing_negative: HashSet<GridStateKey>,
+    #[cfg(test)]
+    se121_forcing_computations: usize,
+    #[cfg(test)]
+    se121_forcing_negative_hits: usize,
     multiple: HashMap<GridStateKey, Arc<[NestedHint]>>,
     dynamic: HashMap<GridStateKey, CachedInnerResult>,
     dynamic_plus: HashMap<GridStateKey, CachedInnerResult>,
@@ -93,6 +106,17 @@ struct InnerChainCache {
 }
 
 impl InnerChainCache {
+    /// Drop proof-bearing results between outer producer scopes while
+    /// retaining the maps' allocation and exact-state negative FCC entries.
+    fn clear_local_results(&mut self) {
+        self.forcing.clear();
+        self.multiple.clear();
+        self.dynamic.clear();
+        self.dynamic_plus.clear();
+        self.nested_two.clear();
+        self.nested_three.clear();
+    }
+
     fn forcing(&mut self, grid: &Grid, config: EngineConfig) -> Arc<[NestedHint]> {
         self.forcing_impl(grid, config, false)
     }
@@ -108,14 +132,30 @@ impl InnerChainCache {
         use_root_prefilter: bool,
     ) -> Arc<[NestedHint]> {
         let key = GridStateKey::new(grid);
+        if use_root_prefilter && self.se121_forcing_negative.contains(&key) {
+            #[cfg(test)]
+            {
+                self.se121_forcing_negative_hits += 1;
+            }
+            return Arc::default();
+        }
         if let Some(hints) = self.forcing.get(&key) {
             return Arc::clone(hints);
         }
-        let hints = Arc::<[NestedHint]>::from(if use_root_prefilter {
+        #[cfg(test)]
+        if use_root_prefilter {
+            self.se121_forcing_computations += 1;
+        }
+        let collected = if use_root_prefilter {
             collect_forcing_chain_proofs_se121(grid, config)
         } else {
             collect_forcing_chain_proofs(grid, config)
-        });
+        };
+        if use_root_prefilter && collected.is_empty() {
+            self.se121_forcing_negative.insert(key);
+            return Arc::default();
+        }
+        let hints = Arc::<[NestedHint]>::from(collected);
         self.forcing.insert(key, Arc::clone(&hints));
         hints
     }
@@ -248,6 +288,25 @@ impl MultiMode {
             AdvancedTargetOrder::CoordinateHash
         }
     }
+}
+
+/// Delta invalidation is deliberately narrower than the general compatibility
+/// engine. Its proof relies on corrected SE121 stopping on newly added OFFs,
+/// monotone candidate removal, the four-family FCPlus=0 schedule, and classic
+/// row/column/block geometry.
+fn uses_se121_delta_advanced_scan(grid: &Grid, config: EngineConfig, mode: MultiMode) -> bool {
+    if !mode.is_se121_search()
+        || config.forcing_chain_plus != 0
+        || grid.topology().config() != VariantConfig::default()
+    {
+        return false;
+    }
+    #[cfg(test)]
+    {
+        APPLY_SE121_DELTA_SCAN.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    true
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -519,9 +578,69 @@ impl ConsequenceSet {
     }
 }
 
+const SE121_ADVANCED_FAMILY_COUNT: usize = 4;
+
+/// Independent invalidation cursors are required because Java's advanced
+/// ladder stops after the first family that adds an implication. A later
+/// family must retain every removal made since *it* was last reached, not just
+/// the removals made since the preceding advanced pass.
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum Se121AdvancedFamily {
+    Locking = 0,
+    HiddenPair = 1,
+    NakedPair = 2,
+    XWing = 3,
+}
+
+/// Compact removal summary for one family's pending event range.
+///
+/// Scanners still traverse their canonical Java unit order. These masks are
+/// predicates only; removal discovery order must never become hint order.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AdvancedDelta {
+    all_cells: CellMask,
+    cells_by_digit: [CellMask; 10],
+}
+
+impl AdvancedDelta {
+    fn from_removed_keys(keys: &[u16]) -> Self {
+        let mut result = Self::default();
+        for &key in keys {
+            debug_assert!(!is_on(key));
+            let (cell, digit) = decode_candidate(key);
+            result.all_cells.insert(cell);
+            result.cells_by_digit[usize::from(digit.get())].insert(cell);
+        }
+        result
+    }
+
+    fn is_empty(&self) -> bool {
+        self.all_cells.is_empty()
+    }
+
+    fn affects_region(&self, grid: &Grid, region: RegionId) -> bool {
+        !self
+            .all_cells
+            .intersect(grid.topology().region_mask(region))
+            .is_empty()
+    }
+
+    fn affects_region_digit(&self, grid: &Grid, region: RegionId, digit: Digit) -> bool {
+        !self.cells_by_digit[usize::from(digit.get())]
+            .intersect(grid.topology().region_mask(region))
+            .is_empty()
+    }
+}
+
 /// Candidate-removal rollback journal for one dynamic branch closure.
 struct DynamicState {
     changed_cells: Vec<CellId>,
+    /// Successful removals in propagation order. Family cursors index this
+    /// capacity-reused log; the events themselves are never iterated as scan
+    /// units, so they cannot perturb Java discovery order.
+    removed_keys: Vec<u16>,
+    track_removed_keys: bool,
     original_masks: [CandidateMask; 81],
     changed: [bool; 81],
     removed_nodes: [u32; 81 * 9],
@@ -531,14 +650,23 @@ impl DynamicState {
     fn new() -> Self {
         Self {
             changed_cells: Vec::with_capacity(32),
+            // General compatibility and GUI searches never allocate this
+            // headless-only scratch.
+            removed_keys: Vec::new(),
+            track_removed_keys: false,
             original_masks: [CandidateMask::EMPTY; 81],
             changed: [false; 81],
             removed_nodes: [NO_NODE; 81 * 9],
         }
     }
 
-    fn begin(&mut self) {
+    fn begin(&mut self, track_removed_keys: bool) {
         debug_assert!(self.changed_cells.is_empty());
+        debug_assert!(self.removed_keys.is_empty());
+        self.track_removed_keys = track_removed_keys;
+        if track_removed_keys && self.removed_keys.capacity() == 0 {
+            self.removed_keys.reserve(96);
+        }
     }
 
     fn remove(&mut self, grid: &mut Grid, key: u16, node: u32) {
@@ -554,6 +682,9 @@ impl DynamicState {
         }
         self.removed_nodes[candidate_index(cell, digit)] = node;
         grid.remove_candidate(cell, digit);
+        if self.track_removed_keys {
+            self.removed_keys.push(key);
+        }
     }
 
     fn original_mask(&self, grid: &Grid, cell: CellId) -> CandidateMask {
@@ -579,6 +710,8 @@ impl DynamicState {
             self.changed[cell.index()] = false;
         }
         self.changed_cells.clear();
+        self.removed_keys.clear();
+        self.track_removed_keys = false;
     }
 }
 
@@ -642,6 +775,7 @@ struct Branch {
     advanced_target_order: Vec<CellId>,
     advanced_target_policy: AdvancedTargetOrder,
     advanced_nested: Option<Arc<ChainProof>>,
+    se121_advanced_family_cursors: [usize; SE121_ADVANCED_FAMILY_COUNT],
 }
 
 impl Branch {
@@ -663,6 +797,7 @@ impl Branch {
             advanced_target_order: Vec::with_capacity(32),
             advanced_target_policy: AdvancedTargetOrder::CoordinateHash,
             advanced_nested: None,
+            se121_advanced_family_cursors: [0; SE121_ADVANCED_FAMILY_COUNT],
         }
     }
 
@@ -676,6 +811,20 @@ impl Branch {
         self.generated_causes.clear();
         self.generated_nodes.clear();
         self.clear_advanced_hint();
+        self.se121_advanced_family_cursors.fill(0);
+    }
+
+    fn take_se121_advanced_delta(
+        &mut self,
+        state: &DynamicState,
+        family: Se121AdvancedFamily,
+    ) -> AdvancedDelta {
+        let end = state.removed_keys.len();
+        let cursor = &mut self.se121_advanced_family_cursors[family as usize];
+        debug_assert!(*cursor <= end, "advanced-family removal cursor");
+        let result = AdvancedDelta::from_removed_keys(&state.removed_keys[*cursor..end]);
+        *cursor = end;
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -749,7 +898,7 @@ impl Branch {
         source_on: bool,
     ) -> Result<Option<Contradiction>, LegacyFcPlusBoundary> {
         self.clear();
-        state.begin();
+        state.begin(uses_se121_delta_advanced_scan(working, config, mode));
         let source_key = potential_key(source_cell, source_digit, source_on);
         let source = self.arena.root(source_key);
         if source_on {
@@ -1218,9 +1367,15 @@ impl Branch {
         mode: MultiMode,
     ) -> AdvancedScan {
         let variant_latin = effective_variant_latin(grid, config);
+        let use_delta = uses_se121_delta_advanced_scan(grid, config, mode);
         let first = if variant_latin {
             if mode.uses_se121_locking_order() {
-                self.scan_locking_se121(grid, state)
+                if use_delta {
+                    let delta = self.take_se121_advanced_delta(state, Se121AdvancedFamily::Locking);
+                    self.scan_locking_se121_scoped(grid, state, Some(&delta))
+                } else {
+                    self.scan_locking_se121(grid, state)
+                }
             } else {
                 self.scan_locking(grid, state)
             }
@@ -1230,15 +1385,30 @@ impl Branch {
         if mode.advanced_family_stops(first) {
             return first;
         }
-        let hidden = self.scan_hidden_sets(grid, state, config, 2);
+        let hidden = if use_delta {
+            let delta = self.take_se121_advanced_delta(state, Se121AdvancedFamily::HiddenPair);
+            self.scan_hidden_sets_scoped(grid, state, config, 2, Some(&delta))
+        } else {
+            self.scan_hidden_sets(grid, state, config, 2)
+        };
         if mode.advanced_family_stops(hidden) {
             return hidden;
         }
-        let naked = self.scan_naked_sets(grid, state, config, !variant_latin, 2);
+        let naked = if use_delta {
+            let delta = self.take_se121_advanced_delta(state, Se121AdvancedFamily::NakedPair);
+            self.scan_naked_sets_scoped(grid, state, config, !variant_latin, 2, Some(&delta))
+        } else {
+            self.scan_naked_sets(grid, state, config, !variant_latin, 2)
+        };
         if mode.advanced_family_stops(naked) {
             return naked;
         }
-        let fish = self.scan_fish(grid, state, 2);
+        let fish = if use_delta {
+            let delta = self.take_se121_advanced_delta(state, Se121AdvancedFamily::XWing);
+            self.scan_fish_scoped(grid, state, 2, Some(&delta))
+        } else {
+            self.scan_fish(grid, state, 2)
+        };
         if mode.advanced_family_stops(fish) {
             return fish;
         }
@@ -1350,6 +1520,18 @@ impl Branch {
     }
 
     fn scan_locking_se121(&mut self, grid: &Grid, state: &DynamicState) -> AdvancedScan {
+        self.scan_locking_se121_scoped(grid, state, None)
+    }
+
+    fn scan_locking_se121_scoped(
+        &mut self,
+        grid: &Grid,
+        state: &DynamicState,
+        delta: Option<&AdvancedDelta>,
+    ) -> AdvancedScan {
+        if delta.is_some_and(AdvancedDelta::is_empty) {
+            return AdvancedScan::default();
+        }
         if !grid.topology().config().blocks {
             return AdvancedScan::default();
         }
@@ -1365,6 +1547,12 @@ impl Branch {
                     }
                     for raw_digit in 1_u8..=9 {
                         let digit = Digit::new(raw_digit).expect("digit loop");
+                        if delta.is_some_and(|delta| {
+                            !delta.affects_region_digit(grid, primary, digit)
+                                && !delta.affects_region_digit(grid, secondary, digit)
+                        }) {
+                            continue;
+                        }
                         let primary_positions = grid.region_candidate_positions(primary, digit);
                         if primary_positions.count() < 2
                             || !primary_positions.without(overlap).is_empty()
@@ -1461,10 +1649,27 @@ impl Branch {
         config: EngineConfig,
         degree: u8,
     ) -> AdvancedScan {
+        self.scan_hidden_sets_scoped(grid, state, config, degree, None)
+    }
+
+    fn scan_hidden_sets_scoped(
+        &mut self,
+        grid: &Grid,
+        state: &DynamicState,
+        config: EngineConfig,
+        degree: u8,
+        delta: Option<&AdvancedDelta>,
+    ) -> AdvancedScan {
+        if delta.is_some_and(AdvancedDelta::is_empty) {
+            return AdvancedScan::default();
+        }
         let mut family = AdvancedScan::default();
         for type_index in extended_family_order(grid, config) {
             for region_index in 0..grid.topology().region_count(type_index) {
                 let region = region_id(type_index, region_index);
+                if delta.is_some_and(|delta| !delta.affects_region(grid, region)) {
+                    continue;
+                }
                 if empty_cell_count(grid, region) <= usize::from(degree * 2) {
                     continue;
                 }
@@ -1511,6 +1716,21 @@ impl Branch {
         generalized: bool,
         degree: u8,
     ) -> AdvancedScan {
+        self.scan_naked_sets_scoped(grid, state, config, generalized, degree, None)
+    }
+
+    fn scan_naked_sets_scoped(
+        &mut self,
+        grid: &Grid,
+        state: &DynamicState,
+        config: EngineConfig,
+        generalized: bool,
+        degree: u8,
+        delta: Option<&AdvancedDelta>,
+    ) -> AdvancedScan {
+        if delta.is_some_and(AdvancedDelta::is_empty) {
+            return AdvancedScan::default();
+        }
         let mut family = AdvancedScan::default();
         let families = if generalized {
             extended_family_order(grid, config)
@@ -1520,6 +1740,9 @@ impl Branch {
         for type_index in families {
             for region_index in 0..grid.topology().region_count(type_index) {
                 let region = region_id(type_index, region_index);
+                if delta.is_some_and(|delta| !delta.affects_region(grid, region)) {
+                    continue;
+                }
                 if empty_cell_count(grid, region) < usize::from(degree * 2) {
                     continue;
                 }
@@ -1585,6 +1808,19 @@ impl Branch {
     }
 
     fn scan_fish(&mut self, grid: &Grid, state: &DynamicState, degree: u8) -> AdvancedScan {
+        self.scan_fish_scoped(grid, state, degree, None)
+    }
+
+    fn scan_fish_scoped(
+        &mut self,
+        grid: &Grid,
+        state: &DynamicState,
+        degree: u8,
+        delta: Option<&AdvancedDelta>,
+    ) -> AdvancedScan {
+        if delta.is_some_and(AdvancedDelta::is_empty) {
+            return AdvancedScan::default();
+        }
         let mut occurrences = [0_u8; 10];
         for raw_cell in 0_u8..81 {
             let value = grid.value(cell_id(raw_cell));
@@ -1601,6 +1837,17 @@ impl Branch {
                         continue;
                     }
                     let digit = Digit::new(raw_digit).expect("digit loop");
+                    if delta.is_some_and(|delta| {
+                        bases.iter().all(|base_index| {
+                            !delta.affects_region_digit(
+                                grid,
+                                region_id(base_type, usize::from(base_index)),
+                                digit,
+                            )
+                        })
+                    }) {
+                        continue;
+                    }
                     let mut covers = PositionMask::EMPTY;
                     let mut valid = true;
                     for base_index in bases.iter() {
@@ -1803,6 +2050,39 @@ impl MultiWorkspace {
             ordered_keys: Vec::with_capacity(192),
         }
     }
+
+    fn clear_results(&mut self) {
+        for branch in &mut self.cell_branches {
+            branch.clear();
+        }
+        for branch in &mut self.region_branches {
+            branch.clear();
+        }
+        self.off_branch.clear();
+        self.ordered_keys.clear();
+        debug_assert!(self.state.changed_cells.is_empty());
+    }
+}
+
+/// Scratch retained only while rating one puzzle with the dedicated SE121
+/// headless path. General engine and presentation searches deliberately keep
+/// their isolated workspaces.
+pub(crate) struct Se121ChainSession {
+    workspace: MultiWorkspace,
+    working: Option<Grid>,
+    inner_cache: InnerChainCache,
+    config: Option<EngineConfig>,
+}
+
+impl Default for Se121ChainSession {
+    fn default() -> Self {
+        Self {
+            workspace: MultiWorkspace::new(),
+            working: None,
+            inner_cache: InnerChainCache::default(),
+            config: None,
+        }
+    }
 }
 
 struct RankedMulti {
@@ -1812,7 +2092,47 @@ struct RankedMulti {
     sort_key: u8,
 }
 
-impl RankedMulti {
+/// Allocation-free first-hint candidate. The effect and evidence are kept as
+/// compact scalars until ranking has selected the one published inference.
+struct RankedMultiDraft {
+    java_difficulty: f64,
+    complexity: u32,
+    sort_key: u8,
+    kind: MultipleChainKind,
+    target_cell: CellId,
+    target_digit: Digit,
+    target_on: bool,
+}
+
+impl RankedMultiDraft {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        grid: &Grid,
+        mode: MultiMode,
+        complexity: u32,
+        sort_key: u8,
+        kind: MultipleChainKind,
+        target_cell: CellId,
+        target_digit: Digit,
+        target_on: bool,
+    ) -> Option<Self> {
+        if !target_has_removals(grid, target_cell, target_digit, target_on) {
+            return None;
+        }
+        #[cfg(test)]
+        FIRST_DRAFT_OFFERS.with(|count| count.set(count.get() + 1));
+        let (_, java_difficulty) = multi_rating(mode, complexity);
+        Some(Self {
+            java_difficulty,
+            complexity,
+            sort_key,
+            kind,
+            target_cell,
+            target_digit,
+            target_on,
+        })
+    }
+
     fn precedes(&self, other: &Self) -> bool {
         if self.java_difficulty < other.java_difficulty {
             return true;
@@ -1822,10 +2142,25 @@ impl RankedMulti {
         }
         (self.complexity, self.sort_key) < (other.complexity, other.sort_key)
     }
+
+    fn materialize(self, grid: &Grid, mode: MultiMode) -> Inference {
+        ranked_target(
+            grid,
+            mode,
+            self.complexity,
+            self.sort_key,
+            self.kind,
+            self.target_cell,
+            self.target_digit,
+            self.target_on,
+        )
+        .expect("ranked first multi-chain effect remains applicable")
+        .inference
+    }
 }
 
 enum MultiSink<'a> {
-    First(&'a mut Option<RankedMulti>),
+    First(&'a mut Option<RankedMultiDraft>),
     Summaries(&'a mut InferenceCollector),
     All(&'a mut NestedHintCollector),
 }
@@ -1860,7 +2195,7 @@ impl MultiSink<'_> {
                 } else {
                     u32::from(flat_complexity)
                 };
-                if let Some(candidate) = ranked_target(
+                if let Some(candidate) = RankedMultiDraft::new(
                     grid,
                     mode,
                     complexity,
@@ -1870,7 +2205,7 @@ impl MultiSink<'_> {
                     effect_digit,
                     effect_on,
                 ) {
-                    keep_best(best, candidate);
+                    keep_best_draft(best, candidate);
                 }
             }
             Self::Summaries(result) => {
@@ -2028,30 +2363,51 @@ pub(crate) fn find_se121_dynamic_forcing_chain_plus(
 /// The dedicated classic rater is the only caller. General compatibility
 /// entry points continue to create isolated workspaces, while this path can
 /// safely retain branch capacity and immutable weak links because every
-/// producer sees the same unchanged outer grid. Exact-state inner caches stay
-/// producer-local, avoiding a larger live working set on deep nested cases.
-pub(crate) fn find_se121_chain_tail(grid: &Grid, config: EngineConfig) -> Option<Inference> {
+/// producer sees the same unchanged outer grid. Proof-bearing inner results
+/// stay producer-local; exact-state negative FCC results survive for one
+/// rating session without retaining proof graphs.
+pub(crate) fn find_se121_chain_tail_with_session(
+    grid: &Grid,
+    config: EngineConfig,
+    session: &mut Se121ChainSession,
+) -> Option<Inference> {
+    // The cache has a dedicated inner-FCC namespace, and one session belongs
+    // to one puzzle. Explicitly invalidate it if an internal caller changes
+    // the engine configuration rather than letting a same-grid key cross
+    // configuration profiles.
+    if session.config != Some(config) {
+        session.inner_cache.clear_local_results();
+        session.inner_cache.se121_forcing_negative.clear();
+        session.config = Some(config);
+    }
     let region_types = active_region_types(grid, config);
-    let mut working = grid.clone();
-    let mut workspace = MultiWorkspace::new();
+    let working = match &mut session.working {
+        Some(working) => {
+            working.clone_from(grid);
+            working
+        }
+        None => session.working.insert(grid.clone()),
+    };
 
     // Static MFC needs the full implication graph. Drop it before building
     // the weak-only graph used by every later dynamic family.
     let multiple = {
         let implications = Implications::new(grid, config);
-        let mut inner_cache = InnerChainCache::default();
+        session.inner_cache.clear_local_results();
         find_multi_chain_with_resources(
             grid,
             config,
             MultiMode::Static,
             &implications,
             &region_types,
-            &mut working,
-            &mut workspace,
-            &mut inner_cache,
+            &mut *working,
+            &mut session.workspace,
+            &mut session.inner_cache,
         )
         .expect("static multiple chains cannot reach an FCPlus boundary")
     };
+    session.inner_cache.clear_local_results();
+    session.workspace.clear_results();
     if multiple.is_some() {
         return multiple;
     }
@@ -2065,18 +2421,20 @@ pub(crate) fn find_se121_chain_tail(grid: &Grid, config: EngineConfig) -> Option
         MultiMode::Se121Nested { level: 4 },
         MultiMode::Se121Nested { level: 5 },
     ] {
-        let mut inner_cache = InnerChainCache::default();
+        session.inner_cache.clear_local_results();
         let inference = find_multi_chain_with_resources(
             grid,
             config,
             mode,
             &implications,
             &region_types,
-            &mut working,
-            &mut workspace,
-            &mut inner_cache,
+            &mut *working,
+            &mut session.workspace,
+            &mut session.inner_cache,
         )
         .expect("SE 1.2.1 FCPlus=0 cannot reach a legacy parent boundary");
+        session.inner_cache.clear_local_results();
+        session.workspace.clear_results();
         if inference.is_some() {
             return inference;
         }
@@ -2677,7 +3035,7 @@ fn find_multi_chain_checked(
         let mut sink = MultiSink::First(&mut best);
         search_multi_chain(grid, config, mode, &mut sink)?;
     }
-    Ok(best.map(|candidate| candidate.inference))
+    Ok(best.map(|candidate| candidate.materialize(grid, mode)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2706,7 +3064,7 @@ fn find_multi_chain_with_resources(
             inner_cache,
         )?;
     }
-    Ok(best.map(|candidate| candidate.inference))
+    Ok(best.map(|candidate| candidate.materialize(grid, mode)))
 }
 
 fn collect_multi_chain_summaries_checked(
@@ -3248,6 +3606,8 @@ fn ranked_target(
     target_digit: Digit,
     target_on: bool,
 ) -> Option<RankedMulti> {
+    #[cfg(test)]
+    RANKED_TARGET_MATERIALIZATIONS.with(|count| count.set(count.get() + 1));
     let (rating, java_difficulty) = multi_rating(mode, complexity);
     let evidence = Evidence::MultipleForcingChain {
         dynamic: mode.is_dynamic(),
@@ -3297,7 +3657,23 @@ fn target_removals(
     Some(removals.build())
 }
 
-fn keep_best(best: &mut Option<RankedMulti>, candidate: RankedMulti) {
+fn target_has_removals(
+    grid: &Grid,
+    target_cell: CellId,
+    target_digit: Digit,
+    target_on: bool,
+) -> bool {
+    if target_on {
+        !grid
+            .candidates(target_cell)
+            .without(CandidateMask::of(target_digit))
+            .is_empty()
+    } else {
+        grid.candidates(target_cell).contains(target_digit)
+    }
+}
+
+fn keep_best_draft(best: &mut Option<RankedMultiDraft>, candidate: RankedMultiDraft) {
     if best
         .as_ref()
         .is_none_or(|current| candidate.precedes(current))
@@ -3465,9 +3841,10 @@ mod tests {
         replay_dynamic_forcing_chain_with_proof, replay_multiple_forcing_chain_with_proof,
         replay_nested_forcing_chain_with_proof_checked,
     };
+    use crate::se121::Se121Solver;
     use crate::{
         ChainCause, ChainProofView, ChainProofViewKind, ChainState, EngineConfig, Evidence,
-        MultipleChainKind, Rating, RatingMode, SearchOutcome, Solver,
+        MultipleChainKind, Rating, RatingMode, SearchOutcome, Solver, Technique,
     };
 
     type ProofNodeShape = (u8, u8, ChainState, Vec<(usize, ChainCause)>);
@@ -3573,6 +3950,29 @@ mod tests {
             .collect()
     }
 
+    type PendingNodeShape = ((u8, u8), Vec<(u8, u8)>);
+
+    fn decoded_key(key: u16) -> (u8, u8) {
+        let (cell, digit) = super::decode_candidate(key);
+        (cell.raw(), digit.get())
+    }
+
+    fn pending_node_shapes(branch: &Branch) -> Vec<PendingNodeShape> {
+        branch
+            .pending_off
+            .iter()
+            .map(|&node| {
+                (
+                    decoded_key(branch.arena.key(node)),
+                    parent_keys(branch, node)
+                        .into_iter()
+                        .map(decoded_key)
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
     fn with_legacy_se121_target_order<T>(run: impl FnOnce() -> T) -> T {
         struct Restore(bool);
 
@@ -3585,6 +3985,20 @@ mod tests {
         let previous_order =
             super::APPLY_SE121_ORDER_CORRECTION.with(|enabled| enabled.replace(false));
         let _restore = Restore(previous_order);
+        run()
+    }
+
+    fn with_se121_delta_scan<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                super::APPLY_SE121_DELTA_SCAN.with(|setting| setting.set(self.0));
+            }
+        }
+
+        let previous = super::APPLY_SE121_DELTA_SCAN.with(|setting| setting.replace(enabled));
+        let _restore = Restore(previous);
         run()
     }
 
@@ -3603,6 +4017,11 @@ mod tests {
         let config = crate::se121::SE121_ENGINE_CONFIG;
         let corrected = super::find_se121_dynamic_forcing_chain_plus(&grid, config)
             .expect("corrected SE121 DFC+ hint");
+        let full_scan = with_se121_delta_scan(false, || {
+            super::find_se121_dynamic_forcing_chain_plus(&grid, config)
+                .expect("full-scan corrected SE121 DFC+ hint")
+        });
+        assert_eq!(corrected, full_scan, "production delta/full exact A/B");
         let legacy = with_legacy_se121_target_order(|| {
             super::find_se121_dynamic_forcing_chain_plus(&grid, config)
                 .expect("coordinate-hash-order SE121 DFC+ hint")
@@ -3654,6 +4073,45 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow nonprotected 10.5 nested full-search delta/full differential"]
+    fn se121_first_ai_escargot_nested_inference_matches_full_scan_exactly() {
+        let mut grid = classic_grid(
+            "1....7.9..3..2...8..96..5....53..9...1..8...26....4...3......1..4......7..7...3..",
+        );
+        let mut compared_nested = false;
+        for _ in 0..512 {
+            let inference = Se121Solver
+                .next_inference(&grid)
+                .unwrap()
+                .expect("AI Escargot remains solvable by the corrected registry");
+            if inference.technique() == Technique::NestedForcingChain {
+                let delta = with_se121_delta_scan(true, || {
+                    super::find_se121_chain_tail_with_session(
+                        &grid,
+                        crate::se121::SE121_ENGINE_CONFIG,
+                        &mut super::Se121ChainSession::default(),
+                    )
+                    .expect("delta nested inference")
+                });
+                let full = with_se121_delta_scan(false, || {
+                    super::find_se121_chain_tail_with_session(
+                        &grid,
+                        crate::se121::SE121_ENGINE_CONFIG,
+                        &mut super::Se121ChainSession::default(),
+                    )
+                    .expect("full-scan nested inference")
+                });
+                assert_eq!(delta, inference, "fresh delta production entry");
+                assert_eq!(delta, full, "nested delta/full exact A/B");
+                compared_nested = true;
+                break;
+            }
+            inference.apply(&mut grid);
+        }
+        assert!(compared_nested, "fixture never reached a nested inference");
+    }
+
+    #[test]
     fn se121_modes_select_the_old_locking_traversal() {
         assert!(MultiMode::Se121DynamicPlus.uses_se121_locking_order());
         for level in 2..=5 {
@@ -3667,6 +4125,55 @@ mod tests {
             }
             .uses_se121_locking_order()
         );
+    }
+
+    #[test]
+    fn se121_delta_scan_is_gated_to_corrected_classic_fcplus_zero() {
+        let classic = sparse_snapshot(&[(0, "12")]);
+        let config = crate::se121::SE121_ENGINE_CONFIG;
+        assert!(super::uses_se121_delta_advanced_scan(
+            &classic,
+            config,
+            MultiMode::Se121DynamicPlus,
+        ));
+        assert!(super::uses_se121_delta_advanced_scan(
+            &classic,
+            config,
+            MultiMode::Se121Nested { level: 5 },
+        ));
+        assert!(!super::uses_se121_delta_advanced_scan(
+            &classic,
+            config,
+            MultiMode::DynamicPlus,
+        ));
+        assert!(!super::uses_se121_delta_advanced_scan(
+            &classic,
+            EngineConfig {
+                forcing_chain_plus: 1,
+                ..config
+            },
+            MultiMode::Se121DynamicPlus,
+        ));
+
+        let variant = sparse_snapshot_with_variant(
+            &[(0, "12")],
+            VariantConfig {
+                anti_knight: true,
+                ..VariantConfig::default()
+            },
+        );
+        assert!(!super::uses_se121_delta_advanced_scan(
+            &variant,
+            config,
+            MultiMode::Se121DynamicPlus,
+        ));
+        with_se121_delta_scan(false, || {
+            assert!(!super::uses_se121_delta_advanced_scan(
+                &classic,
+                config,
+                MultiMode::Se121DynamicPlus,
+            ));
+        });
     }
 
     #[test]
@@ -3723,6 +4230,7 @@ mod tests {
             ]);
             let mut branch = Branch::new();
             let mut state = DynamicState::new();
+            state.begin(true);
 
             remove_for_advanced(&mut branch, &mut state, &mut grid, 1, 2);
             remove_for_advanced(&mut branch, &mut state, &mut grid, 4, 1);
@@ -3804,6 +4312,178 @@ mod tests {
         assert!(
             legacy.pending_off.is_empty(),
             "the historical general policy must still prune after stale Locking"
+        );
+    }
+
+    #[test]
+    fn se121_delta_backlogs_survive_an_earlier_family_stop_and_match_full_ordered_parents() {
+        type Pass = (super::AdvancedScan, Vec<PendingNodeShape>);
+
+        fn run(delta_enabled: bool) -> (Pass, Pass) {
+            with_se121_delta_scan(delta_enabled, || {
+                let mut grid = sparse_snapshot(&[
+                    (0, "2"),
+                    (1, "2"),
+                    (9, "2"),
+                    (27, "2"),
+                    (3, "1"),
+                    (4, "1"),
+                    (12, "1"),
+                    (30, "1"),
+                    (72, "789"),
+                    (73, "678"),
+                    (74, "78"),
+                ]);
+                let mut branch = Branch::new();
+                let mut state = DynamicState::new();
+                state.begin(delta_enabled);
+                for (cell, digit) in [(1, 2), (4, 1), (74, 7), (74, 8)] {
+                    remove_for_advanced(&mut branch, &mut state, &mut grid, cell, digit);
+                }
+
+                let config = crate::se121::SE121_ENGINE_CONFIG;
+                let first_scan = branch.collect_advanced(
+                    &grid,
+                    &state,
+                    &mut InnerChainCache::default(),
+                    MultiMode::Se121DynamicPlus,
+                    config,
+                );
+                let first_shape = pending_node_shapes(&branch);
+                if delta_enabled {
+                    assert_eq!(
+                        branch.se121_advanced_family_cursors,
+                        [4, 0, 0, 0],
+                        "later families must retain the removals skipped after Locking"
+                    );
+                }
+
+                while let Some(node) = branch.pending_off.pop_front() {
+                    let key = branch.arena.key(node);
+                    state.remove(&mut grid, key, node);
+                }
+
+                let second_scan = branch.collect_advanced(
+                    &grid,
+                    &state,
+                    &mut InnerChainCache::default(),
+                    MultiMode::Se121DynamicPlus,
+                    config,
+                );
+                let second_shape = pending_node_shapes(&branch);
+                if delta_enabled {
+                    assert_eq!(
+                        branch.se121_advanced_family_cursors,
+                        [6, 6, 0, 0],
+                        "Hidden Pair must consume the complete six-removal backlog"
+                    );
+                }
+                ((first_scan, first_shape), (second_scan, second_shape))
+            })
+        }
+
+        let full = run(false);
+        let delta = run(true);
+        assert_eq!(delta, full, "delta/full advanced passes must be exact");
+        assert_eq!(
+            delta.0,
+            (
+                super::AdvancedScan {
+                    productive: true,
+                    added: true,
+                    boundary: None,
+                },
+                vec![((27, 2), vec![(1, 2)]), ((30, 1), vec![(4, 1)]),],
+            )
+        );
+        assert_eq!(
+            delta.1,
+            (
+                super::AdvancedScan {
+                    productive: true,
+                    added: true,
+                    boundary: None,
+                },
+                vec![
+                    ((72, 9), vec![(74, 7), (74, 8)]),
+                    ((73, 6), vec![(74, 7), (74, 8)]),
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn se121_delta_naked_pair_and_xwing_match_full_ordered_parents() {
+        fn naked_pair(scoped: bool) -> (super::AdvancedScan, Vec<PendingNodeShape>) {
+            let mut grid = sparse_snapshot(&[(0, "123"), (1, "12"), (2, "124")]);
+            let mut branch = Branch::new();
+            let mut state = DynamicState::new();
+            state.begin(true);
+            remove_for_advanced(&mut branch, &mut state, &mut grid, 0, 3);
+            let scan = if scoped {
+                let delta = super::AdvancedDelta::from_removed_keys(&state.removed_keys);
+                branch.scan_naked_sets_scoped(
+                    &grid,
+                    &state,
+                    crate::se121::SE121_ENGINE_CONFIG,
+                    false,
+                    2,
+                    Some(&delta),
+                )
+            } else {
+                branch.scan_naked_sets(&grid, &state, crate::se121::SE121_ENGINE_CONFIG, false, 2)
+            };
+            (scan, pending_node_shapes(&branch))
+        }
+
+        fn xwing(scoped: bool) -> (super::AdvancedScan, Vec<PendingNodeShape>) {
+            let mut grid = sparse_snapshot(&[
+                (0, "12"),
+                (1, "12"),
+                (2, "14"),
+                (9, "12"),
+                (10, "12"),
+                (18, "13"),
+            ]);
+            let mut branch = Branch::new();
+            let mut state = DynamicState::new();
+            state.begin(true);
+            remove_for_advanced(&mut branch, &mut state, &mut grid, 18, 1);
+            let scan = if scoped {
+                let delta = super::AdvancedDelta::from_removed_keys(&state.removed_keys);
+                branch.scan_fish_scoped(&grid, &state, 2, Some(&delta))
+            } else {
+                branch.scan_fish(&grid, &state, 2)
+            };
+            (scan, pending_node_shapes(&branch))
+        }
+
+        let naked_full = naked_pair(false);
+        assert_eq!(naked_pair(true), naked_full);
+        assert_eq!(
+            naked_full,
+            (
+                super::AdvancedScan {
+                    productive: true,
+                    added: true,
+                    boundary: None,
+                },
+                vec![((2, 1), vec![(0, 3)]), ((2, 2), vec![(0, 3)]),],
+            )
+        );
+
+        let xwing_full = xwing(false);
+        assert_eq!(xwing(true), xwing_full);
+        assert_eq!(
+            xwing_full,
+            (
+                super::AdvancedScan {
+                    productive: true,
+                    added: true,
+                    boundary: None,
+                },
+                vec![((2, 1), vec![(18, 1)])],
+            )
         );
     }
 
@@ -3991,6 +4671,114 @@ mod tests {
         let mut solved = grid.clone();
         solved.place(CellId::new(80).unwrap(), Digit::new(9).unwrap());
         assert!(GridStateKey::new(&grid) != GridStateKey::new(&solved));
+    }
+
+    #[test]
+    fn se121_negative_fcc_cache_survives_scope_clear_and_keys_values_exactly() {
+        let solved = classic_grid(
+            "123456789456789123789123456214365897365897214897214365531642978642978531978531642",
+        );
+        let config = crate::se121::SE121_ENGINE_CONFIG;
+        let mut cache = InnerChainCache::default();
+
+        assert!(cache.forcing_se121(&solved, config).is_empty());
+        assert_eq!(cache.se121_forcing_computations, 1);
+        assert_eq!(cache.se121_forcing_negative_hits, 0);
+        assert_eq!(cache.se121_forcing_negative.len(), 1);
+        assert!(
+            cache.forcing.is_empty(),
+            "negative results retain no proof slice"
+        );
+
+        cache.clear_local_results();
+        assert!(cache.forcing_se121(&solved, config).is_empty());
+        assert_eq!(
+            cache.se121_forcing_computations, 1,
+            "the second scope must hit the session negative cache"
+        );
+        assert_eq!(cache.se121_forcing_negative_hits, 1);
+
+        let mut changed_value = solved.clone();
+        changed_value.place(CellId::new(0).unwrap(), Digit::new(2).unwrap());
+        assert!(cache.forcing_se121(&changed_value, config).is_empty());
+        assert_eq!(cache.se121_forcing_computations, 2);
+        assert_eq!(cache.se121_forcing_negative.len(), 2);
+    }
+
+    #[test]
+    fn first_hint_draft_materializes_the_same_placement_and_elimination() {
+        let grid = sparse_snapshot(&[(0, "123")]);
+        let mode = MultiMode::Dynamic;
+        let target_cell = CellId::new(0).unwrap();
+        let target_digit = Digit::new(1).unwrap();
+
+        for target_on in [true, false] {
+            let kind = crate::MultipleChainKind::Cell {
+                source_cell: target_cell,
+                target_cell,
+                target_digit,
+                target_on,
+            };
+            let draft = super::RankedMultiDraft::new(
+                &grid,
+                mode,
+                17,
+                5,
+                kind,
+                target_cell,
+                target_digit,
+                target_on,
+            )
+            .expect("applicable draft");
+            let direct = super::ranked_target(
+                &grid,
+                mode,
+                17,
+                5,
+                kind,
+                target_cell,
+                target_digit,
+                target_on,
+            )
+            .expect("applicable materialized candidate")
+            .inference;
+            assert_eq!(draft.materialize(&grid, mode), direct);
+        }
+    }
+
+    #[test]
+    fn first_hint_search_materializes_only_the_ranked_winner() {
+        let grid = sparse_snapshot(&[
+            (0, "129"),
+            (10, "157"),
+            (11, "124"),
+            (12, "17"),
+            (19, "128"),
+            (20, "189"),
+            (21, "17"),
+            (28, "146"),
+            (29, "157"),
+            (80, "129"),
+            (70, "157"),
+            (69, "124"),
+            (68, "17"),
+            (61, "128"),
+            (60, "189"),
+            (59, "17"),
+            (52, "146"),
+            (51, "157"),
+        ]);
+        super::FIRST_DRAFT_OFFERS.with(|count| count.set(0));
+        super::RANKED_TARGET_MATERIALIZATIONS.with(|count| count.set(0));
+
+        assert!(find_dynamic_forcing_chain(&grid, EngineConfig::default()).is_some());
+        let offers = super::FIRST_DRAFT_OFFERS.with(std::cell::Cell::get);
+        let materializations = super::RANKED_TARGET_MATERIALIZATIONS.with(std::cell::Cell::get);
+        assert!(
+            offers > 1,
+            "fixture must expose losing first-hint candidates"
+        );
+        assert_eq!(materializations, 1, "only the ranked winner is allocated");
     }
 
     #[test]

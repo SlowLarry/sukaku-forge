@@ -174,17 +174,84 @@ for the native rater and 761.22 seconds for SudokuMonster v1.18.1. Both emitted
 engine received one fresh process without warm-up on the same pinned Xeon
 8370C CPU; this result is not presented as a corpus average.
 
+### 0.6.0 headless optimization measurements
+
+The Java comparison above remains the external SudokuMonster v1.18.1
+benchmark. The optimized 0.6.0 code candidate used a preserved native 0.5.0
+Rust binary as its baseline, so these numbers measure changes within the
+focused headless rater and must not be read as new Rust-versus-Java results.
+The isolated and protected candidate artifact was built immediately before the
+metadata bump and therefore still identified itself as 0.5.0. The protected
+11.8 case was not rerun after that metadata-only change; the hardest-ten batch
+was repeated with the final self-identifying 0.6.0 binary.
+
+Four changes were evaluated while preserving the SE ordering and exact grid
+state semantics:
+
+- Chain searches now defer `Inference` payload construction and candidate
+  removal allocation until the final winning candidate is known. This removed
+  912 allocations on the 10.5 case; its measured runtime was neutral.
+- The rating session shares exact-state negative forcing-chain cache entries
+  and reusable scratch capacity across solver steps. The focused measurement
+  improved from 3.559 to 2.644 seconds (`25.7%`) while retaining about 0.57 MiB
+  of negative-cache key payload at the observed capacity; hash-table metadata
+  and reusable branch arenas are additional memory.
+- Nested scans retain a separate removal-event cursor for each inner family
+  and revisit only affected houses and digits, without changing Java's family
+  or traversal order. This improved the matched measurement from 2.617 to
+  2.528 seconds (`3.4%`).
+- A fixed 9×9 Classic candidate cache is the safe first phase of a dedicated
+  grid representation. It measured about `0.3%` faster on the 9.8 case and
+  `1.6%` faster on the 10.5 case.
+
+The combined native build rated the first (hardest) ten entries of the
+retained corpus in one reusable process. The preserved 0.5.0 binary took
+121.453 seconds and the final 0.6.0 binary took 102.688 seconds in one
+same-core batch per binary, a `15.4%` reduction; all ten ER/EP/ED results were
+identical between the two builds. The pre-bump protected 11.8 one-shot
+moved from 32.891 to 28.949 seconds (`12.0%`) and both builds emitted
+`11.8/1.2/1.2`. These are matched Rust-to-Rust measurements, separate from the
+retained 33.57-versus-761.22-second Java comparison above.
+
+### Retained hard-puzzle corpus
+
+`scripts/hard-puzzle-corpus.json` is an ordered snapshot of the public
+[hard-puzzle Google Sheet](https://docs.google.com/spreadsheets/d/1t-PsJT-pKGQEWjSbbNBXzLcxb5Inmooszntu9ZVCW_M/edit?gid=0#gid=0).
+It retains all 972 unique `expanded-minlex` strings and their published
+ER/EP/ED ratings, but none of the sheet's dates, solutions or auxiliary
+columns. Source and normalized-case SHA-256 digests make accidental corpus
+changes visible. The sheet does not state a data license; the snapshot remains
+explicitly attributed third-party benchmark data, and the project's LGPL
+license should not be read as licensing that corpus.
+
+Rate an ordered slice in one reusable process and optionally retain a JSON
+report:
+
+```sh
+python3 scripts/benchmark-hard-corpus.py \
+  --rater target/rater-native/rater/sukaku-forge-rate \
+  --start 1 --limit 10 \
+  --json-out target/benchmarks/hard-corpus-first10.json
+```
+
+Published ratings are comparison data rather than a pass/fail oracle: the
+corrected rater, its default-off uniqueness techniques, and later source
+versions can intentionally produce different ratings.
+
 ## Optimization policy
 
-The dedicated path already reuses one immutable topology per batch, freezes a
-static producer array instead of allocating/gating the general registry each
-step, passes the top-level grid directly into the rating loop, and tracks only
-three numeric ratings without allocating technique names. Hidden/set family
+The dedicated path reuses one immutable topology per batch, freezes a static
+producer array instead of allocating/gating the general registry each step,
+passes the top-level grid directly into the rating loop, and tracks only three
+numeric ratings without allocating technique names. Hidden/set family
 traversal and Locking family pairs use static tables and lazy stack-only
-iterators rather than allocating order vectors on every probe.
+iterators rather than allocating order vectors on every probe. The 0.6.0
+changes add winner-only chain payload materialization, rating-session scratch
+and exact-negative cache reuse, delta-aware nested scans, and the first fixed
+Classic grid cache described above.
 
-Further work may replace the general grid/topology, inference payloads,
-implication construction, workspaces and caches freely. Each change remains
+Further work may deepen the dedicated Classic grid representation and replace
+more implication construction, workspaces and caches. Each change remains
 behind the corrected corpus plus its pinned SE 1.2.1 baselines and is measured
 independently in portable and `target-cpu=native` builds. Multithreaded root
 search remains deferred.

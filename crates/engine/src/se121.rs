@@ -14,7 +14,7 @@ use crate::aligned_exclusion::{
     find_aligned_pair_exclusion_se121, find_aligned_triplet_exclusion_se121,
 };
 use crate::bug::find_bivalue_universal_grave_se121;
-use crate::multiple_chains::find_se121_chain_tail;
+use crate::multiple_chains::{Se121ChainSession, find_se121_chain_tail_with_session};
 use crate::producers::{find_direct_locking_se121, find_locking_se121};
 use crate::wings::find_wing_se121;
 
@@ -243,6 +243,16 @@ impl Se121Solver {
     }
 
     fn next_classic_inference(self, grid: &Grid, options: Se121Options) -> Option<Inference> {
+        let mut chain_session = None;
+        self.next_classic_inference_with_session(grid, options, &mut chain_session)
+    }
+
+    fn next_classic_inference_with_session(
+        self,
+        grid: &Grid,
+        options: Se121Options,
+        chain_session: &mut Option<Se121ChainSession>,
+    ) -> Option<Inference> {
         for producer in SE121_PRODUCERS {
             if !options.enables(producer) {
                 continue;
@@ -288,7 +298,11 @@ impl Se121Solver {
                 // and weak implications can be reused without changing
                 // producer or discovery order.
                 Se121Producer::MultipleForcingChain => {
-                    return find_se121_chain_tail(grid, SE121_ENGINE_CONFIG);
+                    return find_se121_chain_tail_with_session(
+                        grid,
+                        SE121_ENGINE_CONFIG,
+                        chain_session.get_or_insert_default(),
+                    );
                 }
                 Se121Producer::DynamicForcingChain
                 | Se121Producer::DynamicForcingChainPlus
@@ -317,11 +331,14 @@ impl Se121Solver {
     ) -> Result<Se121Rating, Se121VariantError> {
         Self::ensure_classic(&grid)?;
         let mut tracker = Se121RatingTracker::default();
+        let mut chain_session = None;
         loop {
             if grid.is_solved() {
                 return Ok(tracker.result);
             }
-            let Some(inference) = self.next_classic_inference(&grid, options) else {
+            let Some(inference) =
+                self.next_classic_inference_with_session(&grid, options, &mut chain_session)
+            else {
                 return Ok(tracker.beyond_solver());
             };
             tracker.observe(&inference);
@@ -453,6 +470,75 @@ mod tests {
         assert_eq!(rating.er(), Rating::default());
         assert_eq!(rating.ep(), Rating::default());
         assert_eq!(rating.ed(), Rating::default());
+    }
+
+    #[test]
+    fn singles_only_rating_never_initializes_chain_session() {
+        let mut grid = classic_grid(
+            ".23456789456789123789123456214365897365897214897214365531642978642978531978531642",
+        );
+        let mut chain_session = None;
+        while !grid.is_solved() {
+            let inference = Se121Solver
+                .next_classic_inference_with_session(
+                    &grid,
+                    Se121Options::default(),
+                    &mut chain_session,
+                )
+                .expect("single remains available");
+            inference.apply(&mut grid);
+        }
+        assert!(
+            chain_session.is_none(),
+            "easy ratings must not allocate multiple-chain scratch"
+        );
+    }
+
+    #[test]
+    #[ignore = "slow stepwise 10.5 nested-chain differential"]
+    fn persistent_chain_session_matches_fresh_resources_at_every_nested_step() {
+        let puzzle =
+            "1....7.9..3..2...8..96..5....53..9...1..8...26....4...3......1..4......7..7...3..";
+        let mut fresh_grid = classic_grid(puzzle);
+        let mut cached_grid = fresh_grid.clone();
+        let mut fresh_tracker = Se121RatingTracker::default();
+        let mut cached_tracker = Se121RatingTracker::default();
+        let mut chain_session = None;
+
+        for _ in 0..512 {
+            assert_eq!(cached_grid.values_string(), fresh_grid.values_string());
+            assert_eq!(
+                cached_grid.candidate_string(),
+                fresh_grid.candidate_string()
+            );
+            if fresh_grid.is_solved() {
+                break;
+            }
+            let fresh = Se121Solver.next_classic_inference(&fresh_grid, Se121Options::default());
+            let cached = Se121Solver.next_classic_inference_with_session(
+                &cached_grid,
+                Se121Options::default(),
+                &mut chain_session,
+            );
+            assert_eq!(
+                cached, fresh,
+                "persistent resources changed a selected hint"
+            );
+            let inference = fresh.expect("nonprotected nested fixture remains solvable");
+            fresh_tracker.observe(&inference);
+            cached_tracker.observe(&inference);
+            inference.apply(&mut fresh_grid);
+            inference.apply(&mut cached_grid);
+        }
+
+        assert!(fresh_grid.is_solved());
+        assert!(cached_grid.is_solved());
+        assert_eq!(cached_tracker.result, fresh_tracker.result);
+        assert_eq!(fresh_tracker.result.er(), Rating::from_tenths(105));
+        assert!(
+            chain_session.is_some(),
+            "fixture must exercise the persistent chain tail"
+        );
     }
 
     #[test]

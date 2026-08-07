@@ -49,7 +49,7 @@ impl ClassicRater {
             return Err(RateError::InvalidLength { actual: text.len() });
         }
         let puzzle = Puzzle::parse(text).map_err(RateError::Parse)?;
-        let grid = Grid::from_puzzle(Arc::clone(&self.topology), &puzzle);
+        let grid = Grid::from_classic_puzzle(Arc::clone(&self.topology), &puzzle);
         Se121Solver
             .rate_with_options(grid, self.options)
             .map_err(RateError::Variant)

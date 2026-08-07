@@ -71,7 +71,9 @@ gui-dev:
 
 verify: fmt check test build
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_benchmark_classic_rater.py
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_benchmark_hard_corpus.py
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_benchmark_java_rust.py
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_hard_puzzle_corpus.py
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_verify_protected_trace.py
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_verify_revised_trace.py
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_verify_se121_oracle.py
