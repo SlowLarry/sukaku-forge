@@ -5,7 +5,7 @@ use sukaku_forge_core::{CandidateMask, CandidateRemovalsBuilder, CellId, Digit, 
 use crate::forcing_chains::{
     Implications, KEY_COUNT, active_region_types, decode_candidate, is_on, potential_key,
 };
-use crate::nested_chains::OnCause;
+use crate::nested_chains::{InferenceCollector, OnCause};
 use crate::presentation_proof::{
     ChainCause, ChainNodeId, ChainProofNode, ChainProofParent, ChainProofView, ChainProofViewKind,
     ChainState, NishioForcingChainWithProof, SelectedChainProof,
@@ -582,6 +582,55 @@ impl RankedNishio {
     }
 }
 
+fn ranked_nishio(
+    arena: &mut DynamicArena,
+    source_cell: CellId,
+    source_digit: Digit,
+    source_on: bool,
+    terminal_on: u32,
+    terminal_off: u32,
+) -> RankedNishio {
+    let contradiction_key = arena.key(terminal_off);
+    debug_assert_eq!(contradiction_key ^ 1, arena.key(terminal_on));
+    let (target_cell, target_digit) = decode_candidate(contradiction_key);
+    let complexity = arena
+        .ancestor_count(terminal_on)
+        .checked_add(arena.ancestor_count(terminal_off))
+        .expect("Nishio complexity");
+    let (rating, java_difficulty) = nishio_rating(complexity);
+    let evidence = Evidence::NishioForcingChain {
+        source_cell,
+        source_digit,
+        source_on,
+        target_cell,
+        target_digit,
+        complexity,
+    };
+    let inference = if source_on {
+        let mut removals = CandidateRemovalsBuilder::with_capacity(1);
+        removals.add(source_cell, CandidateMask::of(source_digit));
+        Inference::elimination(
+            Technique::NishioForcingChain,
+            rating,
+            removals.build(),
+            evidence,
+        )
+    } else {
+        Inference::placement(
+            Technique::NishioForcingChain,
+            rating,
+            source_cell,
+            source_digit,
+            evidence,
+        )
+    };
+    RankedNishio {
+        inference,
+        java_difficulty,
+        complexity,
+    }
+}
+
 /// Find Java's first ranked Nishio contradiction forcing chain.
 #[must_use]
 pub fn find_nishio_forcing_chain(grid: &Grid, config: EngineConfig) -> Option<Inference> {
@@ -609,46 +658,14 @@ pub fn find_nishio_forcing_chain(grid: &Grid, config: EngineConfig) -> Option<In
                 ) else {
                     continue;
                 };
-                let contradiction_key = workspace.arena.key(terminal_off);
-                debug_assert_eq!(contradiction_key ^ 1, workspace.arena.key(terminal_on));
-                let (target_cell, target_digit) = decode_candidate(contradiction_key);
-                let complexity = workspace
-                    .arena
-                    .ancestor_count(terminal_on)
-                    .checked_add(workspace.arena.ancestor_count(terminal_off))
-                    .expect("Nishio complexity");
-                let (rating, java_difficulty) = nishio_rating(complexity);
-                let evidence = Evidence::NishioForcingChain {
-                    source_cell: cell,
-                    source_digit: digit,
+                let candidate = ranked_nishio(
+                    &mut workspace.arena,
+                    cell,
+                    digit,
                     source_on,
-                    target_cell,
-                    target_digit,
-                    complexity,
-                };
-                let inference = if source_on {
-                    let mut removals = CandidateRemovalsBuilder::with_capacity(1);
-                    removals.add(cell, CandidateMask::of(digit));
-                    Inference::elimination(
-                        Technique::NishioForcingChain,
-                        rating,
-                        removals.build(),
-                        evidence,
-                    )
-                } else {
-                    Inference::placement(
-                        Technique::NishioForcingChain,
-                        rating,
-                        cell,
-                        digit,
-                        evidence,
-                    )
-                };
-                let candidate = RankedNishio {
-                    inference,
-                    java_difficulty,
-                    complexity,
-                };
+                    terminal_on,
+                    terminal_off,
+                );
                 if best
                     .as_ref()
                     .is_none_or(|current| candidate.precedes(current))
@@ -660,6 +677,58 @@ pub fn find_nishio_forcing_chain(grid: &Grid, config: EngineConfig) -> Option<In
     }
 
     best.map(|candidate| candidate.inference)
+}
+
+/// Collect every Java-ranked Nishio contradiction forcing chain.
+///
+/// The result is stably ranked and effect-deduplicated while retaining no
+/// presentation DAGs.  Use [`replay_nishio_forcing_chain_with_proof`] after a
+/// GUI row has been selected.
+#[must_use]
+pub fn collect_nishio_forcing_chains(grid: &Grid, config: EngineConfig) -> Vec<Inference> {
+    let implications = Implications::weak_only(grid, config);
+    let region_types = active_region_types(grid, config);
+    let mut working = grid.clone();
+    let mut workspace = DynamicChainWorkspace::new();
+    let mut result = InferenceCollector::new();
+
+    for raw_cell in 0_u8..81 {
+        let cell = CellId::new(raw_cell).expect("cell index loop");
+        if grid.value(cell) != 0 || grid.candidates(cell).count() <= 1 {
+            continue;
+        }
+        for digit in grid.candidates(cell).iter() {
+            for source_on in [true, false] {
+                let Some((terminal_on, terminal_off)) = workspace.contradiction(
+                    &mut working,
+                    &implications,
+                    &region_types,
+                    cell,
+                    digit,
+                    source_on,
+                ) else {
+                    continue;
+                };
+                let candidate = ranked_nishio(
+                    &mut workspace.arena,
+                    cell,
+                    digit,
+                    source_on,
+                    terminal_on,
+                    terminal_off,
+                );
+                result.offer(
+                    grid,
+                    candidate.inference,
+                    candidate.java_difficulty,
+                    u32::from(candidate.complexity),
+                    0,
+                );
+            }
+        }
+    }
+
+    result.finish()
 }
 
 /// Find Java's first ranked Nishio chain and materialize only its selected
@@ -696,46 +765,14 @@ pub fn find_nishio_forcing_chain_with_proof(
                 ) else {
                     continue;
                 };
-                let contradiction_key = workspace.arena.key(terminal_off);
-                debug_assert_eq!(contradiction_key ^ 1, workspace.arena.key(terminal_on));
-                let (target_cell, target_digit) = decode_candidate(contradiction_key);
-                let complexity = workspace
-                    .arena
-                    .ancestor_count(terminal_on)
-                    .checked_add(workspace.arena.ancestor_count(terminal_off))
-                    .expect("Nishio complexity");
-                let (rating, java_difficulty) = nishio_rating(complexity);
-                let evidence = Evidence::NishioForcingChain {
-                    source_cell: cell,
-                    source_digit: digit,
+                let candidate = ranked_nishio(
+                    &mut workspace.arena,
+                    cell,
+                    digit,
                     source_on,
-                    target_cell,
-                    target_digit,
-                    complexity,
-                };
-                let inference = if source_on {
-                    let mut removals = CandidateRemovalsBuilder::with_capacity(1);
-                    removals.add(cell, CandidateMask::of(digit));
-                    Inference::elimination(
-                        Technique::NishioForcingChain,
-                        rating,
-                        removals.build(),
-                        evidence,
-                    )
-                } else {
-                    Inference::placement(
-                        Technique::NishioForcingChain,
-                        rating,
-                        cell,
-                        digit,
-                        evidence,
-                    )
-                };
-                let candidate = RankedNishio {
-                    inference,
-                    java_difficulty,
-                    complexity,
-                };
+                    terminal_on,
+                    terminal_off,
+                );
                 if best
                     .as_ref()
                     .is_none_or(|(current, _)| candidate.precedes(current))
@@ -775,6 +812,75 @@ pub fn find_nishio_forcing_chain_with_proof(
     Some(NishioForcingChainWithProof::new(winner.inference, proof))
 }
 
+/// Replay the contradiction DAGs for any retained Nishio inference.
+///
+/// Returns `None` for a stale inference or one produced by another family.
+#[must_use]
+pub fn replay_nishio_forcing_chain_with_proof(
+    grid: &Grid,
+    config: EngineConfig,
+    inference: &Inference,
+) -> Option<NishioForcingChainWithProof> {
+    if inference.technique() != Technique::NishioForcingChain {
+        return None;
+    }
+    let Evidence::NishioForcingChain {
+        source_cell,
+        source_digit,
+        source_on,
+        ..
+    } = inference.evidence()
+    else {
+        return None;
+    };
+    let implications = Implications::weak_only(grid, config);
+    let region_types = active_region_types(grid, config);
+    let mut working = grid.clone();
+    let mut workspace = DynamicChainWorkspace::new();
+    let (terminal_on, terminal_off) = workspace.contradiction_with_proof(
+        &mut working,
+        &implications,
+        &region_types,
+        source_cell,
+        source_digit,
+        source_on,
+    )?;
+    let candidate = ranked_nishio(
+        &mut workspace.arena,
+        source_cell,
+        source_digit,
+        source_on,
+        terminal_on,
+        terminal_off,
+    );
+    if candidate.inference != *inference {
+        return None;
+    }
+    let proof = SelectedChainProof::new(vec![
+        materialize_nishio_view(&workspace.arena, terminal_on, ChainProofViewKind::NishioOn),
+        materialize_nishio_view(
+            &workspace.arena,
+            terminal_off,
+            ChainProofViewKind::NishioOff,
+        ),
+    ]);
+    Some(NishioForcingChainWithProof::new(candidate.inference, proof))
+}
+
+/// Materialize only the selected proof for an inference retained by the
+/// all-hints session.
+#[must_use]
+pub fn replay_nishio_forcing_chain_proof(
+    grid: &Grid,
+    config: EngineConfig,
+    inference: &Inference,
+) -> SelectedChainProof {
+    replay_nishio_forcing_chain_with_proof(grid, config, inference)
+        .expect("retained Nishio inference is reproducible")
+        .into_parts()
+        .1
+}
+
 fn nishio_rating(complexity: u16) -> (Rating, f64) {
     let length = i32::from(complexity) - 2;
     let mut ceiling = 4_i32;
@@ -807,8 +913,9 @@ mod tests {
     };
 
     use super::{
-        DynamicChainWorkspace, Implications, active_region_types, find_nishio_forcing_chain,
-        find_nishio_forcing_chain_with_proof, nishio_rating,
+        DynamicChainWorkspace, Implications, active_region_types, collect_nishio_forcing_chains,
+        find_nishio_forcing_chain, find_nishio_forcing_chain_with_proof, nishio_rating,
+        replay_nishio_forcing_chain_with_proof,
     };
     use crate::{
         ChainCause, ChainProofView, ChainProofViewKind, ChainState, EngineConfig, Evidence, Rating,
@@ -917,6 +1024,35 @@ mod tests {
             grid.candidates(CellId::new(0).unwrap()),
             CandidateMask::EMPTY
         );
+    }
+
+    #[test]
+    fn all_nishio_hints_keep_rank_order_and_replay_a_nonfirst_proof() {
+        let grid = sparse_snapshot(&[
+            (0, "78"),
+            (1, "79"),
+            (9, "79"),
+            (40, "45"),
+            (41, "46"),
+            (49, "46"),
+        ]);
+        let config = EngineConfig::default();
+        let hints = collect_nishio_forcing_chains(&grid, config);
+        assert!(
+            hints.len() > 1,
+            "fixture must expose multiple Nishio effects"
+        );
+        assert_eq!(
+            find_nishio_forcing_chain(&grid, config).as_ref(),
+            hints.first()
+        );
+
+        let selected = &hints[1];
+        let first_replay = replay_nishio_forcing_chain_with_proof(&grid, config, selected).unwrap();
+        let second_replay =
+            replay_nishio_forcing_chain_with_proof(&grid, config, selected).unwrap();
+        assert_eq!(first_replay.inference(), selected);
+        assert_eq!(first_replay.proof(), second_replay.proof());
     }
 
     #[test]

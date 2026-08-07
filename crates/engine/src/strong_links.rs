@@ -1,4 +1,4 @@
-use std::array;
+use std::{array, cmp::Ordering};
 
 use sukaku_forge_core::{
     CandidateMask, CandidateRemovalsBuilder, CellId, CellMask, Digit, Grid, PositionMask,
@@ -185,6 +185,27 @@ struct RankedHint {
     suffix: String,
 }
 
+trait RankedHintSink {
+    fn offer(&mut self, hint: RankedHint);
+}
+
+impl RankedHintSink for Option<RankedHint> {
+    fn offer(&mut self, hint: RankedHint) {
+        if self
+            .as_ref()
+            .is_none_or(|current| better_than(&hint, current))
+        {
+            *self = Some(hint);
+        }
+    }
+}
+
+impl RankedHintSink for Vec<RankedHint> {
+    fn offer(&mut self, hint: RankedHint) {
+        self.push(hint);
+    }
+}
+
 /// Find the first Java-ordered two-strong-links hint.
 ///
 /// Original rating mode ports `StrongLinks(2)`. Revised mode deliberately
@@ -199,6 +220,19 @@ pub fn find_two_strong_links(grid: &Grid, config: EngineConfig) -> Option<Infere
         RatingMode::Revised => search_revised(grid, config, &catalogs, &mut best),
     }
     best.map(|ranked: RankedHint| ranked.inference)
+}
+
+/// Collect every Java-compatible two-strong-links hint in the producer's
+/// stable rank order.
+#[must_use]
+pub fn collect_two_strong_links(grid: &Grid, config: EngineConfig) -> Vec<Inference> {
+    let catalogs = build_catalogs(grid, config.rating_mode);
+    let mut hints = Vec::new();
+    match config.rating_mode {
+        RatingMode::Original => search_original(grid, config, &catalogs, &mut hints),
+        RatingMode::Revised => search_revised(grid, config, &catalogs, &mut hints),
+    }
+    finish_ranked_hints(hints)
 }
 
 const THREE_LINK_ORDERS: [[usize; 3]; 3] = [[0, 1, 2], [1, 0, 2], [0, 2, 1]];
@@ -234,6 +268,18 @@ pub fn find_three_strong_links(grid: &Grid, config: EngineConfig) -> Option<Infe
     best.map(|ranked: RankedHint| ranked.inference)
 }
 
+/// Collect every Java-compatible `StrongLinks(3)` hint in stable rank order.
+#[must_use]
+pub fn collect_three_strong_links(grid: &Grid, config: EngineConfig) -> Vec<Inference> {
+    let catalogs = build_catalogs(grid, RatingMode::Original);
+    let active_types = original_active_types(grid, config);
+    let mut hints = Vec::new();
+    visit_three_link_type_multisets(&active_types, |types| {
+        search_three_link_types(grid, config, &catalogs, types, &mut hints);
+    });
+    finish_ranked_hints(hints)
+}
+
 /// Find the first Java-ranked `StrongLinks(4)` hint in either rating mode.
 #[must_use]
 pub fn find_four_strong_links(grid: &Grid, config: EngineConfig) -> Option<Inference> {
@@ -244,6 +290,34 @@ pub fn find_four_strong_links(grid: &Grid, config: EngineConfig) -> Option<Infer
         search_four_link_types(grid, config, &catalogs, types, &mut best);
     });
     best.map(|ranked: RankedHint| ranked.inference)
+}
+
+/// Collect every Java-compatible `StrongLinks(4)` hint in stable rank order.
+#[must_use]
+pub fn collect_four_strong_links(grid: &Grid, config: EngineConfig) -> Vec<Inference> {
+    let catalogs = build_catalogs(grid, RatingMode::Original);
+    let active_types = original_active_types(grid, config);
+    let mut hints = Vec::new();
+    visit_four_link_type_multisets(&active_types, |types| {
+        search_four_link_types(grid, config, &catalogs, types, &mut hints);
+    });
+    finish_ranked_hints(hints)
+}
+
+fn finish_ranked_hints(mut hints: Vec<RankedHint>) -> Vec<Inference> {
+    // Java's Collections.sort is stable. StrongLinks and TurbotFish do not
+    // implement value equality, so the producer-local accumulator retains
+    // all equal-ranked discoveries rather than deduplicating them.
+    hints.sort_by(java_compare);
+    hints.into_iter().map(|hint| hint.inference).collect()
+}
+
+fn java_compare(left: &RankedHint, right: &RankedHint) -> Ordering {
+    left.inference
+        .rating()
+        .cmp(&right.inference.rating())
+        .then_with(|| right.raw_eliminations.cmp(&left.raw_eliminations))
+        .then_with(|| left.suffix.cmp(&right.suffix))
 }
 
 fn visit_three_link_type_multisets(active_types: &[usize], mut visit: impl FnMut([usize; 3])) {
@@ -287,7 +361,7 @@ fn search_three_link_types(
     config: EngineConfig,
     catalogs: &[[Vec<LinkCandidate>; REGION_TYPE_COUNT]; 10],
     types: [usize; 3],
-    best: &mut Option<RankedHint>,
+    sink: &mut impl RankedHintSink,
 ) {
     for value in 1_u8..=9 {
         let digit = Digit::new(value).expect("digit loop");
@@ -317,7 +391,7 @@ fn search_three_link_types(
                     if !first_two_cells.intersect(third.all_cells).is_empty() {
                         continue;
                     }
-                    evaluate_three_link_tuple(grid, config, digit, [first, second, third], best);
+                    evaluate_three_link_tuple(grid, config, digit, [first, second, third], sink);
                 }
             }
         }
@@ -329,7 +403,7 @@ fn search_four_link_types(
     config: EngineConfig,
     catalogs: &[[Vec<LinkCandidate>; REGION_TYPE_COUNT]; 10],
     types: [usize; 4],
-    best: &mut Option<RankedHint>,
+    sink: &mut impl RankedHintSink,
 ) {
     for value in 1_u8..=9 {
         let digit = Digit::new(value).expect("digit loop");
@@ -372,7 +446,7 @@ fn search_four_link_types(
                             config,
                             digit,
                             [first, second, third, fourth],
-                            best,
+                            sink,
                         );
                     }
                 }
@@ -386,7 +460,7 @@ fn evaluate_three_link_tuple(
     config: EngineConfig,
     digit: Digit,
     links: [LinkCandidate; 3],
-    best: &mut Option<RankedHint>,
+    sink: &mut impl RankedHintSink,
 ) {
     for order in THREE_LINK_ORDERS {
         for directions in 0_u8..8 {
@@ -438,12 +512,7 @@ fn evaluate_three_link_tuple(
                 raw_eliminations,
                 suffix: three_strong_links_suffix(link_regions, order_bytes, grouped_links),
             };
-            if best
-                .as_ref()
-                .is_none_or(|current| better_than(&ranked, current))
-            {
-                *best = Some(ranked);
-            }
+            sink.offer(ranked);
         }
     }
 }
@@ -453,7 +522,7 @@ fn evaluate_four_link_tuple(
     config: EngineConfig,
     digit: Digit,
     links: [LinkCandidate; 4],
-    best: &mut Option<RankedHint>,
+    sink: &mut impl RankedHintSink,
 ) {
     let endpoint_groups: [CellGroup; 8] =
         array::from_fn(|index| links[index / 2].endpoints[index % 2]);
@@ -544,12 +613,7 @@ fn evaluate_four_link_tuple(
                 raw_eliminations,
                 suffix: four_strong_links_suffix(link_regions, order_bytes, grouped_links),
             };
-            if best
-                .as_ref()
-                .is_none_or(|current| better_than(&ranked, current))
-            {
-                *best = Some(ranked);
-            }
+            sink.offer(ranked);
         }
     }
 }
@@ -847,7 +911,7 @@ fn search_original(
     grid: &Grid,
     config: EngineConfig,
     catalogs: &[[Vec<LinkCandidate>; REGION_TYPE_COUNT]; 10],
-    best: &mut Option<RankedHint>,
+    sink: &mut impl RankedHintSink,
 ) {
     let active_types = original_active_types(grid, config);
     for second_ordinal in 0..active_types.len() {
@@ -873,7 +937,7 @@ fn search_original(
                             digit,
                             [first, second],
                             RatingMode::Original,
-                            best,
+                            sink,
                         );
                     }
                 }
@@ -886,7 +950,7 @@ fn search_revised(
     grid: &Grid,
     config: EngineConfig,
     catalogs: &[[Vec<LinkCandidate>; REGION_TYPE_COUNT]; 10],
-    best: &mut Option<RankedHint>,
+    sink: &mut impl RankedHintSink,
 ) {
     let pair_count = if effective_variant_latin(grid, config) {
         5
@@ -919,7 +983,7 @@ fn search_revised(
                         digit,
                         [base, cover],
                         RatingMode::Revised,
-                        best,
+                        sink,
                     );
                 }
             }
@@ -933,7 +997,7 @@ fn evaluate_link_pair(
     digit: Digit,
     links: [LinkCandidate; 2],
     mode: RatingMode,
-    best: &mut Option<RankedHint>,
+    sink: &mut impl RankedHintSink,
 ) {
     for first_direction in 0..2 {
         for second_direction in 0..2 {
@@ -985,22 +1049,13 @@ fn evaluate_link_pair(
                 raw_eliminations,
                 suffix,
             };
-            if best
-                .as_ref()
-                .is_none_or(|current| better_than(&ranked, current))
-            {
-                *best = Some(ranked);
-            }
+            sink.offer(ranked);
         }
     }
 }
 
 fn better_than(candidate: &RankedHint, current: &RankedHint) -> bool {
-    candidate.inference.rating() < current.inference.rating()
-        || candidate.inference.rating() == current.inference.rating()
-            && (candidate.raw_eliminations > current.raw_eliminations
-                || candidate.raw_eliminations == current.raw_eliminations
-                    && candidate.suffix < current.suffix)
+    java_compare(candidate, current) == Ordering::Less
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1549,8 +1604,11 @@ mod tests {
         CellId, ConstraintTopology, Digit, Grid, Puzzle, RegionId, VariantConfig,
     };
 
-    use super::{find_four_strong_links, find_three_strong_links, find_two_strong_links};
-    use crate::{EngineConfig, Rating, RatingMode, RatingTracker, Technique};
+    use super::{
+        collect_four_strong_links, collect_three_strong_links, collect_two_strong_links,
+        find_four_strong_links, find_three_strong_links, find_two_strong_links,
+    };
+    use crate::{EngineConfig, Inference, Rating, RatingMode, RatingTracker, Technique};
 
     fn sparse_snapshot(digit: u8, cells: &[usize]) -> Grid {
         sparse_snapshot_with_variant(digit, cells, VariantConfig::default())
@@ -1647,6 +1705,83 @@ mod tests {
             41,
             "(2 Strong Links) X-Loop 000: Cell r1c1,r2c2,r2c5,r1c4 on value 1",
             &[0, 3, 10, 13],
+        );
+    }
+
+    #[test]
+    fn full_collectors_preserve_java_rank_order_and_compact_winner() {
+        let config = EngineConfig::default();
+        let two_grid = sparse_snapshot(1, &[0, 3, 28, 30, 10]);
+        let two = collect_two_strong_links(&two_grid, config);
+        assert_eq!(two.len(), 5);
+        assert_eq!(
+            find_two_strong_links(&two_grid, config).as_ref(),
+            two.first()
+        );
+        assert_eq!(
+            two.iter()
+                .map(|hint| hint.description(two_grid.topology()))
+                .collect::<Vec<_>>(),
+            [
+                "Skyscraper 011: Cell r1c1,r1c4,r4c4,r4c2 on value 1",
+                "Skyscraper 011: Cell r2c2,r4c2,r4c4,r1c4 on value 1",
+                "2 Strong links 001: Cell r1c1,r2c2,r4c2,r4c4 on value 1",
+                "2 Strong links 001: Cell r2c2,r1c1,r1c4,r4c4 on value 1",
+                "2-String Kite 012: Cell r1c4,r1c1,r2c2,r4c2 on value 1",
+            ]
+        );
+
+        let three_grid = sparse_snapshot(
+            3,
+            &[
+                1, 2, 6, 11, 12, 15, 18, 22, 26, 27, 28, 29, 56, 57, 60, 63, 65, 67, 69, 71, 74,
+                76, 78,
+            ],
+        );
+        let three = collect_three_strong_links(&three_grid, config);
+        assert_eq!(three.len(), 3);
+        assert_eq!(
+            find_three_strong_links(&three_grid, config).as_ref(),
+            three.first()
+        );
+        assert_eq!(
+            three.iter().map(Inference::short_name).collect::<Vec<_>>(),
+            ["g3SL1010", "g3SL2012", "g3SL3001"]
+        );
+
+        let four_grid = sparse_snapshot(1, &[0, 3, 16, 21, 24, 27, 37, 42, 52]);
+        let four = collect_four_strong_links(&four_grid, config);
+        assert_eq!(four.len(), 9);
+        assert_eq!(
+            find_four_strong_links(&four_grid, config).as_ref(),
+            four.first()
+        );
+        assert_eq!(
+            four.iter()
+                .map(|hint| (hint.rating().tenths(), hint.short_name()))
+                .collect::<Vec<_>>(),
+            [
+                (59, "4SL00001".to_owned()),
+                (59, "4SL00001".to_owned()),
+                (59, "4SL00011".to_owned()),
+                (59, "4SL00011".to_owned()),
+                (59, "4SL01121".to_owned()),
+                (59, "4SL01121".to_owned()),
+                (59, "4SL01212".to_owned()),
+                (60, "4SL00112".to_owned()),
+                (60, "4SL00112".to_owned()),
+            ]
+        );
+
+        let revised_config = EngineConfig {
+            rating_mode: RatingMode::Revised,
+            ..config
+        };
+        let revised_grid = sparse_snapshot(1, &[0, 3, 27, 31, 39]);
+        let revised = collect_two_strong_links(&revised_grid, revised_config);
+        assert_eq!(
+            find_two_strong_links(&revised_grid, revised_config).as_ref(),
+            revised.first()
         );
     }
 

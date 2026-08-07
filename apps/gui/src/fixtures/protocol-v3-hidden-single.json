@@ -1,10 +1,10 @@
 {
-  "protocol_version": 2,
+  "protocol_version": 3,
   "scenario": "hidden_single_round_trip",
   "steps": [
     {
       "request": {
-        "protocol_version": 2,
+        "protocol_version": 3,
         "request_id": 1,
         "command": "create_session",
         "puzzle": "12345678.........................................................................",
@@ -33,7 +33,7 @@
         }
       },
       "response": {
-        "protocol_version": 2,
+        "protocol_version": 3,
         "request_id": 1,
         "response": "session_created",
         "snapshot": {
@@ -771,13 +771,13 @@
     },
     {
       "request": {
-        "protocol_version": 2,
+        "protocol_version": 3,
         "request_id": 2,
         "command": "next_hint",
         "expected_revision": "0"
       },
       "response": {
-        "protocol_version": 2,
+        "protocol_version": 3,
         "request_id": 2,
         "response": "next_hint",
         "revision": "0",
@@ -870,14 +870,14 @@
     },
     {
       "request": {
-        "protocol_version": 2,
+        "protocol_version": 3,
         "request_id": 3,
         "command": "apply_hint",
         "expected_revision": "0",
         "hint_id": "1"
       },
       "response": {
-        "protocol_version": 2,
+        "protocol_version": 3,
         "request_id": 3,
         "response": "snapshot",
         "snapshot": {

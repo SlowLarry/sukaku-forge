@@ -13,6 +13,29 @@ pub fn find_naked_set(
     degree: u8,
     generalized: bool,
 ) -> Option<Inference> {
+    first_inference(|emit| visit_naked_sets(grid, config, degree, generalized, emit))
+}
+
+/// Collect every ordinary or visibility-generalized Naked Set in discovery order.
+#[must_use]
+pub fn collect_naked_sets(
+    grid: &Grid,
+    config: EngineConfig,
+    degree: u8,
+    generalized: bool,
+) -> Vec<Inference> {
+    // NakedSetHint and NakedSetGenHint inherit Object identity. In particular,
+    // equivalent block/line explanations remain distinct in Java.
+    collect_inferences(|emit| visit_naked_sets(grid, config, degree, generalized, emit))
+}
+
+fn visit_naked_sets(
+    grid: &Grid,
+    config: EngineConfig,
+    degree: u8,
+    generalized: bool,
+    emit: &mut dyn FnMut(Inference) -> bool,
+) {
     assert!(
         matches!(degree, 2..=4),
         "only pair through quad layers are currently registered"
@@ -51,7 +74,7 @@ pub fn find_naked_set(
                 if removals.is_empty() {
                     continue;
                 }
-                return Some(Inference::elimination(
+                if !emit(Inference::elimination(
                     naked_set_technique(degree, generalized),
                     naked_set_rating(degree),
                     removals,
@@ -62,16 +85,33 @@ pub fn find_naked_set(
                         tuple_positions,
                         generalized,
                     },
-                ));
+                )) {
+                    return;
+                }
             }
         }
     }
-    None
 }
 
 /// Find the first indirect Hidden Set.
 #[must_use]
 pub fn find_hidden_set(grid: &Grid, config: EngineConfig, degree: u8) -> Option<Inference> {
+    first_inference(|emit| visit_hidden_sets(grid, config, degree, emit))
+}
+
+/// Collect every indirect Hidden Set in Java discovery order.
+#[must_use]
+pub fn collect_hidden_sets(grid: &Grid, config: EngineConfig, degree: u8) -> Vec<Inference> {
+    // HiddenSetHint also inherits Object identity and retains every discovery.
+    collect_inferences(|emit| visit_hidden_sets(grid, config, degree, emit))
+}
+
+fn visit_hidden_sets(
+    grid: &Grid,
+    config: EngineConfig,
+    degree: u8,
+    emit: &mut dyn FnMut(Inference) -> bool,
+) {
     assert!(
         matches!(degree, 2..=4),
         "only pair through quad layers are currently registered"
@@ -106,7 +146,7 @@ pub fn find_hidden_set(grid: &Grid, config: EngineConfig, degree: u8) -> Option<
                 if removals.is_empty() {
                     continue;
                 }
-                return Some(Inference::elimination(
+                if !emit(Inference::elimination(
                     hidden_set_technique(degree),
                     hidden_set_rating(degree, config.rating_mode),
                     removals,
@@ -116,16 +156,42 @@ pub fn find_hidden_set(grid: &Grid, config: EngineConfig, degree: u8) -> Option<
                         tuple_digits,
                         tuple_positions,
                     },
-                ));
+                )) {
+                    return;
+                }
             }
         }
     }
-    None
 }
 
 /// Find the first row/column fish of the requested degree.
 #[must_use]
 pub fn find_fish(grid: &Grid, config: EngineConfig, degree: u8) -> Option<Inference> {
+    first_inference(|emit| visit_fish(grid, config, degree, emit))
+}
+
+/// Collect every row/column fish of the requested degree in discovery order.
+#[must_use]
+pub fn collect_fish(grid: &Grid, config: EngineConfig, degree: u8) -> Vec<Inference> {
+    let mut keys = Vec::new();
+    let mut inferences = Vec::new();
+    visit_fish(grid, config, degree, &mut |inference| {
+        let key = fish_equality_key(&inference);
+        if !keys.contains(&key) {
+            keys.push(key);
+            inferences.push(inference);
+        }
+        true
+    });
+    inferences
+}
+
+fn visit_fish(
+    grid: &Grid,
+    config: EngineConfig,
+    degree: u8,
+    emit: &mut dyn FnMut(Inference) -> bool,
+) {
     assert!(
         matches!(degree, 2..=4),
         "only X-Wing through Jellyfish are currently registered"
@@ -184,7 +250,7 @@ pub fn find_fish(grid: &Grid, config: EngineConfig, degree: u8) -> Option<Infere
                 if removals.is_empty() {
                     continue;
                 }
-                return Some(Inference::elimination(
+                if !emit(Inference::elimination(
                     fish_technique(degree),
                     fish_rating(degree, config.rating_mode),
                     removals,
@@ -195,11 +261,58 @@ pub fn find_fish(grid: &Grid, config: EngineConfig, degree: u8) -> Option<Infere
                         cover_type: cover_type as u8,
                         selected_cells,
                     },
-                ));
+                )) {
+                    return;
+                }
             }
         }
     }
-    None
+}
+
+fn first_inference(visit: impl FnOnce(&mut dyn FnMut(Inference) -> bool)) -> Option<Inference> {
+    let mut first = None;
+    visit(&mut |inference| {
+        first = Some(inference);
+        false
+    });
+    first
+}
+
+fn collect_inferences(visit: impl FnOnce(&mut dyn FnMut(Inference) -> bool)) -> Vec<Inference> {
+    let mut inferences = Vec::new();
+    visit(&mut |inference| {
+        inferences.push(inference);
+        true
+    });
+    inferences
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FishEqualityKey {
+    // Fisherman emits LockingHint, whose equality ignores base/cover regions.
+    digit: Digit,
+    pattern_cell_count: u8,
+    pattern_cells: CellMask,
+}
+
+fn fish_equality_key(inference: &Inference) -> FishEqualityKey {
+    let Evidence::Fish {
+        digit,
+        selected_cells,
+        ..
+    } = inference.evidence()
+    else {
+        unreachable!("fish equality key evidence")
+    };
+    let mut pattern_cells = CellMask::EMPTY;
+    for cell in selected_cells.iter() {
+        pattern_cells.insert(cell);
+    }
+    FishEqualityKey {
+        digit,
+        pattern_cell_count: selected_cells.len() as u8,
+        pattern_cells,
+    }
 }
 
 fn naked_set_technique(degree: u8, generalized: bool) -> Technique {
@@ -400,8 +513,11 @@ mod tests {
 
     use sukaku_forge_core::{ConstraintTopology, Grid, Puzzle, VariantConfig};
 
-    use super::{combination_masks, find_fish, find_hidden_set, find_naked_set};
-    use crate::{EngineConfig, Rating, RatingMode, Technique};
+    use super::{
+        collect_fish, collect_hidden_sets, collect_naked_sets, combination_masks, find_fish,
+        find_hidden_set, find_naked_set,
+    };
+    use crate::{EngineConfig, Evidence, Inference, Rating, RatingMode, Technique};
 
     fn sparse_snapshot(config: VariantConfig, entries: &[(usize, &[u8])]) -> Grid {
         sparse_snapshot_with_values(config, &[], entries)
@@ -447,6 +563,17 @@ mod tests {
             &[(0, &[1, 2]), (1, &[1, 2]), (2, &[1, 2, 3])],
         );
         let inference = find_naked_set(&grid, EngineConfig::default(), 2, false).unwrap();
+        let all = collect_naked_sets(&grid, EngineConfig::default(), 2, false);
+        assert_eq!(Some(inference.clone()), all.first().cloned());
+        assert_eq!(
+            all.iter()
+                .map(|inference| inference.description(grid.topology()))
+                .collect::<Vec<_>>(),
+            [
+                "Naked Pair: Cells r1c1,r1c2: 1,2 in block",
+                "Naked Pair: Cells r1c1,r1c2: 1,2 in row",
+            ]
+        );
         assert_eq!(inference.technique(), Technique::NakedPair);
         assert_eq!(inference.rating(), Rating::from_tenths(30));
         assert_eq!(
@@ -513,6 +640,40 @@ mod tests {
         )
         .unwrap();
         let inference = find_fish(&grid, EngineConfig::default(), 2).unwrap();
+        assert_eq!(
+            Some(inference.clone()),
+            collect_fish(&grid, EngineConfig::default(), 2)
+                .first()
+                .cloned()
+        );
+        let Evidence::Fish {
+            degree,
+            digit,
+            base_type,
+            cover_type,
+            selected_cells,
+        } = inference.evidence()
+        else {
+            panic!("fish evidence")
+        };
+        let mirrored = Inference::elimination(
+            inference.technique(),
+            inference.rating(),
+            inference.removals().clone(),
+            Evidence::Fish {
+                degree,
+                digit,
+                base_type: cover_type,
+                cover_type: base_type,
+                selected_cells,
+            },
+        );
+        assert_ne!(inference, mirrored);
+        assert_eq!(
+            super::fish_equality_key(&inference),
+            super::fish_equality_key(&mirrored),
+            "LockingHint.equals ignores base/cover orientation"
+        );
         assert_eq!(inference.technique(), Technique::XWing);
         assert_eq!(inference.rating(), Rating::from_tenths(32));
         assert_eq!(
@@ -529,6 +690,9 @@ mod tests {
             &[(3, &[1, 5, 9]), (4, &[2, 5, 9])],
         );
         let original = find_hidden_set(&grid, EngineConfig::default(), 2).unwrap();
+        let all = collect_hidden_sets(&grid, EngineConfig::default(), 2);
+        assert_eq!(Some(original.clone()), all.first().cloned());
+        assert!(all.len() >= 2, "block and row Hidden Pair explanations");
         assert_eq!(original.technique(), Technique::HiddenPair);
         assert_eq!(original.rating(), Rating::from_tenths(34));
         assert_eq!(

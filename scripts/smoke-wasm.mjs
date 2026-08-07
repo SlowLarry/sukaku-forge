@@ -8,18 +8,18 @@ initSync({ module: await readFile(binaryPath) })
 const port = new WasmApplicationPort()
 const dispatch = (request) => JSON.parse(port.dispatch_json(JSON.stringify(request)))
 const created = dispatch({
-  protocol_version: 2,
+  protocol_version: 3,
   request_id: 1,
   command: 'create_session',
   puzzle: '53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79',
 })
 
-if (created.protocol_version !== 2 || created.request_id !== 1 || created.response !== 'session_created') {
+if (created.protocol_version !== 3 || created.request_id !== 1 || created.response !== 'session_created') {
   throw new Error(`unexpected WASM create response: ${JSON.stringify(created)}`)
 }
 
 const hinted = dispatch({
-  protocol_version: 2,
+  protocol_version: 3,
   request_id: 2,
   command: 'next_hint',
   expected_revision: created.snapshot.revision,
@@ -29,7 +29,7 @@ if (hinted.response !== 'next_hint' || hinted.outcome !== 'presented') {
 }
 
 const applied = dispatch({
-  protocol_version: 2,
+  protocol_version: 3,
   request_id: 3,
   command: 'apply_hint',
   expected_revision: hinted.revision,

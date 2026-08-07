@@ -20,12 +20,17 @@ const session = (overrides: Partial<SessionControllerView> = {}): SessionControl
   topology: boardTopology,
   hint: null,
   hintResult: null,
+  hintCatalog: [],
+  hintCatalogResult: null,
+  selectedHintId: null,
   busy: false,
   pendingRequestId: null,
   pendingCommand: null,
   error: null,
   createSession: createAction,
   nextHint: idleAction,
+  getAllHints: idleAction,
+  selectHint: idleAction,
   applyHint: idleAction,
   applyAndNext: idleAction,
   placeValue: idleAction,
@@ -60,6 +65,7 @@ describe('App', () => {
     const markup = renderToStaticMarkup(<SessionWorkspace session={session({
       hint: mixedEffectHint,
       hintResult: { kind: 'presented', hintId: primaryHint.id },
+      selectedHintId: primaryHint.id,
     })} />)
 
     expect(markup).toContain('aria-label="Sudoku board')
@@ -75,7 +81,7 @@ describe('App', () => {
     expect(markup).toContain('role="menubar"')
     expect(markup).toContain('>File</button>')
     expect(markup).toContain('>Options</button>')
-    expect(markup).not.toContain('Get all hints')
+    expect(markup).toContain('Get all hints')
     expect(markup).toContain('Solve step')
     expect(markup).not.toContain('Open a puzzle')
   })
@@ -130,11 +136,44 @@ describe('App', () => {
         gap: { code: 'producer_not_ported', message: 'No producer exists for this technique yet.' },
       },
     })} />)
+    const incompleteMaterializationMarkup = renderToStaticMarkup(<SessionWorkspace session={session({
+      hintCatalog: [{
+        hint_id: '53',
+        category: 'indirect',
+        group_key: 'forcing_chains_cycles',
+        group_name: 'Forcing Chains & Cycles',
+        identity: {
+          technique_key: 'forcing_chain',
+          name: 'Forcing Chain',
+          short_name: 'FC',
+          rating_tenths: 66,
+        },
+        effects: {
+          placement: null,
+          removals: [{ cell: 40, digits: 1 << 2 }],
+          elimination_count: 1,
+        },
+        filter_effects: {
+          placement: null,
+          removals: [{ cell: 40, digits: 1 << 2 }],
+          elimination_count: 1,
+        },
+      }],
+      hintCatalogResult: { kind: 'complete' },
+      selectedHintId: '53',
+      hintResult: {
+        kind: 'incomplete',
+        gap: { code: 'legacy_fc_plus_2', message: 'The selected chain proof could not be replayed.' },
+      },
+    })} />)
 
     expect(noneMarkup).toContain('The engine reports no applicable next hint.')
     expect(noneMarkup).toContain('No applicable hint')
     expect(incompleteMarkup).toContain('No producer exists for this technique yet.')
     expect(incompleteMarkup).toContain('Hint search incomplete')
     expect(incompleteMarkup).not.toContain('data-hint-kind=')
+    expect(incompleteMaterializationMarkup).toContain('data-hint-kind="incomplete"')
+    expect(incompleteMaterializationMarkup).toContain('The selected chain proof could not be replayed.')
+    expect(incompleteMaterializationMarkup).not.toContain('Select an available hint')
   })
 })

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use sukaku_forge_core::{
     CandidateMask, CandidateRemovals, CandidateRemovalsBuilder, CellId, CellMask, Digit, Grid,
     NonConsecutiveMode, PositionMask, REGION_TYPE_COUNT, RegionId,
@@ -10,11 +12,34 @@ use crate::{
 /// Find the first Unique Rectangle/Loop after Java's global difficulty/type sort.
 #[must_use]
 pub fn find_unique_loop(grid: &Grid, config: EngineConfig) -> Option<Inference> {
+    run_search(grid, config, false)
+        .best
+        .map(|best| best.inference)
+}
+
+/// Collect every Java-compatible Unique Rectangle/Loop after the producer's
+/// concrete-hint deduplication and stable difficulty/type sort.
+#[must_use]
+pub fn collect_unique_loop(grid: &Grid, config: EngineConfig) -> Vec<Inference> {
+    let mut search = run_search(grid, config, true);
+    let mut hints = search.all.take().expect("unique-loop collector");
+    hints.sort_by(|left, right| {
+        left.java_difficulty
+            .partial_cmp(&right.java_difficulty)
+            .expect("finite unique-loop difficulty")
+            .then_with(|| left.hint_type.cmp(&right.hint_type))
+    });
+    hints.into_iter().map(|hint| hint.inference).collect()
+}
+
+fn run_search(grid: &Grid, config: EngineConfig, collect_all: bool) -> Search<'_> {
     let mut search = Search {
         grid,
         config,
         active_types: active_region_types(grid, config),
         best: None,
+        all: collect_all.then(Vec::new),
+        seen: collect_all.then(HashSet::new),
         stop: false,
     };
     for raw_start in 0_u8..81 {
@@ -43,7 +68,7 @@ pub fn find_unique_loop(grid: &Grid, config: EngineConfig) -> Option<Inference> 
             0,
         );
     }
-    search.best.map(|best| best.inference)
+    search
 }
 
 struct Search<'a> {
@@ -51,6 +76,8 @@ struct Search<'a> {
     config: EngineConfig,
     active_types: Vec<usize>,
     best: Option<Best>,
+    all: Option<Vec<Best>>,
+    seen: Option<HashSet<JavaUniqueLoopKey>>,
     stop: bool,
 }
 
@@ -680,12 +707,12 @@ impl Search<'_> {
             return;
         }
         let hint_type = kind.hint_type();
-        if let Some(best) = &self.best {
-            if best.java_difficulty < java_difficulty
-                || (best.java_difficulty == java_difficulty && best.hint_type <= hint_type)
-            {
-                return;
-            }
+        if self.all.is_none()
+            && let Some(best) = &self.best
+            && (best.java_difficulty < java_difficulty
+                || (best.java_difficulty == java_difficulty && best.hint_type <= hint_type))
+        {
+            return;
         }
         let inference = Inference::elimination(
             Technique::UniqueLoop,
@@ -698,11 +725,26 @@ impl Search<'_> {
                 kind,
             },
         );
-        self.best = Some(Best {
+        let candidate = Best {
             java_difficulty,
             hint_type,
             inference,
-        });
+        };
+        if let Some(all) = &mut self.all {
+            // Java performs this concrete-hint equality check in discovery
+            // order before its stable rank sort, retaining the first proof.
+            let key = java_unique_loop_key(&candidate.inference);
+            if self
+                .seen
+                .as_mut()
+                .expect("unique-loop collector keys")
+                .insert(key)
+            {
+                all.push(candidate);
+            }
+            return;
+        }
+        self.best = Some(candidate);
         self.stop = java_difficulty == 4.5 && hint_type == 1;
     }
 
@@ -801,6 +843,93 @@ fn active_region_types(grid: &Grid, config: EngineConfig) -> Vec<usize> {
         }
     }
     result
+}
+
+#[derive(Eq, Hash, PartialEq)]
+enum JavaUniqueLoopKey {
+    Type1 {
+        loop_cells: CellMask,
+    },
+    Type2 {
+        loop_cells: CellMask,
+    },
+    Type3Naked {
+        loop_cells: CellMask,
+        region: RegionId,
+        set_cells: OrderedCells,
+        set_values: CandidateMask,
+    },
+    Type3Hidden {
+        loop_cells: CellMask,
+        region: RegionId,
+        hidden_positions: PositionMask,
+        hidden_values: CandidateMask,
+    },
+    Type4 {
+        loop_cells: CellMask,
+    },
+}
+
+#[derive(Eq, Hash, PartialEq)]
+struct OrderedCells {
+    cells: [u8; 18],
+    len: u8,
+}
+
+fn java_unique_loop_key(inference: &Inference) -> JavaUniqueLoopKey {
+    let Evidence::UniqueLoop {
+        loop_cells, kind, ..
+    } = inference.evidence()
+    else {
+        unreachable!("unique-loop collector evidence")
+    };
+    let loop_cells = cell_sequence_mask(loop_cells);
+    match kind {
+        UniqueLoopKind::Type1 { .. } => JavaUniqueLoopKey::Type1 { loop_cells },
+        UniqueLoopKind::Type2 { .. } => JavaUniqueLoopKey::Type2 { loop_cells },
+        UniqueLoopKind::Type3Naked {
+            region,
+            set_cells,
+            set_values,
+            ..
+        } => JavaUniqueLoopKey::Type3Naked {
+            loop_cells,
+            region,
+            set_cells: ordered_cells(set_cells),
+            set_values,
+        },
+        UniqueLoopKind::Type3Hidden {
+            region,
+            hidden_positions,
+            hidden_values,
+            ..
+        } => JavaUniqueLoopKey::Type3Hidden {
+            loop_cells,
+            region,
+            hidden_positions,
+            hidden_values,
+        },
+        UniqueLoopKind::Type4 { .. } => JavaUniqueLoopKey::Type4 { loop_cells },
+    }
+}
+
+fn cell_sequence_mask(cells: CellSequence) -> CellMask {
+    let mut result = CellMask::EMPTY;
+    for cell in cells.iter() {
+        result.insert(cell);
+    }
+    result
+}
+
+fn ordered_cells(sequence: CellSequence) -> OrderedCells {
+    let mut cells = [0; 18];
+    for (index, cell) in sequence.iter().enumerate() {
+        cells[index] = cell.raw();
+    }
+    OrderedCells {
+        cells,
+        len: sequence.len() as u8,
+    }
 }
 
 fn effective_variant_latin(grid: &Grid, config: EngineConfig) -> bool {
@@ -905,8 +1034,10 @@ mod tests {
         CandidateMask, ConstraintTopology, Grid, NonConsecutiveMode, Puzzle, VariantConfig,
     };
 
-    use super::{CombinationMasks, Search, active_region_types, cell, find_unique_loop};
-    use crate::{EngineConfig, Evidence, Rating, RatingMode, Technique, UniqueLoopKind};
+    use super::{
+        CombinationMasks, Search, active_region_types, cell, collect_unique_loop, find_unique_loop,
+    };
+    use crate::{EngineConfig, Evidence, Inference, Rating, RatingMode, Technique, UniqueLoopKind};
 
     fn sparse_snapshot(config: VariantConfig, entries: &[(usize, &[u8])]) -> Grid {
         let values = Puzzle::parse(&".".repeat(81)).unwrap();
@@ -949,6 +1080,84 @@ mod tests {
         ));
         inference.apply(&mut grid);
         assert_eq!(grid.candidates(cell(12)).single().unwrap().get(), 3);
+    }
+
+    #[test]
+    fn full_collector_deduplicates_sorts_and_matches_compact_winner() {
+        let grid = sparse_snapshot(
+            VariantConfig::default(),
+            &[
+                (0, &[1, 2]),
+                (3, &[1, 2]),
+                (9, &[1, 2]),
+                (12, &[1, 2, 3]),
+                (54, &[4, 5]),
+                (57, &[4, 5]),
+                (63, &[4, 5]),
+                (66, &[4, 5, 6]),
+            ],
+        );
+        let hints = collect_unique_loop(&grid, EngineConfig::default());
+        assert_eq!(hints.len(), 2);
+        assert_eq!(
+            find_unique_loop(&grid, EngineConfig::default()).as_ref(),
+            hints.first()
+        );
+        assert_eq!(
+            hints
+                .iter()
+                .map(|hint| hint.description(grid.topology()))
+                .collect::<Vec<_>>(),
+            [
+                "Unique Rectangle type 1: Cells r1c1,r2c1,r2c4,r1c4 on 1, 2",
+                "Unique Rectangle type 1: Cells r7c1,r8c1,r8c4,r7c4 on 4, 5",
+            ]
+        );
+
+        for (expected_name, entries) in [
+            (
+                "Unique Rectangle type 2",
+                &[
+                    (0, &[1, 2][..]),
+                    (3, &[1, 2]),
+                    (9, &[1, 2, 3]),
+                    (12, &[1, 2, 3]),
+                    (10, &[1, 2, 3]),
+                ][..],
+            ),
+            (
+                "Unique Rectangle type 3",
+                &[
+                    (0, &[1, 2][..]),
+                    (3, &[1, 2]),
+                    (9, &[1, 2, 3]),
+                    (12, &[1, 2, 4]),
+                    (10, &[3, 4]),
+                    (11, &[3]),
+                    (16, &[1, 2]),
+                ],
+            ),
+            (
+                "Unique Rectangle type 4",
+                &[
+                    (0, &[1, 2][..]),
+                    (3, &[1, 2]),
+                    (9, &[1, 2, 3]),
+                    (12, &[1, 2, 4]),
+                ],
+            ),
+        ] {
+            let case = sparse_snapshot(VariantConfig::default(), entries);
+            let collected = collect_unique_loop(&case, EngineConfig::default());
+            assert_eq!(
+                collected.first().map(Inference::name).as_deref(),
+                Some(expected_name)
+            );
+            assert_eq!(
+                find_unique_loop(&case, EngineConfig::default()).as_ref(),
+                collected.first()
+            );
+        }
     }
 
     #[test]
@@ -1134,6 +1343,8 @@ mod tests {
             config,
             active_types: active_region_types(&grid, config),
             best: None,
+            all: None,
+            seen: None,
             stop: false,
         };
         assert_eq!(search.base_rating_tenths(8), 47);
@@ -1149,6 +1360,8 @@ mod tests {
             config: revised,
             active_types: active_region_types(&grid, revised),
             best: None,
+            all: None,
+            seen: None,
             stop: false,
         };
         assert_eq!(search.base_rating_tenths(18), 52);

@@ -207,52 +207,99 @@ impl NonConsecutiveHint {
 /// Find the first Java-ordered orthogonal NC forcing-cell hint.
 #[must_use]
 pub fn find_forcing_cell_non_consecutive(grid: &Grid) -> Option<NonConsecutiveHint> {
+    first_hint(|emit| visit_orthogonal_forcing_cells(grid, emit))
+}
+
+/// Collect every Java-ordered orthogonal NC forcing-cell hint.
+#[must_use]
+pub fn collect_forcing_cell_non_consecutive(grid: &Grid) -> Vec<NonConsecutiveHint> {
+    collect_forcing_hints(|emit| visit_orthogonal_forcing_cells(grid, emit))
+}
+
+fn visit_orthogonal_forcing_cells(grid: &Grid, emit: &mut dyn FnMut(NonConsecutiveHint) -> bool) {
     let mode = grid.topology().config().non_consecutive;
-    matches!(
+    if matches!(
         mode,
         NonConsecutiveMode::Orthogonal | NonConsecutiveMode::OrthogonalCyclic
-    )
-    .then(|| find_forcing_cell(grid, NonConsecutiveGeometry::Orthogonal))
-    .flatten()
+    ) {
+        visit_forcing_cells(grid, NonConsecutiveGeometry::Orthogonal, emit);
+    }
 }
 
 /// Find the first Java-ordered orthogonal locked-NC hint.
 #[must_use]
 pub fn find_locked_non_consecutive(grid: &Grid) -> Option<NonConsecutiveHint> {
+    first_hint(|emit| visit_orthogonal_locked(grid, emit))
+}
+
+/// Collect every Java-ordered orthogonal locked-NC hint.
+#[must_use]
+pub fn collect_locked_non_consecutive(grid: &Grid) -> Vec<NonConsecutiveHint> {
+    // lockedNCHint compares its newly allocated Cell[] by reference, so Java
+    // retains every producer discovery even when the cell contents match.
+    collect_hints(|emit| visit_orthogonal_locked(grid, emit))
+}
+
+fn visit_orthogonal_locked(grid: &Grid, emit: &mut dyn FnMut(NonConsecutiveHint) -> bool) {
     let mode = grid.topology().config().non_consecutive;
-    matches!(
+    if matches!(
         mode,
         NonConsecutiveMode::Orthogonal | NonConsecutiveMode::OrthogonalCyclic
-    )
-    .then(|| find_locked(grid, NonConsecutiveGeometry::Orthogonal))
-    .flatten()
+    ) {
+        visit_locked(grid, NonConsecutiveGeometry::Orthogonal, emit);
+    }
 }
 
 /// Find the first Java-ordered diagonal/Ferz NC forcing-cell hint.
 #[must_use]
 pub fn find_forcing_cell_ferz_non_consecutive(grid: &Grid) -> Option<NonConsecutiveHint> {
+    first_hint(|emit| visit_ferz_forcing_cells(grid, emit))
+}
+
+/// Collect every Java-ordered diagonal/Ferz NC forcing-cell hint.
+#[must_use]
+pub fn collect_forcing_cell_ferz_non_consecutive(grid: &Grid) -> Vec<NonConsecutiveHint> {
+    collect_forcing_hints(|emit| visit_ferz_forcing_cells(grid, emit))
+}
+
+fn visit_ferz_forcing_cells(grid: &Grid, emit: &mut dyn FnMut(NonConsecutiveHint) -> bool) {
     let mode = grid.topology().config().non_consecutive;
-    matches!(
+    if matches!(
         mode,
         NonConsecutiveMode::Diagonal | NonConsecutiveMode::DiagonalCyclic
-    )
-    .then(|| find_forcing_cell(grid, NonConsecutiveGeometry::Ferz))
-    .flatten()
+    ) {
+        visit_forcing_cells(grid, NonConsecutiveGeometry::Ferz, emit);
+    }
 }
 
 /// Find the first Java-ordered diagonal/Ferz locked-NC hint.
 #[must_use]
 pub fn find_locked_ferz_non_consecutive(grid: &Grid) -> Option<NonConsecutiveHint> {
-    let mode = grid.topology().config().non_consecutive;
-    matches!(
-        mode,
-        NonConsecutiveMode::Diagonal | NonConsecutiveMode::DiagonalCyclic
-    )
-    .then(|| find_locked(grid, NonConsecutiveGeometry::Ferz))
-    .flatten()
+    first_hint(|emit| visit_ferz_locked(grid, emit))
 }
 
-fn find_forcing_cell(grid: &Grid, geometry: NonConsecutiveGeometry) -> Option<NonConsecutiveHint> {
+/// Collect every Java-ordered diagonal/Ferz locked-NC hint.
+#[must_use]
+pub fn collect_locked_ferz_non_consecutive(grid: &Grid) -> Vec<NonConsecutiveHint> {
+    // lockedFNCHint has the same released array-reference equality quirk.
+    collect_hints(|emit| visit_ferz_locked(grid, emit))
+}
+
+fn visit_ferz_locked(grid: &Grid, emit: &mut dyn FnMut(NonConsecutiveHint) -> bool) {
+    let mode = grid.topology().config().non_consecutive;
+    if matches!(
+        mode,
+        NonConsecutiveMode::Diagonal | NonConsecutiveMode::DiagonalCyclic
+    ) {
+        visit_locked(grid, NonConsecutiveGeometry::Ferz, emit);
+    }
+}
+
+fn visit_forcing_cells(
+    grid: &Grid,
+    geometry: NonConsecutiveGeometry,
+    emit: &mut dyn FnMut(NonConsecutiveHint) -> bool,
+) {
     let cyclic = grid.topology().config().non_consecutive.is_cyclic();
     for raw_cell in 0_u8..81 {
         let cell = CellId::new(raw_cell).expect("cell loop");
@@ -270,20 +317,26 @@ fn find_forcing_cell(grid: &Grid, geometry: NonConsecutiveGeometry) -> Option<No
             if cardinality == 2 {
                 let values = NonConsecutiveDigitSequence::two(first, last);
                 if let Some(hint) = forcing_hint(grid, geometry, cell, values, false) {
-                    return Some(hint);
+                    if !emit(hint) {
+                        return;
+                    }
                 }
             } else if cyclic && range == 8 {
                 let middle = candidates.iter().nth(1).expect("three candidates");
                 if middle.get() == first.get() + 1 {
                     let values = NonConsecutiveDigitSequence::one(first);
                     if let Some(hint) = forcing_hint(grid, geometry, cell, values, true) {
-                        return Some(hint);
+                        if !emit(hint) {
+                            return;
+                        }
                     }
                 }
                 if middle.get() == last.get() - 1 {
                     let values = NonConsecutiveDigitSequence::one(last);
                     if let Some(hint) = forcing_hint(grid, geometry, cell, values, true) {
-                        return Some(hint);
+                        if !emit(hint) {
+                            return;
+                        }
                     }
                 }
                 // Java continues to the next cell even when neither cyclic
@@ -293,7 +346,9 @@ fn find_forcing_cell(grid: &Grid, geometry: NonConsecutiveGeometry) -> Option<No
                 let middle = Digit::new(first.get() + 1).expect("middle NC digit");
                 let values = NonConsecutiveDigitSequence::one(middle);
                 if let Some(hint) = forcing_hint(grid, geometry, cell, values, true) {
-                    return Some(hint);
+                    if !emit(hint) {
+                        return;
+                    }
                 }
             }
         }
@@ -310,11 +365,12 @@ fn find_forcing_cell(grid: &Grid, geometry: NonConsecutiveGeometry) -> Option<No
             };
             let values = NonConsecutiveDigitSequence::one(middle);
             if let Some(hint) = forcing_hint(grid, geometry, cell, values, cardinality == 3) {
-                return Some(hint);
+                if !emit(hint) {
+                    return;
+                }
             }
         }
     }
-    None
 }
 
 fn forcing_hint(
@@ -355,7 +411,11 @@ fn forcing_hint(
     })
 }
 
-fn find_locked(grid: &Grid, geometry: NonConsecutiveGeometry) -> Option<NonConsecutiveHint> {
+fn visit_locked(
+    grid: &Grid,
+    geometry: NonConsecutiveGeometry,
+    emit: &mut dyn FnMut(NonConsecutiveHint) -> bool,
+) {
     let topology = grid.topology();
     let variant = topology.config();
     let cyclic = variant.non_consecutive.is_cyclic();
@@ -391,12 +451,54 @@ fn find_locked(grid: &Grid, geometry: NonConsecutiveGeometry) -> Option<NonConse
                 );
                 let values = adjacent_values(digit, cyclic);
                 if let Some(hint) = locked_hint(grid, geometry, cells, values, region, digit) {
-                    return Some(hint);
+                    if !emit(hint) {
+                        return;
+                    }
                 }
             }
         }
     }
-    None
+}
+
+fn first_hint(
+    visit: impl FnOnce(&mut dyn FnMut(NonConsecutiveHint) -> bool),
+) -> Option<NonConsecutiveHint> {
+    let mut first = None;
+    visit(&mut |hint| {
+        first = Some(hint);
+        false
+    });
+    first
+}
+
+fn collect_hints(
+    visit: impl FnOnce(&mut dyn FnMut(NonConsecutiveHint) -> bool),
+) -> Vec<NonConsecutiveHint> {
+    let mut hints = Vec::new();
+    visit(&mut |hint| {
+        hints.push(hint);
+        true
+    });
+    hints
+}
+
+fn collect_forcing_hints(
+    visit: impl FnOnce(&mut dyn FnMut(NonConsecutiveHint) -> bool),
+) -> Vec<NonConsecutiveHint> {
+    // Both forcing-cell concrete hints compare only their forcing cell.
+    let mut cells = Vec::new();
+    let mut hints = Vec::new();
+    visit(&mut |hint| {
+        let NonConsecutiveHintKind::ForcingCell { cell, .. } = hint.kind() else {
+            unreachable!("forcing-cell collector kind")
+        };
+        if !cells.contains(&cell) {
+            cells.push(cell);
+            hints.push(hint);
+        }
+        true
+    });
+    hints
 }
 
 fn locked_hint(
@@ -508,7 +610,9 @@ mod tests {
     };
 
     use super::{
-        NonConsecutiveGeometry, NonConsecutiveHintKind, find_forcing_cell_ferz_non_consecutive,
+        NonConsecutiveGeometry, NonConsecutiveHintKind, collect_forcing_cell_ferz_non_consecutive,
+        collect_forcing_cell_non_consecutive, collect_locked_ferz_non_consecutive,
+        collect_locked_non_consecutive, find_forcing_cell_ferz_non_consecutive,
         find_forcing_cell_non_consecutive, find_locked_ferz_non_consecutive,
         find_locked_non_consecutive,
     };
@@ -591,6 +695,18 @@ mod tests {
             &[(0, "45"), (1, "45"), (9, "45")],
         );
         let hint = find_forcing_cell_non_consecutive(&double).expect("double consecutive");
+        let all = collect_forcing_cell_non_consecutive(&double);
+        assert_eq!(Some(hint.clone()), all.first().cloned());
+        assert_eq!(
+            all.iter()
+                .map(super::NonConsecutiveHint::description)
+                .collect::<Vec<_>>(),
+            [
+                "Cell r1c1 on value(s) 4,5",
+                "Cell r1c2 on value(s) 4,5",
+                "Cell r2c1 on value(s) 4,5",
+            ]
+        );
         assert_eq!(hint.geometry(), NonConsecutiveGeometry::Orthogonal);
         assert_eq!(hint.description(), "Cell r1c1 on value(s) 4,5");
         assert_eq!(removal_entries(&hint), vec![(1, 0x30), (9, 0x30)]);
@@ -600,11 +716,31 @@ mod tests {
             false,
             &[(0, "456"), (1, "5")],
         );
+        let mut raw_triple = Vec::new();
+        super::visit_forcing_cells(&triple, NonConsecutiveGeometry::Orthogonal, &mut |hint| {
+            raw_triple.push(hint);
+            true
+        });
+        assert_eq!(
+            raw_triple.len(),
+            2,
+            "released producer visits both branches"
+        );
+        let retained_triple = collect_forcing_cell_non_consecutive(&triple);
+        assert_eq!(
+            retained_triple.len(),
+            1,
+            "forcing-cell equality uses only the cell"
+        );
         assert_eq!(
             find_forcing_cell_non_consecutive(&triple)
                 .expect("triple consecutive")
                 .description(),
             "Cell r1c1 on value(s) 5"
+        );
+        assert_eq!(
+            find_forcing_cell_non_consecutive(&triple),
+            retained_triple.first().cloned()
         );
 
         let middle = sparse_snapshot(
@@ -647,6 +783,12 @@ mod tests {
         );
         let hint = find_forcing_cell_ferz_non_consecutive(&regular_double)
             .expect("regular Ferz double consecutive");
+        assert_eq!(
+            Some(hint.clone()),
+            collect_forcing_cell_ferz_non_consecutive(&regular_double)
+                .first()
+                .cloned()
+        );
         // r2c3 is diagonal but does not see the forcing cell; r2c5 does.
         assert_eq!(removal_entries(&hint), vec![(13, 0x30)]);
 
@@ -678,6 +820,9 @@ mod tests {
             &[(0, "12"), (9, "12")],
         );
         let hint = find_locked_non_consecutive(&orthogonal).expect("orthogonal locked NC");
+        let all = collect_locked_non_consecutive(&orthogonal);
+        assert_eq!(Some(hint.clone()), all.first().cloned());
+        assert!(all.len() > 1);
         assert_eq!(hint.description(), "1: Cells r1c1,r2c1 on value(s) 2");
         assert_eq!(removal_entries(&hint), vec![(0, 1 << 2), (9, 1 << 2)]);
         let NonConsecutiveHintKind::Locked { region, .. } = hint.kind() else {
@@ -704,6 +849,17 @@ mod tests {
         .expect("cyclic locked Ferz NC");
         assert_eq!(hint.description(), "9: Cell r1c1 on value(s) 8,1");
         assert_eq!(removal_entries(&hint), vec![(0, 1 << 8), (10, 1 << 1)]);
+
+        let ferz = sparse_snapshot(
+            NonConsecutiveMode::Diagonal,
+            false,
+            &[(0, "12"), (10, "12")],
+        );
+        let ferz_hint = find_locked_ferz_non_consecutive(&ferz).expect("diagonal locked-NC hint");
+        assert_eq!(
+            Some(ferz_hint),
+            collect_locked_ferz_non_consecutive(&ferz).first().cloned()
+        );
     }
 
     #[test]
@@ -715,6 +871,8 @@ mod tests {
         );
         assert!(find_forcing_cell_ferz_non_consecutive(&orthogonal).is_none());
         assert!(find_locked_ferz_non_consecutive(&orthogonal).is_none());
+        assert!(collect_forcing_cell_ferz_non_consecutive(&orthogonal).is_empty());
+        assert!(collect_locked_ferz_non_consecutive(&orthogonal).is_empty());
 
         let ferz = sparse_snapshot(
             NonConsecutiveMode::Diagonal,
@@ -723,6 +881,8 @@ mod tests {
         );
         assert!(find_forcing_cell_non_consecutive(&ferz).is_none());
         assert!(find_locked_non_consecutive(&ferz).is_none());
+        assert!(collect_forcing_cell_non_consecutive(&ferz).is_empty());
+        assert!(collect_locked_non_consecutive(&ferz).is_empty());
     }
 
     #[test]

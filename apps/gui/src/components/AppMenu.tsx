@@ -125,6 +125,7 @@ interface AppMenuProps {
   canUndo: boolean
   canRedo: boolean
   canRequestHint: boolean
+  canRequestAllHints: boolean
   canApply: boolean
   candidatesVisible: boolean
   candidateEntry: boolean
@@ -137,6 +138,7 @@ interface AppMenuProps {
   onUndo: () => void
   onRedo: () => void
   onNextHint: () => void
+  onAllHints: () => void
   onApply: () => void
   onApplyAndNext: () => void
   onToggleCandidates: () => void
@@ -153,6 +155,7 @@ export function AppMenu({
   canUndo,
   canRedo,
   canRequestHint,
+  canRequestAllHints,
   canApply,
   candidatesVisible,
   candidateEntry,
@@ -165,6 +168,7 @@ export function AppMenu({
   onUndo,
   onRedo,
   onNextHint,
+  onAllHints,
   onApply,
   onApplyAndNext,
   onToggleCandidates,
@@ -244,6 +248,8 @@ export function AppMenu({
         </ApplicationMenu>
         <ApplicationMenu {...menuProps('tools', 'Tools')}>
           <MenuAction disabled={busy || !canRequestHint} onSelect={() => select(onNextHint)}>Next hint</MenuAction>
+          <MenuAction disabled={busy || !canRequestAllHints} onSelect={() => select(onAllHints)}>Get all hints</MenuAction>
+          <div role="separator" />
           <MenuAction disabled={busy || !canApply} onSelect={() => select(onApply)}>Apply hint</MenuAction>
           <MenuAction disabled={busy || !canApply} onSelect={() => select(onApplyAndNext)}>Apply and next</MenuAction>
         </ApplicationMenu>

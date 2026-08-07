@@ -127,6 +127,24 @@ const presentation: HintPresentationDto = {
   },
 }
 
+const summary = (hintId: string, cell: number, digit: number) => ({
+  hint_id: hintId,
+  category: 'direct' as const,
+  group_key: 'hidden_single',
+  group_name: 'Hidden Single',
+  identity: presentation.identity,
+  effects: {
+    placement: { cell, digit },
+    removals: [],
+    elimination_count: 0,
+  },
+  filter_effects: {
+    placement: { cell, digit },
+    removals: [],
+    elimination_count: 0,
+  },
+})
+
 const HookProbe = ({ port, capture }: {
   port: ApplicationPort
   capture: (view: SessionControllerView) => void
@@ -250,6 +268,114 @@ describe('session controller', () => {
       hintResult: null,
     })
     expect(controller.getState().snapshot?.values[8]).toBe(9)
+  })
+
+  it('stores an ordered catalog, lazily selects entries, and applies the selected opaque ID', async () => {
+    const port = new FakePort()
+    const controller = createSessionController(port)
+    await initialize(controller, port)
+
+    const catalogPending = controller.getAllHints()
+    expect(port.requests[1]).toMatchObject({
+      command: 'get_all_hints',
+      expected_revision: '0',
+    })
+    port.respond(1, {
+      response: 'all_hints',
+      revision: '0',
+      outcome: { outcome: 'complete', hints: [summary('11', 8, 9), summary('12', 17, 3)] },
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(port.requests[2]).toMatchObject({
+      command: 'get_hint',
+      expected_revision: '0',
+      hint_id: '11',
+    })
+    port.respond(2, {
+      response: 'hint',
+      revision: '0',
+      hint_id: '11',
+      outcome: {
+        outcome: 'presented',
+        presentation,
+        effects: summary('11', 8, 9).effects,
+      },
+    })
+    await catalogPending
+
+    expect(controller.getState()).toMatchObject({
+      hintCatalogResult: { kind: 'complete' },
+      selectedHintId: '11',
+      hint: { id: '11' },
+    })
+    expect(controller.getState().hintCatalog.map((hint) => hint.hint_id)).toEqual(['11', '12'])
+
+    const selected = controller.selectHint('12')
+    expect(port.requests[3]).toMatchObject({ command: 'get_hint', hint_id: '12' })
+    port.respond(3, {
+      response: 'hint',
+      revision: '0',
+      hint_id: '12',
+      outcome: {
+        outcome: 'presented',
+        presentation,
+        effects: summary('12', 17, 3).effects,
+      },
+    })
+    await selected
+    expect(controller.getState()).toMatchObject({ selectedHintId: '12', hint: { id: '12' } })
+    expect(controller.getState().hintCatalog).toHaveLength(2)
+
+    const applied = controller.applyHint()
+    expect(port.requests[4]).toMatchObject({ command: 'apply_hint', hint_id: '12' })
+    port.respond(4, { response: 'snapshot', snapshot: snapshot('1') })
+    await applied
+    expect(controller.getState()).toMatchObject({
+      selectedHintId: null,
+      hint: null,
+      hintCatalog: [],
+      hintCatalogResult: null,
+    })
+  })
+
+  it('surfaces the explicit expensive-search confirmation and continues on demand', async () => {
+    const port = new FakePort()
+    const controller = createSessionController(port)
+    await initialize(controller, port)
+
+    const ordinary = controller.getAllHints()
+    port.respond(1, {
+      response: 'all_hints',
+      revision: '0',
+      outcome: { outcome: 'confirmation_required' },
+    })
+    await ordinary
+    expect(controller.getState()).toMatchObject({
+      hintCatalog: [],
+      hintCatalogResult: { kind: 'confirmation-required' },
+    })
+
+    const advanced = controller.getAllHints(true)
+    expect(port.requests[2]).toMatchObject({
+      command: 'get_all_hints',
+      expected_revision: '0',
+      include_expensive: true,
+    })
+    port.respond(2, {
+      response: 'all_hints',
+      revision: '0',
+      outcome: {
+        outcome: 'incomplete',
+        hints: [],
+        gap: { code: 'indirect_techniques', message: 'no further logical tier is ported' },
+      },
+    })
+    await advanced
+    expect(controller.getState().hintCatalogResult).toMatchObject({
+      kind: 'incomplete',
+      gap: { code: 'indirect_techniques' },
+    })
   })
 
   it('does not request another hint when apply-and-next fails', async () => {

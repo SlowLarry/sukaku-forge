@@ -7,8 +7,8 @@ use sukaku_forge_core::{
 };
 
 use crate::nested_chains::{
-    ChainProof, NestedHint, NestedHintCollector, OnCause, ProofArena, ProofKind, ProofNode,
-    ProofTarget,
+    ChainProof, InferenceCollector, NestedHint, NestedHintCollector, OnCause, ProofArena,
+    ProofKind, ProofNode, ProofTarget,
 };
 use crate::presentation_proof::{
     ChainCause, ChainNodeId, ChainProofNode, ChainProofParent, ChainProofView, ChainProofViewKind,
@@ -610,6 +610,114 @@ pub fn find_forcing_chain_cycle(grid: &Grid, config: EngineConfig) -> Option<Inf
     best.map(|candidate| candidate.inference)
 }
 
+/// Collect every Java-ranked static Forcing Chain or bidirectional Cycle.
+///
+/// Results are stably ordered by Java difficulty, recursive complexity, family
+/// sort key, and discovery order, then de-duplicated by logical effect.  Only
+/// compact inference summaries are retained; call
+/// [`replay_forcing_chain_cycle_with_proof`] for the selected row.
+#[must_use]
+pub fn collect_forcing_chain_cycles(grid: &Grid, config: EngineConfig) -> Vec<Inference> {
+    let implications = Implications::new(grid, config);
+    let mut workspace = StaticChainWorkspace::new();
+    let mut result = InferenceCollector::new();
+
+    for (kind_cycle, kind_forcing, y_enabled, x_enabled, sort_key) in [
+        (ChainKind::XCycle, ChainKind::XForcing, false, true, 2),
+        (ChainKind::YCycle, ChainKind::XForcing, true, false, 3),
+        (ChainKind::XyCycle, ChainKind::XyForcing, true, true, 4),
+    ] {
+        for raw_cell in 0_u8..81 {
+            let cell = CellId::new(raw_cell).expect("cell index loop");
+            if grid.value(cell) != 0 {
+                continue;
+            }
+            let values = grid.candidates(cell);
+            if values.count() <= 1 || (!x_enabled && values.count() > 2) {
+                continue;
+            }
+            for digit in values.iter() {
+                search_cycles(
+                    &mut workspace,
+                    &implications,
+                    cell,
+                    digit,
+                    y_enabled,
+                    x_enabled,
+                );
+                for &terminal in &workspace.cycles {
+                    if let Some(candidate) =
+                        cycle_inference(grid, &workspace.arena, terminal, kind_cycle, sort_key)
+                    {
+                        offer_public_inference(grid, &mut result, candidate);
+                    }
+                }
+
+                if x_enabled {
+                    if let Some(terminal) = search_forcing(
+                        &mut workspace,
+                        &implications,
+                        cell,
+                        digit,
+                        true,
+                        y_enabled,
+                        x_enabled,
+                    ) {
+                        offer_public_inference(
+                            grid,
+                            &mut result,
+                            forcing_inference(
+                                grid,
+                                &workspace.arena,
+                                terminal,
+                                kind_forcing,
+                                sort_key,
+                            ),
+                        );
+                    }
+                    if let Some(terminal) = search_forcing(
+                        &mut workspace,
+                        &implications,
+                        cell,
+                        digit,
+                        false,
+                        y_enabled,
+                        x_enabled,
+                    ) {
+                        offer_public_inference(
+                            grid,
+                            &mut result,
+                            forcing_inference(
+                                grid,
+                                &workspace.arena,
+                                terminal,
+                                kind_forcing,
+                                sort_key,
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    result.finish()
+}
+
+fn offer_public_inference(
+    grid: &Grid,
+    result: &mut InferenceCollector,
+    candidate: RankedInference,
+) {
+    result.offer(
+        grid,
+        candidate.inference,
+        candidate.java_difficulty,
+        u32::from(candidate.complexity),
+        candidate.sort_key,
+    );
+}
+
 /// Find the first Java-ranked static FCC hint and materialize its flat views.
 ///
 /// This is an opt-in GUI path. Candidate discovery and ranking remain compact:
@@ -732,6 +840,108 @@ pub fn find_forcing_chain_cycle_with_proof(
     let (winner, locator) = best?;
     let proof = materialize_selected_proof(&mut workspace, &implications, grid, locator);
     Some(ForcingChainWithProof::new(winner.inference, proof))
+}
+
+/// Replay the flat proof for any retained static FCC inference.
+///
+/// This is the lazy companion to [`collect_forcing_chain_cycles`].  It reruns
+/// only the selected root and returns `None` when the inference does not
+/// belong to this grid/configuration.
+#[must_use]
+pub fn replay_forcing_chain_cycle_with_proof(
+    grid: &Grid,
+    config: EngineConfig,
+    inference: &Inference,
+) -> Option<ForcingChainWithProof> {
+    if inference.technique() != Technique::ForcingChainCycle {
+        return None;
+    }
+    let Evidence::ForcingChainCycle {
+        kind,
+        target_cell,
+        target_digit,
+        target_on,
+        ..
+    } = inference.evidence()
+    else {
+        return None;
+    };
+    let (y_enabled, x_enabled, sort_key, cycle) = match kind {
+        ChainKind::XCycle => (false, true, 2, true),
+        ChainKind::YCycle => (true, false, 3, true),
+        ChainKind::XyCycle => (true, true, 4, true),
+        ChainKind::XForcing => (false, true, 2, false),
+        ChainKind::XyForcing => (true, true, 4, false),
+    };
+    let implications = Implications::new(grid, config);
+    let mut workspace = StaticChainWorkspace::new();
+
+    let locator = if cycle {
+        if !target_on {
+            return None;
+        }
+        search_cycles(
+            &mut workspace,
+            &implications,
+            target_cell,
+            target_digit,
+            y_enabled,
+            x_enabled,
+        );
+        workspace
+            .cycles
+            .iter()
+            .enumerate()
+            .find_map(|(cycle_index, &terminal)| {
+                let candidate = cycle_inference(grid, &workspace.arena, terminal, kind, sort_key)?;
+                (candidate.inference == *inference).then_some(SelectedProofLocator::Cycle {
+                    source_cell: target_cell,
+                    source_digit: target_digit,
+                    y_enabled,
+                    x_enabled,
+                    cycle_index,
+                })
+            })?
+    } else {
+        let source_on = !target_on;
+        let terminal = search_forcing(
+            &mut workspace,
+            &implications,
+            target_cell,
+            target_digit,
+            source_on,
+            y_enabled,
+            x_enabled,
+        )?;
+        let candidate = forcing_inference(grid, &workspace.arena, terminal, kind, sort_key);
+        if candidate.inference != *inference {
+            return None;
+        }
+        SelectedProofLocator::Forcing {
+            source_cell: target_cell,
+            source_digit: target_digit,
+            source_on,
+            y_enabled,
+            x_enabled,
+        }
+    };
+
+    let proof = materialize_selected_proof(&mut workspace, &implications, grid, locator);
+    Some(ForcingChainWithProof::new(inference.clone(), proof))
+}
+
+/// Materialize only the selected proof for an inference retained by the
+/// all-hints session.
+#[must_use]
+pub fn replay_forcing_chain_cycle_proof(
+    grid: &Grid,
+    config: EngineConfig,
+    inference: &Inference,
+) -> SelectedChainProof {
+    replay_forcing_chain_cycle_with_proof(grid, config, inference)
+        .expect("retained static FCC inference is reproducible")
+        .into_parts()
+        .1
 }
 
 /// Collect every Java-ranked static FCC hint with its complete implication
@@ -1537,8 +1747,9 @@ mod tests {
     };
 
     use super::{
-        Arena, Implications, OnCause, chain_rating, collect_forcing_chain_proofs,
-        find_forcing_chain_cycle, find_forcing_chain_cycle_with_proof, potential_key,
+        Arena, Implications, OnCause, chain_rating, collect_forcing_chain_cycles,
+        collect_forcing_chain_proofs, find_forcing_chain_cycle,
+        find_forcing_chain_cycle_with_proof, potential_key, replay_forcing_chain_cycle_with_proof,
         reversed_cycle_target,
     };
     use crate::{
@@ -1678,6 +1889,38 @@ mod tests {
         );
         inference.apply(&mut grid);
         assert_eq!(grid.candidates(cell(6)), mask("6"));
+    }
+
+    #[test]
+    fn all_static_chains_keep_rank_order_and_replay_a_nonfirst_proof() {
+        let grid = sparse_snapshot(
+            &[
+                (0, "12"),
+                (3, "13"),
+                (30, "14"),
+                (27, "15"),
+                (6, "16"),
+                (36, "78"),
+                (39, "79"),
+                (66, "67"),
+                (63, "57"),
+                (42, "47"),
+            ],
+            VariantConfig::default(),
+        );
+        let config = EngineConfig::default();
+        let hints = collect_forcing_chain_cycles(&grid, config);
+        assert!(hints.len() > 1, "fixture must expose multiple FCC effects");
+        assert_eq!(
+            find_forcing_chain_cycle(&grid, config).as_ref(),
+            hints.first()
+        );
+
+        let selected = &hints[1];
+        let first_replay = replay_forcing_chain_cycle_with_proof(&grid, config, selected).unwrap();
+        let second_replay = replay_forcing_chain_cycle_with_proof(&grid, config, selected).unwrap();
+        assert_eq!(first_replay.inference(), selected);
+        assert_eq!(first_replay.proof(), second_replay.proof());
     }
 
     #[test]

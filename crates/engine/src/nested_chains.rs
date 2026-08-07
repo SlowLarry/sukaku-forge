@@ -1,8 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use sukaku_forge_core::{CandidateMask, CandidateRemovals, CellId, Digit, Grid};
+use sukaku_forge_core::{
+    CandidateMask, CandidateRemovals, CandidateRemovalsBuilder, CellId, Digit, Grid,
+};
 
+use crate::Inference;
 use crate::forcing_chains::{KEY_COUNT, decode_candidate, potential_key};
 
 /// A complete inner chaining hint after Java's own worth check. The public
@@ -80,6 +83,114 @@ impl NestedHintCollector {
                 .then_with(|| left.ordinal.cmp(&right.ordinal))
         });
         self.winners.into_iter().map(|ranked| ranked.hint).collect()
+    }
+}
+
+struct RankedPublicInference {
+    inference: Inference,
+    java_difficulty: f64,
+    complexity: u32,
+    sort_key: u8,
+    ordinal: u64,
+}
+
+impl RankedPublicInference {
+    fn precedes(&self, other: &Self) -> bool {
+        if self.java_difficulty < other.java_difficulty {
+            return true;
+        }
+        if self.java_difficulty > other.java_difficulty {
+            return false;
+        }
+        (self.complexity, self.sort_key) < (other.complexity, other.sort_key)
+    }
+}
+
+/// Compact public all-hints analogue of [`NestedHintCollector`].
+///
+/// Java stably sorts chaining hints by difficulty, complexity, and family
+/// sort key, then keeps the first hint for each removable-potentials map.
+/// For a placement, Java's chain hint populates that map with the other
+/// candidates in the target cell. This online form retains only the winning
+/// compact [`Inference`] for a Java equality key; proof graphs are deliberately
+/// replayed later for the selected inference.
+pub(crate) struct InferenceCollector {
+    by_effect: HashMap<EffectKey, usize>,
+    winners: Vec<RankedPublicInference>,
+    next_ordinal: u64,
+}
+
+impl InferenceCollector {
+    pub(crate) fn new() -> Self {
+        Self {
+            by_effect: HashMap::new(),
+            winners: Vec::new(),
+            next_ordinal: 0,
+        }
+    }
+
+    pub(crate) fn offer(
+        &mut self,
+        grid: &Grid,
+        inference: Inference,
+        java_difficulty: f64,
+        complexity: u32,
+        sort_key: u8,
+    ) {
+        let ordinal = self.next_ordinal;
+        self.next_ordinal = self
+            .next_ordinal
+            .checked_add(1)
+            .expect("public hint discovery ordinal");
+        let effect = chaining_effect_key(grid, &inference);
+        let candidate = RankedPublicInference {
+            inference,
+            java_difficulty,
+            complexity,
+            sort_key,
+            ordinal,
+        };
+        if let Some(&index) = self.by_effect.get(&effect) {
+            if candidate.precedes(&self.winners[index]) {
+                self.winners[index] = candidate;
+            }
+        } else {
+            let index = self.winners.len();
+            self.by_effect.insert(effect, index);
+            self.winners.push(candidate);
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Vec<Inference> {
+        self.winners.sort_by(|left, right| {
+            left.java_difficulty
+                .partial_cmp(&right.java_difficulty)
+                .expect("finite chaining difficulty")
+                .then_with(|| left.complexity.cmp(&right.complexity))
+                .then_with(|| left.sort_key.cmp(&right.sort_key))
+                .then_with(|| left.ordinal.cmp(&right.ordinal))
+        });
+        self.winners
+            .into_iter()
+            .map(|ranked| ranked.inference)
+            .collect()
+    }
+}
+
+/// Canonical Java removable-potentials key for a public chain inference.
+///
+/// Elimination entry order is ignored. A placement reconstructs the map Java
+/// stores for chaining hints: all other candidates in the target cell.
+pub(crate) fn chaining_effect_key(grid: &Grid, inference: &Inference) -> EffectKey {
+    if let (Some(cell), Some(digit)) = (inference.placement_cell(), inference.placement_digit()) {
+        let mut removals = CandidateRemovalsBuilder::with_capacity(1);
+        removals.add(
+            cell,
+            grid.candidates(cell).without(CandidateMask::of(digit)),
+        );
+        EffectKey::new(&removals.build())
+    } else {
+        EffectKey::new(inference.removals())
     }
 }
 
@@ -411,13 +522,16 @@ mod tests {
     use std::sync::Arc;
 
     use sukaku_forge_core::{
-        CandidateMask, CellId, ConstraintTopology, Digit, Grid, Puzzle, VariantConfig,
+        CandidateMask, CandidateRemovalsBuilder, CellId, ConstraintTopology, Digit, Grid, Puzzle,
+        VariantConfig,
     };
 
     use super::{
-        ChainProof, FullChainFingerprint, OnCause, ProofArena, ProofKind, ProofNode, ProofTarget,
+        ChainProof, FullChainFingerprint, InferenceCollector, OnCause, ProofArena, ProofKind,
+        ProofNode, ProofTarget, chaining_effect_key,
     };
     use crate::forcing_chains::potential_key;
+    use crate::{Evidence, Inference, Rating, Technique};
 
     fn arena(nodes: &[(u16, &[u32])]) -> Arc<ProofArena> {
         let mut proof_nodes = Vec::new();
@@ -469,6 +583,53 @@ mod tests {
             }],
         );
         assert_eq!(proof.complexity(), 2);
+    }
+
+    #[test]
+    fn public_collector_deduplicates_equivalent_placement_and_elimination_effects() {
+        let values = Puzzle::parse(&".".repeat(81)).unwrap();
+        let mut slots = vec![".........".to_owned(); 81];
+        slots[0] = "12.......".to_owned();
+        let grid = Grid::from_snapshot(
+            Arc::new(ConstraintTopology::new(VariantConfig::default())),
+            &values,
+            &Puzzle::parse(&slots.concat()).unwrap(),
+        )
+        .unwrap();
+        let cell = CellId::new(0).unwrap();
+        let one = Digit::new(1).unwrap();
+        let two = Digit::new(2).unwrap();
+        let placement = Inference::placement(
+            Technique::NakedSingle,
+            Rating::from_tenths(80),
+            cell,
+            one,
+            Evidence::NakedSingle,
+        );
+        let mut removals = CandidateRemovalsBuilder::with_capacity(1);
+        removals.add(cell, CandidateMask::of(two));
+        let elimination = Inference::elimination(
+            Technique::NakedSingle,
+            Rating::from_tenths(70),
+            removals.build(),
+            Evidence::NakedSingle,
+        );
+        assert_eq!(
+            chaining_effect_key(&grid, &placement),
+            chaining_effect_key(&grid, &elimination)
+        );
+
+        let mut collector = InferenceCollector::new();
+        collector.offer(&grid, placement.clone(), 8.0, 8, 0);
+        collector.offer(&grid, elimination.clone(), 7.0, 7, 0);
+        assert_eq!(collector.finish(), vec![elimination.clone()]);
+
+        let mut placement_wins = InferenceCollector::new();
+        placement_wins.offer(&grid, elimination, 8.0, 8, 0);
+        placement_wins.offer(&grid, placement.clone(), 7.0, 7, 0);
+        let retained = placement_wins.finish();
+        assert_eq!(retained, vec![placement]);
+        assert!(retained[0].is_placement());
     }
 
     #[test]

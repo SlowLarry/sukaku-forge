@@ -10,6 +10,57 @@ use crate::{Evidence, Inference, Rating, Technique};
 /// hand, come from Java's `CellSet` and therefore use ascending cell order.
 #[must_use]
 pub fn find_wing(grid: &Grid, xyz: bool) -> Option<Inference> {
+    let mut first = None;
+    visit_wings(grid, xyz, &mut |inference| {
+        first = Some(inference);
+        false
+    });
+    first
+}
+
+/// Collect every Java-compatible XY-Wing or XYZ-Wing in discovery order.
+#[must_use]
+pub fn collect_wings(grid: &Grid, xyz: bool) -> Vec<Inference> {
+    let mut keys = Vec::new();
+    let mut inferences = Vec::new();
+    visit_wings(grid, xyz, &mut |inference| {
+        let key = wing_equality_key(&inference);
+        if !keys.contains(&key) {
+            keys.push(key);
+            inferences.push(inference);
+        }
+        true
+    });
+    inferences
+}
+
+fn wing_equality_key(inference: &Inference) -> (bool, u8, u8, u8, u8) {
+    // XYWingHint treats the two wing cells as an unordered pair but retains
+    // the XY/XYZ flag, pivot, and elimination value.
+    let Evidence::Wing {
+        pivot,
+        xz,
+        yz,
+        digit,
+    } = inference.evidence()
+    else {
+        unreachable!("wing equality key evidence")
+    };
+    let (first_wing, second_wing) = if xz.raw() <= yz.raw() {
+        (xz.raw(), yz.raw())
+    } else {
+        (yz.raw(), xz.raw())
+    };
+    (
+        inference.technique() == Technique::XYZWing,
+        pivot.raw(),
+        first_wing,
+        second_wing,
+        digit.get(),
+    )
+}
+
+fn visit_wings(grid: &Grid, xyz: bool, emit: &mut dyn FnMut(Inference) -> bool) {
     let pivot_cardinality = if xyz { 3 } else { 2 };
     for raw_pivot in 0_u8..81 {
         let pivot = cell(raw_pivot);
@@ -64,7 +115,7 @@ pub fn find_wing(grid: &Grid, xyz: bool) -> Option<Inference> {
                 for victim in victims.iter() {
                     removals.add(victim, CandidateMask::of(digit));
                 }
-                return Some(Inference::elimination(
+                if !emit(Inference::elimination(
                     if xyz {
                         Technique::XYZWing
                     } else {
@@ -78,11 +129,12 @@ pub fn find_wing(grid: &Grid, xyz: bool) -> Option<Inference> {
                         yz,
                         digit,
                     },
-                ));
+                )) {
+                    return;
+                }
             }
         }
     }
-    None
 }
 
 fn cell(raw: u8) -> CellId {
@@ -95,7 +147,7 @@ mod tests {
 
     use sukaku_forge_core::{CellId, ConstraintTopology, Grid, Puzzle, VariantConfig};
 
-    use super::find_wing;
+    use super::{collect_wings, find_wing};
     use crate::{Evidence, Rating, Technique};
 
     fn sparse_snapshot(config: VariantConfig, entries: &[(usize, &[u8])]) -> Grid {
@@ -122,6 +174,20 @@ mod tests {
             &[(0, &[1, 2]), (3, &[1, 3]), (27, &[2, 3]), (30, &[3])],
         );
         let inference = find_wing(&grid, false).unwrap();
+        let mut raw = Vec::new();
+        super::visit_wings(&grid, false, &mut |inference| {
+            raw.push(inference);
+            true
+        });
+        assert_eq!(raw.len(), 2, "the two Java wing-cell orientations");
+        let all = collect_wings(&grid, false);
+        assert_eq!(Some(inference.clone()), all.first().cloned());
+        assert_eq!(
+            all.iter()
+                .map(|inference| inference.description(grid.topology()))
+                .collect::<Vec<_>>(),
+            ["XY-Wing: Cells r1c1,r1c4,r4c1 on value 3",]
+        );
         assert_eq!(inference.technique(), Technique::XYWing);
         assert_eq!(inference.rating(), Rating::from_tenths(42));
         assert_eq!(
@@ -190,6 +256,10 @@ mod tests {
             &[(0, &[1, 2, 3]), (1, &[1, 3]), (9, &[2, 3]), (10, &[3])],
         );
         let inference = find_wing(&grid, true).unwrap();
+        assert_eq!(
+            Some(inference.clone()),
+            collect_wings(&grid, true).first().cloned()
+        );
         assert_eq!(inference.technique(), Technique::XYZWing);
         assert_eq!(inference.rating(), Rating::from_tenths(44));
         assert_eq!(

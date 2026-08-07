@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Current application-port presentation protocol.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 pub const ROLE_SELECTED: u16 = HighlightRoles::SELECTED.bits();
 pub const ROLE_PATTERN: u16 = HighlightRoles::PATTERN.bits();
@@ -427,7 +427,7 @@ mod tests {
         let envelope = HintPresentationEnvelope::new(37, &presentation);
 
         assert_eq!(envelope.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(envelope.protocol_version, 2);
+        assert_eq!(envelope.protocol_version, 3);
         assert_eq!(envelope.revision, "37");
         assert_eq!(envelope.presentation.identity.technique_key, "xy_wing");
         assert_eq!(envelope.presentation.identity.name, "XY-Wing");
@@ -530,14 +530,14 @@ mod tests {
     }
 
     #[test]
-    fn v2_json_tags_group_members_and_js_safe_revision_are_frozen() {
+    fn v3_json_tags_group_members_and_js_safe_revision_are_frozen() {
         let grid = sparse_snapshot(&[(0, "12"), (3, "13"), (27, "23"), (30, "3")]);
         let inference = find_wing(&grid, false).unwrap();
         let presentation = present(&grid, &inference).unwrap();
         let envelope = HintPresentationEnvelope::new(u64::MAX, &presentation);
         let encoded = serde_json::to_value(&envelope).unwrap();
 
-        assert_eq!(encoded["protocol_version"], 2);
+        assert_eq!(encoded["protocol_version"], 3);
         assert_eq!(encoded["revision"], u64::MAX.to_string());
         assert_eq!(encoded["presentation"]["views"][0]["key"], "main");
         assert_eq!(

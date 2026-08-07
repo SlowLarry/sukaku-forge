@@ -12,12 +12,15 @@ use sukaku_forge_core::{
 };
 use sukaku_forge_engine::{EngineConfig, PortGap, RatingMode, SearchPolicy, Solver};
 use sukaku_forge_presentation::wire::{
-    CandidateRefDto, HintPresentationDto, PROTOCOL_VERSION as PRESENTATION_PROTOCOL_VERSION,
-    technique_key,
+    CandidateRefDto, HintIdentityDto, HintPresentationDto,
+    PROTOCOL_VERSION as PRESENTATION_PROTOCOL_VERSION, technique_key,
 };
 use sukaku_forge_presentation::{UnsupportedPresentation, UnsupportedPresentationKind};
 
-use crate::{HintEffects, HintId, NextHintOutcome, Session, SessionError, SessionSnapshot};
+use crate::{
+    AllHintsOutcome, HintEffects, HintId, HintSummary, MaterializedHintOutcome, NextHintOutcome,
+    Session, SessionError, SessionSnapshot,
+};
 
 /// One protocol revision covers session commands and nested presentation DTOs.
 pub const PROTOCOL_VERSION: u16 = PRESENTATION_PROTOCOL_VERSION;
@@ -44,6 +47,15 @@ pub enum CommandDto {
     },
     NextHint {
         expected_revision: String,
+    },
+    GetAllHints {
+        expected_revision: String,
+        #[serde(default)]
+        include_expensive: bool,
+    },
+    GetHint {
+        expected_revision: String,
+        hint_id: String,
     },
     ApplyHint {
         expected_revision: String,
@@ -306,6 +318,17 @@ pub enum ResponseKindDto {
         #[serde(flatten)]
         outcome: NextHintOutcomeDto,
     },
+    AllHints {
+        revision: String,
+        #[serde(flatten)]
+        outcome: AllHintsOutcomeDto,
+    },
+    Hint {
+        revision: String,
+        hint_id: String,
+        #[serde(flatten)]
+        outcome: MaterializedHintOutcomeDto,
+    },
     Error {
         error: ErrorDto,
     },
@@ -327,6 +350,82 @@ pub enum NextHintOutcomeDto {
     None,
     Incomplete {
         gap: GapDto,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AllHintsOutcomeDto {
+    Complete {
+        hints: Vec<HintSummaryDto>,
+    },
+    ConfirmationRequired,
+    Incomplete {
+        hints: Vec<HintSummaryDto>,
+        gap: GapDto,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct HintSummaryDto {
+    pub hint_id: String,
+    pub category: HintCategoryDto,
+    pub group_key: String,
+    pub group_name: String,
+    pub identity: HintIdentityDto,
+    pub effects: HintEffectsDto,
+    pub filter_effects: HintEffectsDto,
+}
+
+impl From<HintSummary> for HintSummaryDto {
+    fn from(value: HintSummary) -> Self {
+        Self {
+            hint_id: value.hint_id.0.to_string(),
+            category: value.category.into(),
+            group_key: value.group_key,
+            group_name: value.group_name,
+            identity: HintIdentityDto {
+                technique_key: technique_key(value.technique).to_owned(),
+                name: value.name,
+                short_name: value.short_name,
+                rating_tenths: value.rating.tenths(),
+            },
+            effects: HintEffectsDto::from_effects(value.effects),
+            filter_effects: HintEffectsDto::from_effects(value.filter_effects),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HintCategoryDto {
+    Direct,
+    Indirect,
+}
+
+impl From<sukaku_forge_engine::HintCategory> for HintCategoryDto {
+    fn from(value: sukaku_forge_engine::HintCategory) -> Self {
+        match value {
+            sukaku_forge_engine::HintCategory::Direct => Self::Direct,
+            sukaku_forge_engine::HintCategory::Indirect => Self::Indirect,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum MaterializedHintOutcomeDto {
+    Presented {
+        presentation: HintPresentationDto,
+        effects: HintEffectsDto,
+    },
+    Unsupported {
+        unsupported: UnsupportedDto,
+        effects: HintEffectsDto,
+    },
+    Incomplete {
+        gap: GapDto,
+        effects: HintEffectsDto,
     },
 }
 
@@ -626,6 +725,14 @@ impl ApplicationPort {
                 engine,
             } => self.create_session(&puzzle, variant, engine),
             CommandDto::NextHint { expected_revision } => self.next_hint(&expected_revision),
+            CommandDto::GetAllHints {
+                expected_revision,
+                include_expensive,
+            } => self.get_all_hints(&expected_revision, include_expensive),
+            CommandDto::GetHint {
+                expected_revision,
+                hint_id,
+            } => self.get_hint(&expected_revision, &hint_id),
             CommandDto::ApplyHint {
                 expected_revision,
                 hint_id,
@@ -697,6 +804,67 @@ impl ApplicationPort {
         };
         Ok(ResponseKindDto::NextHint {
             revision: response.revision.to_string(),
+            outcome,
+        })
+    }
+
+    fn get_all_hints(
+        &mut self,
+        revision: &str,
+        include_expensive: bool,
+    ) -> Result<ResponseKindDto, ErrorDto> {
+        let session = self.session_mut()?;
+        let expected_revision = parse_decimal_u64(revision, "expected_revision", false)?;
+        require_revision(session, expected_revision)?;
+        let response = session.all_hints(include_expensive);
+        let outcome = match response.outcome {
+            AllHintsOutcome::Complete { hints } => AllHintsOutcomeDto::Complete {
+                hints: hints.into_iter().map(Into::into).collect(),
+            },
+            AllHintsOutcome::ConfirmationRequired => AllHintsOutcomeDto::ConfirmationRequired,
+            AllHintsOutcome::Incomplete { hints, gap } => AllHintsOutcomeDto::Incomplete {
+                hints: hints.into_iter().map(Into::into).collect(),
+                gap: gap.into(),
+            },
+        };
+        Ok(ResponseKindDto::AllHints {
+            revision: response.revision.to_string(),
+            outcome,
+        })
+    }
+
+    fn get_hint(&mut self, revision: &str, hint_id: &str) -> Result<ResponseKindDto, ErrorDto> {
+        let session = self.session_mut()?;
+        let expected_revision = parse_decimal_u64(revision, "expected_revision", false)?;
+        let hint_id = parse_decimal_u64(hint_id, "hint_id", true)?;
+        let response = session
+            .hint(expected_revision, HintId(hint_id))
+            .map_err(ErrorDto::from)?;
+        let outcome = match response.outcome {
+            MaterializedHintOutcome::Presented {
+                presentation,
+                effects,
+            } => MaterializedHintOutcomeDto::Presented {
+                presentation: (&presentation).into(),
+                effects: HintEffectsDto::from_effects(effects),
+            },
+            MaterializedHintOutcome::Unsupported {
+                unsupported,
+                effects,
+            } => MaterializedHintOutcomeDto::Unsupported {
+                unsupported: unsupported.into(),
+                effects: HintEffectsDto::from_effects(effects),
+            },
+            MaterializedHintOutcome::Incomplete { gap, effects } => {
+                MaterializedHintOutcomeDto::Incomplete {
+                    gap: gap.into(),
+                    effects: HintEffectsDto::from_effects(effects),
+                }
+            }
+        };
+        Ok(ResponseKindDto::Hint {
+            revision: response.revision.to_string(),
+            hint_id: response.hint_id.0.to_string(),
             outcome,
         })
     }
@@ -1025,6 +1193,73 @@ mod tests {
         assert_eq!(applied["snapshot"]["revision"], "1");
         assert_eq!(applied["snapshot"]["values"][8], 9);
         assert_eq!(applied["snapshot"]["can_undo"], true);
+    }
+
+    #[test]
+    fn all_hints_catalog_materializes_and_applies_a_selected_opaque_id() {
+        let mut port = ApplicationPort::new();
+        let puzzle = format!("12345678.45678912.{}", ".".repeat(63));
+        dispatch(&mut port, create_request(1, &puzzle));
+
+        let catalog = dispatch(
+            &mut port,
+            json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "request_id": 2,
+                "command": "get_all_hints",
+                "expected_revision": "0"
+            }),
+        );
+        assert_eq!(catalog["response"], "all_hints");
+        assert_eq!(catalog["revision"], "0");
+        assert_eq!(catalog["outcome"], "complete");
+        let hints = catalog["hints"].as_array().unwrap();
+        assert!(hints.len() >= 2);
+        assert_eq!(hints[0]["category"], "direct");
+        assert!(hints[0]["identity"]["technique_key"].is_string());
+        assert!(hints[0]["effects"]["placement"].is_object());
+        assert!(hints[0]["filter_effects"]["placement"].is_object());
+        let selected_id = hints[1]["hint_id"].as_str().unwrap().to_owned();
+
+        let detail = dispatch(
+            &mut port,
+            json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "request_id": 3,
+                "command": "get_hint",
+                "expected_revision": "0",
+                "hint_id": selected_id
+            }),
+        );
+        assert_eq!(detail["response"], "hint");
+        assert_eq!(detail["outcome"], "presented");
+        assert_eq!(detail["hint_id"], selected_id);
+
+        let applied = dispatch(
+            &mut port,
+            json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "request_id": 4,
+                "command": "apply_hint",
+                "expected_revision": "0",
+                "hint_id": selected_id
+            }),
+        );
+        assert_eq!(applied["response"], "snapshot");
+        assert_eq!(applied["snapshot"]["revision"], "1");
+
+        let stale_detail = dispatch(
+            &mut port,
+            json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "request_id": 5,
+                "command": "get_hint",
+                "expected_revision": "1",
+                "hint_id": selected_id
+            }),
+        );
+        assert_eq!(stale_detail["response"], "error");
+        assert_eq!(stale_detail["error"]["code"], "unknown_hint");
     }
 
     #[test]

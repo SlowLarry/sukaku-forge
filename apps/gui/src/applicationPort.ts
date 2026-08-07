@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 2 as const
+export const PROTOCOL_VERSION = 3 as const
 
 export type DecimalString = string
 export type NonZeroDecimalString = string
@@ -44,6 +44,8 @@ interface RequestBase {
 export type ApplicationRequestDto = RequestBase & (
   | { command: 'create_session'; puzzle: string; variant?: VariantInputDto; engine?: EngineInputDto }
   | { command: 'next_hint'; expected_revision: DecimalString }
+  | { command: 'get_all_hints'; expected_revision: DecimalString; include_expensive?: boolean }
+  | { command: 'get_hint'; expected_revision: DecimalString; hint_id: NonZeroDecimalString }
   | { command: 'apply_hint'; expected_revision: DecimalString; hint_id: NonZeroDecimalString }
   | { command: 'place_value'; expected_revision: DecimalString; cell: number; digit: number }
   | { command: 'toggle_candidate'; expected_revision: DecimalString; cell: number; digit: number }
@@ -183,6 +185,18 @@ export interface HintEffectsDto {
   elimination_count: number
 }
 
+export type HintCategoryDto = 'direct' | 'indirect'
+
+export interface HintSummaryDto {
+  hint_id: NonZeroDecimalString
+  category: HintCategoryDto
+  group_key: string
+  group_name: string
+  identity: HintIdentityDto
+  effects: HintEffectsDto
+  filter_effects: HintEffectsDto
+}
+
 export interface UnsupportedPresentationDto {
   technique_key: string
   kind: 'missing_chain_proof' | 'evidence_not_implemented'
@@ -209,6 +223,20 @@ export type NextHintOutcomeDto =
   | { outcome: 'none' }
   | { outcome: 'incomplete'; gap: PortGapDto }
 
+export type AllHintsOutcomeDto =
+  | { outcome: 'complete'; hints: HintSummaryDto[] }
+  | { outcome: 'confirmation_required' }
+  | { outcome: 'incomplete'; hints: HintSummaryDto[]; gap: PortGapDto }
+
+export type MaterializedHintOutcomeDto =
+  | { outcome: 'presented'; presentation: HintPresentationDto; effects: HintEffectsDto }
+  | {
+    outcome: 'unsupported'
+    unsupported: UnsupportedPresentationDto
+    effects: HintEffectsDto
+  }
+  | { outcome: 'incomplete'; gap: PortGapDto; effects: HintEffectsDto }
+
 export interface PortErrorDto {
   code: string
   message: string
@@ -225,6 +253,13 @@ export type ApplicationResponseDto = ResponseBase & (
   | { response: 'session_created'; snapshot: SessionSnapshotDto; topology: TopologyDto }
   | { response: 'snapshot'; snapshot: SessionSnapshotDto }
   | { response: 'next_hint'; revision: DecimalString; outcome: NextHintOutcomeDto }
+  | { response: 'all_hints'; revision: DecimalString; outcome: AllHintsOutcomeDto }
+  | {
+    response: 'hint'
+    revision: DecimalString
+    hint_id: NonZeroDecimalString
+    outcome: MaterializedHintOutcomeDto
+  }
   | { response: 'error'; error: PortErrorDto }
 )
 
@@ -494,15 +529,9 @@ const parseExplanationBlock = (value: unknown, path: string): ExplanationBlockDt
 
 export const parseHintPresentation = (value: unknown, path = 'presentation'): HintPresentationDto => {
   const source = objectValue(value, path)
-  const identitySource = objectValue(source.identity, `${path}.identity`)
   const explanationSource = objectValue(source.explanation, `${path}.explanation`)
   return {
-    identity: {
-      technique_key: nonEmptyStringValue(identitySource.technique_key, `${path}.identity.technique_key`),
-      name: nonEmptyStringValue(identitySource.name, `${path}.identity.name`),
-      short_name: nonEmptyStringValue(identitySource.short_name, `${path}.identity.short_name`),
-      rating_tenths: integerValue(identitySource.rating_tenths, `${path}.identity.rating_tenths`, 0, 65_535),
-    },
+    identity: parseHintIdentity(source.identity, `${path}.identity`),
     views: arrayValue(source.views, `${path}.views`, (view, viewPath): HintViewDto => {
       const viewSource = objectValue(view, viewPath)
       return {
@@ -536,6 +565,16 @@ export const parseHintPresentation = (value: unknown, path = 'presentation'): Hi
   }
 }
 
+const parseHintIdentity = (value: unknown, path: string): HintIdentityDto => {
+  const source = objectValue(value, path)
+  return {
+    technique_key: nonEmptyStringValue(source.technique_key, `${path}.technique_key`),
+    name: nonEmptyStringValue(source.name, `${path}.name`),
+    short_name: nonEmptyStringValue(source.short_name, `${path}.short_name`),
+    rating_tenths: integerValue(source.rating_tenths, `${path}.rating_tenths`, 0, 65_535),
+  }
+}
+
 const parseHintEffects = (value: unknown, path: string): HintEffectsDto => {
   const source = objectValue(value, path)
   if (!Object.hasOwn(source, 'placement')) return fail(`${path}.placement`, 'a candidate or null')
@@ -560,6 +599,53 @@ const parseHintEffects = (value: unknown, path: string): HintEffectsDto => {
   return { placement, removals, elimination_count: eliminationCount }
 }
 
+const parseGap = (value: unknown, path: string): PortGapDto => {
+  const source = objectValue(value, path)
+  return {
+    code: enumValue(
+      source.code,
+      `${path}.code`,
+      ['producer_not_ported', 'indirect_techniques', 'legacy_fc_plus_2'] as const,
+    ),
+    message: nonEmptyStringValue(source.message, `${path}.message`),
+  }
+}
+
+const parseUnsupported = (value: unknown, path: string): UnsupportedPresentationDto => {
+  const source = objectValue(value, path)
+  return {
+    technique_key: nonEmptyStringValue(source.technique_key, `${path}.technique_key`),
+    kind: enumValue(
+      source.kind,
+      `${path}.kind`,
+      ['missing_chain_proof', 'evidence_not_implemented'] as const,
+    ),
+  }
+}
+
+const parseHintSummary = (value: unknown, path: string): HintSummaryDto => {
+  const source = objectValue(value, path)
+  return {
+    hint_id: decimalValue(source.hint_id, `${path}.hint_id`, true),
+    category: enumValue(source.category, `${path}.category`, ['direct', 'indirect'] as const),
+    group_key: nonEmptyStringValue(source.group_key, `${path}.group_key`),
+    group_name: nonEmptyStringValue(source.group_name, `${path}.group_name`),
+    identity: parseHintIdentity(source.identity, `${path}.identity`),
+    effects: parseHintEffects(source.effects, `${path}.effects`),
+    filter_effects: parseHintEffects(source.filter_effects, `${path}.filter_effects`),
+  }
+}
+
+const parseHintSummaries = (value: unknown, path: string): HintSummaryDto[] => {
+  const hints = arrayValue(value, path, parseHintSummary)
+  const ids = new Set<string>()
+  hints.forEach((hint, index) => {
+    if (ids.has(hint.hint_id)) fail(`${path}[${index}].hint_id`, 'unique within the catalog')
+    ids.add(hint.hint_id)
+  })
+  return hints
+}
+
 const parseNextHintOutcome = (value: unknown, path: string): NextHintOutcomeDto => {
   const source = objectValue(value, path)
   const outcome = enumValue(source.outcome, `${path}.outcome`, ['presented', 'unsupported', 'none', 'incomplete'] as const)
@@ -572,37 +658,64 @@ const parseNextHintOutcome = (value: unknown, path: string): NextHintOutcomeDto 
         effects: parseHintEffects(source.effects, `${path}.effects`),
       }
     case 'unsupported': {
-      const unsupportedSource = objectValue(source.unsupported, `${path}.unsupported`)
       return {
         outcome,
         hint_id: decimalValue(source.hint_id, `${path}.hint_id`, true),
-        unsupported: {
-          technique_key: nonEmptyStringValue(unsupportedSource.technique_key, `${path}.unsupported.technique_key`),
-          kind: enumValue(
-            unsupportedSource.kind,
-            `${path}.unsupported.kind`,
-            ['missing_chain_proof', 'evidence_not_implemented'] as const,
-          ),
-        },
+        unsupported: parseUnsupported(source.unsupported, `${path}.unsupported`),
         effects: parseHintEffects(source.effects, `${path}.effects`),
       }
     }
     case 'none':
       return { outcome }
     case 'incomplete': {
-      const gapSource = objectValue(source.gap, `${path}.gap`)
+      return { outcome, gap: parseGap(source.gap, `${path}.gap`) }
+    }
+  }
+}
+
+const parseAllHintsOutcome = (value: unknown, path: string): AllHintsOutcomeDto => {
+  const source = objectValue(value, path)
+  const outcome = enumValue(
+    source.outcome,
+    `${path}.outcome`,
+    ['complete', 'confirmation_required', 'incomplete'] as const,
+  )
+  switch (outcome) {
+    case 'complete':
+      return { outcome, hints: parseHintSummaries(source.hints, `${path}.hints`) }
+    case 'confirmation_required':
+      return { outcome }
+    case 'incomplete':
       return {
         outcome,
-        gap: {
-          code: enumValue(
-            gapSource.code,
-            `${path}.gap.code`,
-            ['producer_not_ported', 'indirect_techniques', 'legacy_fc_plus_2'] as const,
-          ),
-          message: nonEmptyStringValue(gapSource.message, `${path}.gap.message`),
-        },
+        hints: parseHintSummaries(source.hints, `${path}.hints`),
+        gap: parseGap(source.gap, `${path}.gap`),
       }
-    }
+  }
+}
+
+const parseMaterializedHintOutcome = (value: unknown, path: string): MaterializedHintOutcomeDto => {
+  const source = objectValue(value, path)
+  const outcome = enumValue(source.outcome, `${path}.outcome`, ['presented', 'unsupported', 'incomplete'] as const)
+  switch (outcome) {
+    case 'presented':
+      return {
+        outcome,
+        presentation: parseHintPresentation(source.presentation, `${path}.presentation`),
+        effects: parseHintEffects(source.effects, `${path}.effects`),
+      }
+    case 'unsupported':
+      return {
+        outcome,
+        unsupported: parseUnsupported(source.unsupported, `${path}.unsupported`),
+        effects: parseHintEffects(source.effects, `${path}.effects`),
+      }
+    case 'incomplete':
+      return {
+        outcome,
+        gap: parseGap(source.gap, `${path}.gap`),
+        effects: parseHintEffects(source.effects, `${path}.effects`),
+      }
   }
 }
 
@@ -614,7 +727,11 @@ export function parseApplicationResponse(value: unknown, expectedRequestId?: Req
   if (expectedRequestId != null && requestId !== expectedRequestId) {
     return fail('response.request_id', `${expectedRequestId} for the pending request`)
   }
-  const response = enumValue(source.response, 'response.response', ['session_created', 'snapshot', 'next_hint', 'error'] as const)
+  const response = enumValue(
+    source.response,
+    'response.response',
+    ['session_created', 'snapshot', 'next_hint', 'all_hints', 'hint', 'error'] as const,
+  )
   switch (response) {
     case 'session_created':
       return {
@@ -638,6 +755,23 @@ export function parseApplicationResponse(value: unknown, expectedRequestId?: Req
         response,
         revision: decimalValue(source.revision, 'response.revision'),
         outcome: parseNextHintOutcome(source, 'response'),
+      }
+    case 'all_hints':
+      return {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: requestId,
+        response,
+        revision: decimalValue(source.revision, 'response.revision'),
+        outcome: parseAllHintsOutcome(source, 'response'),
+      }
+    case 'hint':
+      return {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: requestId,
+        response,
+        revision: decimalValue(source.revision, 'response.revision'),
+        hint_id: decimalValue(source.hint_id, 'response.hint_id', true),
+        outcome: parseMaterializedHintOutcome(source, 'response'),
       }
     case 'error': {
       const errorSource = objectValue(source.error, 'response.error')

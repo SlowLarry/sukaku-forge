@@ -102,7 +102,7 @@ describe('application port response validation', () => {
     expect(response.topology.regions[0]).toMatchObject({ family_key: 'row', cells: [0, 1, 2, 3, 4, 5, 6, 7, 8] })
   })
 
-  it('accepts the canonical protocol-v2 presented-hint shape without coercing decimal IDs', () => {
+  it('accepts the canonical protocol-v3 presented-hint shape without coercing decimal IDs', () => {
     const raw = {
       protocol_version: PROTOCOL_VERSION,
       request_id: 17,
@@ -184,6 +184,93 @@ describe('application port response validation', () => {
       removals: [{ cell: 80, digits: 1 << 9 }],
       elimination_count: 1,
     })
+  })
+
+  it('accepts an ordered all-hints catalog and one lazily materialized entry', () => {
+    const effects = {
+      placement: { cell: 8, digit: 9 },
+      removals: [],
+      elimination_count: 0,
+    }
+    const summary = {
+      hint_id: '1',
+      category: 'direct',
+      group_key: 'hidden_single',
+      group_name: 'Hidden Single',
+      identity: canonicalPresentation.identity,
+      effects,
+      filter_effects: effects,
+    }
+    const catalog = parseApplicationResponse({
+      protocol_version: PROTOCOL_VERSION,
+      request_id: 20,
+      response: 'all_hints',
+      revision: '0',
+      outcome: 'complete',
+      hints: [summary, { ...summary, hint_id: '2', category: 'indirect' }],
+    }, 20)
+
+    expect(catalog.response).toBe('all_hints')
+    if (catalog.response !== 'all_hints' || catalog.outcome.outcome !== 'complete') {
+      throw new Error('expected an all-hints catalog')
+    }
+    expect(catalog.outcome.hints.map((hint) => hint.hint_id)).toEqual(['1', '2'])
+    expect(catalog.outcome.hints.map((hint) => hint.category)).toEqual(['direct', 'indirect'])
+
+    const detail = parseApplicationResponse({
+      protocol_version: PROTOCOL_VERSION,
+      request_id: 21,
+      response: 'hint',
+      revision: '0',
+      hint_id: '2',
+      outcome: 'presented',
+      presentation: canonicalPresentation,
+      effects,
+    }, 21)
+    expect(detail.response).toBe('hint')
+    if (detail.response !== 'hint') throw new Error('expected a selected hint detail')
+    expect(detail.hint_id).toBe('2')
+    expect(detail.outcome.outcome).toBe('presented')
+  })
+
+  it('validates all-hints confirmation, partial catalogs, and unique opaque IDs', () => {
+    const confirmation = parseApplicationResponse({
+      protocol_version: PROTOCOL_VERSION,
+      request_id: 22,
+      response: 'all_hints',
+      revision: '9',
+      outcome: 'confirmation_required',
+    })
+    expect(confirmation.response === 'all_hints' && confirmation.outcome.outcome).toBe('confirmation_required')
+
+    const summary = {
+      hint_id: '7',
+      category: 'indirect',
+      group_key: 'four_strong_links',
+      group_name: '4 Strong links',
+      identity: canonicalPresentation.identity,
+      effects: { placement: null, removals: [], elimination_count: 0 },
+      filter_effects: { placement: null, removals: [], elimination_count: 0 },
+    }
+    const incomplete = parseApplicationResponse({
+      protocol_version: PROTOCOL_VERSION,
+      request_id: 23,
+      response: 'all_hints',
+      revision: '9',
+      outcome: 'incomplete',
+      hints: [summary],
+      gap: { code: 'producer_not_ported', message: 'not ported' },
+    })
+    expect(incomplete.response === 'all_hints' && incomplete.outcome.outcome).toBe('incomplete')
+
+    expect(() => parseApplicationResponse({
+      protocol_version: PROTOCOL_VERSION,
+      request_id: 24,
+      response: 'all_hints',
+      revision: '9',
+      outcome: 'complete',
+      hints: [summary, summary],
+    })).toThrowError(/unique within the catalog/)
   })
 
   it('rejects a candidate group that omits its exact representative', () => {

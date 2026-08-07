@@ -15,8 +15,8 @@ use crate::forcing_chains::{
     is_on, potential_key,
 };
 use crate::nested_chains::{
-    ChainProof, FullChainFingerprint, NestedHint, NestedHintCollector, OnCause, ProofArena,
-    ProofKind, ProofNode, ProofTarget,
+    ChainProof, FullChainFingerprint, InferenceCollector, NestedHint, NestedHintCollector, OnCause,
+    ProofArena, ProofKind, ProofNode, ProofTarget,
 };
 use crate::presentation_proof::{
     ChainCause, ChainNodeId, ChainProofNode, ChainProofParent, ChainProofView, ChainProofViewKind,
@@ -1606,6 +1606,7 @@ impl RankedMulti {
 
 enum MultiSink<'a> {
     First(&'a mut Option<RankedMulti>),
+    Summaries(&'a mut InferenceCollector),
     All(&'a mut NestedHintCollector),
 }
 
@@ -1615,7 +1616,7 @@ impl MultiSink<'_> {
     }
 
     fn needs_complete_complexity(&self, mode: MultiMode) -> bool {
-        matches!(self, Self::First(_)) && mode.level() >= 2
+        matches!(self, Self::First(_) | Self::Summaries(_)) && mode.level() >= 2
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1652,6 +1653,31 @@ impl MultiSink<'_> {
                     keep_best(best, candidate);
                 }
             }
+            Self::Summaries(result) => {
+                let complexity = if mode.level() >= 2 {
+                    complete_complexity.expect("nested all-hints complete complexity")
+                } else {
+                    u32::from(flat_complexity)
+                };
+                if let Some(candidate) = ranked_target(
+                    grid,
+                    mode,
+                    complexity,
+                    sort_key,
+                    kind,
+                    effect_cell,
+                    effect_digit,
+                    effect_on,
+                ) {
+                    result.offer(
+                        grid,
+                        candidate.inference,
+                        candidate.java_difficulty,
+                        candidate.complexity,
+                        candidate.sort_key,
+                    );
+                }
+            }
             Self::All(result) => {
                 let Some(removals) = target_removals(grid, effect_cell, effect_digit, effect_on)
                 else {
@@ -1679,6 +1705,14 @@ pub fn find_multiple_forcing_chain(grid: &Grid, config: EngineConfig) -> Option<
         .expect("static multiple chains cannot reach an FCPlus boundary")
 }
 
+/// Collect all Java-ranked static Multiple Forcing Chains without retaining
+/// their branch proof graphs.
+#[must_use]
+pub fn collect_multiple_forcing_chains(grid: &Grid, config: EngineConfig) -> Vec<Inference> {
+    collect_multi_chain_summaries_checked(grid, config, MultiMode::Static)
+        .expect("static multiple chains cannot reach an FCPlus boundary")
+}
+
 /// Find Java's first ranked static Multiple Forcing Chain and replay only its
 /// selected outer branches into presentation proof views.
 #[must_use]
@@ -1692,10 +1726,29 @@ pub fn find_multiple_forcing_chain_with_proof(
     Some(MultipleForcingChainWithProof::new(inference, proof))
 }
 
+/// Replay the outer branch views for any retained static MFC inference.
+#[must_use]
+pub fn replay_multiple_forcing_chain_with_proof(
+    grid: &Grid,
+    config: EngineConfig,
+    inference: &Inference,
+) -> Option<MultipleForcingChainWithProof> {
+    replay_multi_chain_with_proof_checked(grid, config, MultiMode::Static, inference)
+        .expect("static selected replay cannot reach an FCPlus boundary")
+}
+
 /// Find Java's first ranked level-0 Dynamic Forcing Chain.
 #[must_use]
 pub fn find_dynamic_forcing_chain(grid: &Grid, config: EngineConfig) -> Option<Inference> {
     find_multi_chain_checked(grid, config, MultiMode::Dynamic)
+        .expect("level-zero dynamic chains cannot reach an FCPlus boundary")
+}
+
+/// Collect all Java-ranked level-zero Dynamic Forcing Chains without
+/// retaining their branch proof graphs.
+#[must_use]
+pub fn collect_dynamic_forcing_chains(grid: &Grid, config: EngineConfig) -> Vec<Inference> {
+    collect_multi_chain_summaries_checked(grid, config, MultiMode::Dynamic)
         .expect("level-zero dynamic chains cannot reach an FCPlus boundary")
 }
 
@@ -1710,6 +1763,17 @@ pub fn find_dynamic_forcing_chain_with_proof(
     let proof = replay_selected_multi_proof(grid, config, MultiMode::Dynamic, &inference)
         .expect("level-zero selected replay cannot reach an FCPlus boundary");
     Some(MultipleForcingChainWithProof::new(inference, proof))
+}
+
+/// Replay the outer branch views for any retained level-zero DFC inference.
+#[must_use]
+pub fn replay_dynamic_forcing_chain_with_proof(
+    grid: &Grid,
+    config: EngineConfig,
+    inference: &Inference,
+) -> Option<MultipleForcingChainWithProof> {
+    replay_multi_chain_with_proof_checked(grid, config, MultiMode::Dynamic, inference)
+        .expect("level-zero selected replay cannot reach an FCPlus boundary")
 }
 
 /// Find Java's first ranked level-1 Dynamic Forcing Chain (+).
@@ -1729,6 +1793,15 @@ pub fn find_dynamic_forcing_chain_plus_checked(
     config: EngineConfig,
 ) -> Result<Option<Inference>, LegacyFcPlusBoundary> {
     find_multi_chain_checked(grid, config, MultiMode::DynamicPlus)
+}
+
+/// Checked all-hints DFC+ entry point for Java's historically broken
+/// FCPlus=2 tail.
+pub fn collect_dynamic_forcing_chain_plus_checked(
+    grid: &Grid,
+    config: EngineConfig,
+) -> Result<Vec<Inference>, LegacyFcPlusBoundary> {
+    collect_multi_chain_summaries_checked(grid, config, MultiMode::DynamicPlus)
 }
 
 /// Find Java's first ranked level-one Dynamic Forcing Chain (+) and replay
@@ -1753,6 +1826,15 @@ pub fn find_dynamic_forcing_chain_plus_with_proof_checked(
     };
     let proof = replay_selected_multi_proof(grid, config, MultiMode::DynamicPlus, &inference)?;
     Ok(Some(MultipleForcingChainWithProof::new(inference, proof)))
+}
+
+/// Checked lazy DFC+ proof replay for Java's FCPlus=2 boundary.
+pub fn replay_dynamic_forcing_chain_plus_with_proof_checked(
+    grid: &Grid,
+    config: EngineConfig,
+    inference: &Inference,
+) -> Result<Option<MultipleForcingChainWithProof>, LegacyFcPlusBoundary> {
+    replay_multi_chain_with_proof_checked(grid, config, MultiMode::DynamicPlus, inference)
 }
 
 /// Find Java's nested dynamic chain family. Levels 2 and 3 ignore
@@ -1782,6 +1864,25 @@ pub fn find_nested_forcing_chain_checked(
     assert!((2..=4).contains(&level), "nested chain level");
     assert!(level != 4 || nesting_limit <= 3, "nested chain cap");
     find_multi_chain_checked(
+        grid,
+        config,
+        MultiMode::Nested {
+            level,
+            nesting_limit,
+        },
+    )
+}
+
+/// Checked nested-chain all-hints entry point.
+pub fn collect_nested_forcing_chains_checked(
+    grid: &Grid,
+    config: EngineConfig,
+    level: u8,
+    nesting_limit: u8,
+) -> Result<Vec<Inference>, LegacyFcPlusBoundary> {
+    assert!((2..=4).contains(&level), "nested chain level");
+    assert!(level != 4 || nesting_limit <= 3, "nested chain cap");
+    collect_multi_chain_summaries_checked(
         grid,
         config,
         MultiMode::Nested {
@@ -1826,6 +1927,110 @@ pub fn find_nested_forcing_chain_with_proof_checked(
         &inference,
     )?;
     Ok(Some(MultipleForcingChainWithProof::new(inference, proof)))
+}
+
+/// Checked lazy proof replay for one exact nested-chain level and cap.
+pub fn replay_nested_forcing_chain_with_proof_checked(
+    grid: &Grid,
+    config: EngineConfig,
+    level: u8,
+    nesting_limit: u8,
+    inference: &Inference,
+) -> Result<Option<MultipleForcingChainWithProof>, LegacyFcPlusBoundary> {
+    assert!((2..=4).contains(&level), "nested chain level");
+    assert!(level != 4 || nesting_limit <= 3, "nested chain cap");
+    replay_multi_chain_with_proof_checked(
+        grid,
+        config,
+        MultiMode::Nested {
+            level,
+            nesting_limit,
+        },
+        inference,
+    )
+}
+
+fn replay_multi_chain_with_proof_checked(
+    grid: &Grid,
+    config: EngineConfig,
+    mode: MultiMode,
+    inference: &Inference,
+) -> Result<Option<MultipleForcingChainWithProof>, LegacyFcPlusBoundary> {
+    let Evidence::MultipleForcingChain { dynamic, level, .. } = inference.evidence() else {
+        return Ok(None);
+    };
+    if inference.technique() != mode.technique()
+        || dynamic != mode.is_dynamic()
+        || level != mode.level()
+    {
+        return Ok(None);
+    }
+    let proof = replay_selected_multi_proof(grid, config, mode, inference)?;
+    Ok(Some(MultipleForcingChainWithProof::new(
+        inference.clone(),
+        proof,
+    )))
+}
+
+/// Materialize only the selected proof for a retained static MFC inference.
+#[must_use]
+pub fn replay_multiple_forcing_chain_proof(
+    grid: &Grid,
+    config: EngineConfig,
+    inference: &Inference,
+) -> SelectedChainProof {
+    replay_multiple_forcing_chain_with_proof(grid, config, inference)
+        .expect("retained static MFC inference is reproducible")
+        .into_parts()
+        .1
+}
+
+/// Materialize only the selected proof for a retained level-zero DFC
+/// inference.
+#[must_use]
+pub fn replay_dynamic_forcing_chain_proof(
+    grid: &Grid,
+    config: EngineConfig,
+    inference: &Inference,
+) -> SelectedChainProof {
+    replay_dynamic_forcing_chain_with_proof(grid, config, inference)
+        .expect("retained level-zero DFC inference is reproducible")
+        .into_parts()
+        .1
+}
+
+/// Checked selected-proof replay for a retained DFC+ inference.
+pub fn replay_dynamic_forcing_chain_plus_proof(
+    grid: &Grid,
+    config: EngineConfig,
+    inference: &Inference,
+) -> Result<SelectedChainProof, LegacyFcPlusBoundary> {
+    Ok(
+        replay_dynamic_forcing_chain_plus_with_proof_checked(grid, config, inference)?
+            .expect("retained DFC+ inference is reproducible")
+            .into_parts()
+            .1,
+    )
+}
+
+/// Checked selected-proof replay for a retained nested-chain inference.
+pub fn replay_nested_forcing_chain_proof_checked(
+    grid: &Grid,
+    config: EngineConfig,
+    level: u8,
+    nesting_limit: u8,
+    inference: &Inference,
+) -> Result<SelectedChainProof, LegacyFcPlusBoundary> {
+    Ok(replay_nested_forcing_chain_with_proof_checked(
+        grid,
+        config,
+        level,
+        nesting_limit,
+        inference,
+    )?
+    .expect("retained nested-chain inference is reproducible")
+    .into_parts()
+    .1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2176,6 +2381,19 @@ fn find_multi_chain_checked(
         search_multi_chain(grid, config, mode, &mut sink)?;
     }
     Ok(best.map(|candidate| candidate.inference))
+}
+
+fn collect_multi_chain_summaries_checked(
+    grid: &Grid,
+    config: EngineConfig,
+    mode: MultiMode,
+) -> Result<Vec<Inference>, LegacyFcPlusBoundary> {
+    let mut result = InferenceCollector::new();
+    {
+        let mut sink = MultiSink::Summaries(&mut result);
+        search_multi_chain(grid, config, mode, &mut sink)?;
+    }
+    Ok(result.finish())
 }
 
 pub(crate) fn collect_multiple_chain_proofs(grid: &Grid, config: EngineConfig) -> Vec<NestedHint> {
@@ -2884,12 +3102,18 @@ mod tests {
 
     use super::{
         Branch, DynamicState, GridStateKey, Implications, InnerChainCache, LegacyFcPlusBoundary,
-        MultiMode, active_region_types, collect_multiple_chain_proofs, find_dynamic_forcing_chain,
-        find_dynamic_forcing_chain_plus, find_dynamic_forcing_chain_plus_checked,
+        MultiMode, active_region_types, collect_dynamic_forcing_chain_plus_checked,
+        collect_dynamic_forcing_chains, collect_multiple_chain_proofs,
+        collect_multiple_forcing_chains, collect_nested_forcing_chains_checked,
+        find_dynamic_forcing_chain, find_dynamic_forcing_chain_plus,
+        find_dynamic_forcing_chain_plus_checked,
         find_dynamic_forcing_chain_plus_with_proof_checked, find_dynamic_forcing_chain_with_proof,
         find_multiple_forcing_chain, find_multiple_forcing_chain_with_proof,
         find_nested_forcing_chain, find_nested_forcing_chain_with_proof_checked,
         first_broken_fcplus_two_family, legacy_hash_map_cell_order,
+        replay_dynamic_forcing_chain_plus_with_proof_checked,
+        replay_dynamic_forcing_chain_with_proof, replay_multiple_forcing_chain_with_proof,
+        replay_nested_forcing_chain_with_proof_checked,
     };
     use crate::{
         ChainCause, ChainProofView, ChainProofViewKind, ChainState, EngineConfig, Evidence,
@@ -3347,6 +3571,35 @@ mod tests {
     }
 
     #[test]
+    fn all_static_multiple_chains_keep_rank_order_and_replay_a_nonfirst_proof() {
+        let grid = sparse_snapshot(&[
+            (0, "123"),
+            (1, "24"),
+            (2, "25"),
+            (10, "26"),
+            (39, "178"),
+            (40, "27"),
+            (41, "37"),
+            (49, "47"),
+        ]);
+        let config = EngineConfig::default();
+        let hints = collect_multiple_forcing_chains(&grid, config);
+        assert!(hints.len() > 1, "fixture must expose multiple MFC effects");
+        assert_eq!(
+            find_multiple_forcing_chain(&grid, config).as_ref(),
+            hints.first()
+        );
+
+        let selected = &hints[1];
+        let first_replay =
+            replay_multiple_forcing_chain_with_proof(&grid, config, selected).unwrap();
+        let second_replay =
+            replay_multiple_forcing_chain_with_proof(&grid, config, selected).unwrap();
+        assert_eq!(first_replay.inference(), selected);
+        assert_eq!(first_replay.proof(), second_replay.proof());
+    }
+
+    #[test]
     fn nested_static_mfc_collector_keeps_region_branch_order_and_complexity() {
         let grid = sparse_snapshot(&[(0, "123"), (1, "24"), (2, "25"), (10, "26")]);
         let hints = collect_multiple_chain_proofs(&grid, EngineConfig::default());
@@ -3461,6 +3714,45 @@ mod tests {
             inference.description(grid.topology()),
             "Contradiction Forcing Chain: r1c1.1 on ==> r3c4.1 both on & off"
         );
+    }
+
+    #[test]
+    fn all_level_zero_dynamic_chains_keep_rank_order_and_replay_nonfirst() {
+        let grid = sparse_snapshot(&[
+            (0, "129"),
+            (10, "157"),
+            (11, "124"),
+            (12, "17"),
+            (19, "128"),
+            (20, "189"),
+            (21, "17"),
+            (28, "146"),
+            (29, "157"),
+            (80, "129"),
+            (70, "157"),
+            (69, "124"),
+            (68, "17"),
+            (61, "128"),
+            (60, "189"),
+            (59, "17"),
+            (52, "146"),
+            (51, "157"),
+        ]);
+        let config = EngineConfig::default();
+        let hints = collect_dynamic_forcing_chains(&grid, config);
+        assert!(hints.len() > 1, "fixture must expose multiple DFC effects");
+        assert_eq!(
+            find_dynamic_forcing_chain(&grid, config).as_ref(),
+            hints.first()
+        );
+
+        let selected = &hints[1];
+        let first_replay =
+            replay_dynamic_forcing_chain_with_proof(&grid, config, selected).unwrap();
+        let second_replay =
+            replay_dynamic_forcing_chain_with_proof(&grid, config, selected).unwrap();
+        assert_eq!(first_replay.inference(), selected);
+        assert_eq!(first_replay.proof(), second_replay.proof());
     }
 
     #[test]
@@ -3675,6 +3967,38 @@ mod tests {
     }
 
     #[test]
+    fn all_level_one_dynamic_chains_keep_rank_order_and_replay_nonfirst() {
+        let grid = Grid::from_puzzle(
+            Arc::new(ConstraintTopology::new(VariantConfig::default())),
+            &Puzzle::parse(
+                "........1.....2....34..........5..6...17..3..8....9..4...6...7...8..4..9.2..3.5..",
+            )
+            .unwrap(),
+        );
+        let config = EngineConfig::default();
+        let hints = collect_dynamic_forcing_chain_plus_checked(&grid, config).unwrap();
+        assert!(hints.len() > 1, "fixture must expose multiple DFC+ effects");
+        assert_eq!(
+            find_dynamic_forcing_chain_plus_checked(&grid, config)
+                .unwrap()
+                .as_ref(),
+            hints.first()
+        );
+
+        let selected = &hints[1];
+        let first_replay =
+            replay_dynamic_forcing_chain_plus_with_proof_checked(&grid, config, selected)
+                .unwrap()
+                .unwrap();
+        let second_replay =
+            replay_dynamic_forcing_chain_plus_with_proof_checked(&grid, config, selected)
+                .unwrap()
+                .unwrap();
+        assert_eq!(first_replay.inference(), selected);
+        assert_eq!(first_replay.proof(), second_replay.proof());
+    }
+
+    #[test]
     fn level_two_matches_java_hard_hint_order() {
         let mut grid = Grid::from_puzzle(
             Arc::new(ConstraintTopology::new(VariantConfig::default())),
@@ -3778,6 +4102,41 @@ mod tests {
         };
         assert_eq!(source_cell, CellId::new(44).unwrap());
         assert_eq!(source_digit, Digit::new(1).unwrap());
+    }
+
+    #[test]
+    fn all_level_two_nested_chains_keep_rank_order_and_replay_nonfirst() {
+        let grid = Grid::from_puzzle(
+            Arc::new(ConstraintTopology::new(VariantConfig::default())),
+            &Puzzle::parse(
+                "100000002030400050006000700040603000000020000000508090007000100080009030200000006",
+            )
+            .unwrap(),
+        );
+        let config = EngineConfig::default();
+        let hints = collect_nested_forcing_chains_checked(&grid, config, 2, 0).unwrap();
+        assert!(
+            hints.len() > 1,
+            "fixture must expose multiple nested DFC effects"
+        );
+        assert_eq!(
+            super::find_nested_forcing_chain_checked(&grid, config, 2, 0)
+                .unwrap()
+                .as_ref(),
+            hints.first()
+        );
+
+        let selected = &hints[1];
+        let first_replay =
+            replay_nested_forcing_chain_with_proof_checked(&grid, config, 2, 0, selected)
+                .unwrap()
+                .unwrap();
+        let second_replay =
+            replay_nested_forcing_chain_with_proof_checked(&grid, config, 2, 0, selected)
+                .unwrap()
+                .unwrap();
+        assert_eq!(first_replay.inference(), selected);
+        assert_eq!(first_replay.proof(), second_replay.proof());
     }
 
     #[test]

@@ -55,7 +55,7 @@ revisions; the React controller ignores responses whose request ID is no longer
 current. A board edit invalidates the pending hint. The legacy test-only
 `boardReducer` and typed renderer fixture are not a production Sudoku engine.
 
-## Protocol v2
+## Protocol v3
 
 Requests and responses contain a protocol version and an exactly representable
 numeric request ID. Commands and responses use explicit snake-case tags.
@@ -87,15 +87,17 @@ when `__TAURI_INTERNALS__` identifies the native runtime.
 The application receives an asynchronous `ApplicationPort` dependency. It owns
 the latest authoritative snapshot, topology and pending presentation, plus
 ephemeral UI state such as selected cell, view, filters and busy/error status.
-Only one conflicting command is submitted at a time. Get all hints and Solve
-are not exposed until Rust provides those operations; progress is shown only
-for real running work.
+Only one conflicting command is submitted at a time. Get all hints uses the
+same serialized dispatcher as edits and next-hint search; automatic Solve is
+not exposed yet. Progress is shown only for real running work. All-hints
+summaries retain opaque IDs and effects, while the selected presentation proof
+is materialized lazily.
 
 ## Delivery status
 
-The stable single-hint path now includes:
+The stable GUI path now includes:
 
-1. semantic presentation and protocol-v2 DTOs frozen by shared Rust/Vitest
+1. semantic presentation and protocol-v3 DTOs frozen by shared Rust/Vitest
    golden fixtures;
 2. a dependency-injected React controller for create, next, apply, edit, undo
    and redo;
@@ -109,17 +111,19 @@ The stable single-hint path now includes:
    forcing chains; and
 7. a legacy-shaped application menu with value-grid import, backed solver and
    history actions, compatibility/variant presets and persistent light/dark
-   themes.
+   themes; and
+8. true tiered all-hints collection, revision-bound opaque handles, lazy proof
+   replay for arbitrary selected chain hints, and the legacy similar-outcome
+   projection in the grouped hint browser.
 
 Advanced and nested forcing-chain views expose the selected outer proof DAG.
 Inner nested deductions are deliberately represented as typed `Derived` edges
 instead of retaining or inventing thousands of recursive proof graphs in the
 normal rating path.
 
-Next work includes value clearing, filesystem open/save, true all-hints
-collection, automatic Solve/Analyze, complete settings, persistence,
-generation, cooperative cancellation, committed browser automation and
-macOS/Linux packaging.
+Next work includes value clearing, filesystem open/save, automatic
+Solve/Analyze, complete settings, persistence, generation, cooperative
+cancellation, committed browser automation and macOS/Linux packaging.
 
 Normal Rust tests, clippy, formatting, GUI unit tests, type checking, lint and
 production build are required at every checkpoint. Protocol changes require an

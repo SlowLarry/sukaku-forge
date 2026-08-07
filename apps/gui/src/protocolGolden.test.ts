@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import golden from './fixtures/protocol-v2-hidden-single.json'
+import golden from './fixtures/protocol-v3-hidden-single.json'
 import { PROTOCOL_VERSION, parseApplicationResponse } from './applicationPort'
 
-describe('Rust protocol-v2 golden fixture', () => {
+describe('Rust protocol-v3 golden fixture', () => {
   it('validates and preserves the hidden-single session sequence', () => {
     expect(golden.protocol_version).toBe(PROTOCOL_VERSION)
     expect(golden.scenario).toBe('hidden_single_round_trip')

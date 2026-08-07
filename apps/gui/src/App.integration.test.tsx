@@ -10,7 +10,7 @@ import type {
   SessionSnapshotDto,
 } from './applicationPort'
 import { parseApplicationResponse } from './applicationPort'
-import golden from './fixtures/protocol-v2-hidden-single.json'
+import golden from './fixtures/protocol-v3-hidden-single.json'
 
 type Deferred<T> = {
   promise: Promise<T>
@@ -31,6 +31,7 @@ afterEach(() => {
 
 const responseAt = (index: number): ApplicationResponseDto => {
   const raw = structuredClone(golden.steps[index]!.response)
+  raw.protocol_version = 3
   return parseApplicationResponse(raw, raw.request_id)
 }
 
@@ -43,7 +44,7 @@ const snapshotResponse = (
   snapshot: SessionSnapshotDto,
   requestId: number,
 ): ApplicationResponseDto => ({
-  protocol_version: 2,
+  protocol_version: 3,
   request_id: requestId,
   response: 'snapshot',
   snapshot,
@@ -133,6 +134,149 @@ describe('live application flow', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Redo' }))
     await waitFor(() => expect(currentRevision()).toBe('3'))
     expect(valueCount()).toBe(9)
+  })
+
+  it('loads the all-hints catalog first and materializes only the selected server-owned hint', async () => {
+    const initial = responseAt(0)
+    const next = responseAt(1)
+    if (next.response !== 'next_hint' || next.outcome.outcome !== 'presented') {
+      throw new Error('expected presented fixture')
+    }
+
+    const hiddenSinglePresentation = structuredClone(next.outcome.presentation)
+    const hiddenSingleEffects = structuredClone(next.outcome.effects)
+    const fishPresentation = structuredClone(hiddenSinglePresentation)
+    fishPresentation.identity = {
+      technique_key: 'fish_2',
+      name: 'X-Wing',
+      short_name: 'XW',
+      rating_tenths: 32,
+    }
+    fishPresentation.explanation = {
+      blocks: [{
+        type: 'paragraph',
+        inlines: [{ type: 'text', text: 'The X-Wing removes two candidates.' }],
+      }],
+    }
+    const fishEffects = {
+      placement: null,
+      removals: [
+        { cell: 40, digits: 1 << 2 },
+        { cell: 41, digits: 1 << 2 },
+      ],
+      elimination_count: 2,
+    }
+    const summaries = [
+      {
+        hint_id: '11',
+        category: 'direct' as const,
+        group_key: 'hidden_single',
+        group_name: 'Hidden Single',
+        identity: hiddenSinglePresentation.identity,
+        effects: hiddenSingleEffects,
+        filter_effects: hiddenSingleEffects,
+      },
+      {
+        hint_id: '12',
+        category: 'indirect' as const,
+        group_key: 'x_wing',
+        group_name: 'X-Wing',
+        identity: fishPresentation.identity,
+        effects: fishEffects,
+        filter_effects: fishEffects,
+      },
+    ]
+
+    const dispatch = vi.fn(async (request: ApplicationRequestDto): Promise<ApplicationResponseDto> => {
+      switch (request.command) {
+        case 'create_session': return correlated(initial, request.request_id)
+        case 'get_all_hints':
+          return {
+            protocol_version: 3,
+            request_id: request.request_id,
+            response: 'all_hints',
+            revision: '0',
+            outcome: { outcome: 'complete', hints: summaries },
+          }
+        case 'get_hint': {
+          const fish = request.hint_id === '12'
+          return {
+            protocol_version: 3,
+            request_id: request.request_id,
+            response: 'hint',
+            revision: '0',
+            hint_id: request.hint_id,
+            outcome: {
+              outcome: 'presented',
+              presentation: fish ? fishPresentation : hiddenSinglePresentation,
+              effects: fish ? fishEffects : hiddenSingleEffects,
+            },
+          }
+        }
+        default: throw new Error(`unexpected command ${request.command}`)
+      }
+    })
+
+    render(<App port={{ dispatch }} />)
+    await screen.findByRole('grid')
+    fireEvent.click(screen.getByRole('button', { name: 'Get all hints' }))
+
+    await waitFor(() => expect(dispatch).toHaveBeenCalledTimes(3))
+    expect(dispatch.mock.calls[1]?.[0]).toMatchObject({
+      command: 'get_all_hints',
+      expected_revision: '0',
+    })
+    expect(dispatch.mock.calls[2]?.[0]).toMatchObject({
+      command: 'get_hint',
+      hint_id: '11',
+      expected_revision: '0',
+    })
+    expect(screen.getByRole('searchbox', { name: 'Search all hints' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Sudoku Rules 1' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Solving Techniques 1' })).toBeTruthy()
+
+    fireEvent.click(screen.getByText('2 eliminations', { selector: 'small' }).closest('button')!)
+    await waitFor(() => expect(dispatch).toHaveBeenCalledTimes(4))
+    expect(dispatch.mock.calls[3]?.[0]).toMatchObject({ command: 'get_hint', hint_id: '12' })
+    await waitFor(() => {
+      expect(document.querySelector('[data-hint-kind="presented"]')?.textContent).toContain('X-Wing')
+    })
+    expect(screen.getByRole('heading', { name: 'Hint details' }).parentElement?.parentElement?.textContent)
+      .toContain('X-Wing')
+  })
+
+  it('requires an explicit second request before searching expensive hints', async () => {
+    const initial = responseAt(0)
+    const dispatch = vi.fn(async (request: ApplicationRequestDto): Promise<ApplicationResponseDto> => {
+      if (request.command === 'create_session') return correlated(initial, request.request_id)
+      if (request.command === 'get_all_hints') {
+        return {
+          protocol_version: 3,
+          request_id: request.request_id,
+          response: 'all_hints',
+          revision: '0',
+          outcome: request.include_expensive
+            ? { outcome: 'complete', hints: [] }
+            : { outcome: 'confirmation_required' },
+        }
+      }
+      throw new Error(`unexpected command ${request.command}`)
+    })
+
+    render(<App port={{ dispatch }} />)
+    await screen.findByRole('grid')
+    fireEvent.click(screen.getByRole('button', { name: 'Get all hints' }))
+
+    expect(await screen.findByText('No ordinary hints found')).toBeTruthy()
+    expect(dispatch.mock.calls[1]?.[0]).not.toHaveProperty('include_expensive')
+    fireEvent.click(screen.getByRole('button', { name: 'Search advanced hints' }))
+
+    await waitFor(() => expect(dispatch).toHaveBeenCalledTimes(3))
+    expect(dispatch.mock.calls[2]?.[0]).toMatchObject({
+      command: 'get_all_hints',
+      include_expensive: true,
+    })
+    expect(await screen.findAllByText('The engine found no applicable logical hints.')).toHaveLength(2)
   })
 
   it('keeps edits non-optimistic, suppresses conflicts while busy, and wires candidate mode', async () => {
@@ -288,7 +432,7 @@ describe('live application flow', () => {
       createCount += 1
       if (createCount === 2 || createCount === 4) {
         return {
-          protocol_version: 2,
+          protocol_version: 3,
           request_id: request.request_id,
           response: 'error',
           error: {

@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { ApplicationPort, ApplicationResponseDto } from './applicationPort'
+import { PROTOCOL_VERSION } from './applicationPort'
 import { createPlatformPort, isTauriRuntime } from './platformPort'
 
 const response: ApplicationResponseDto = {
-  protocol_version: 2,
+  protocol_version: PROTOCOL_VERSION,
   request_id: 1,
   response: 'error',
   error: { code: 'test', message: 'test response' },
@@ -43,7 +44,7 @@ describe('platform application-port selection', () => {
     })
 
     await expect(port.dispatch({
-      protocol_version: 2,
+      protocol_version: PROTOCOL_VERSION,
       request_id: 1,
       command: 'next_hint',
       expected_revision: '0',

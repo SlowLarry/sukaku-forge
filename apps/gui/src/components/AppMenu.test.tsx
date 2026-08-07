@@ -12,6 +12,7 @@ const props = () => ({
   canUndo: true,
   canRedo: false,
   canRequestHint: true,
+  canRequestAllHints: true,
   canApply: true,
   candidatesVisible: true,
   candidateEntry: false,
@@ -24,6 +25,7 @@ const props = () => ({
   onUndo: vi.fn(),
   onRedo: vi.fn(),
   onNextHint: vi.fn(),
+  onAllHints: vi.fn(),
   onApply: vi.fn(),
   onApplyAndNext: vi.fn(),
   onToggleCandidates: vi.fn(),
@@ -74,5 +76,16 @@ describe('AppMenu', () => {
     fireEvent.click(screen.getByRole('menuitemradio', { name: 'Light theme' }))
     expect(actions.onTheme).toHaveBeenCalledWith('light')
     expect(document.getElementById('options-application-menu')?.hasAttribute('hidden')).toBe(true)
+  })
+
+  it('exposes all-hints in Tools and dispatches it independently of next hint', () => {
+    const actions = props()
+    render(<AppMenu {...actions} />)
+
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Tools' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Get all hints' }))
+
+    expect(actions.onAllHints).toHaveBeenCalledOnce()
+    expect(actions.onNextHint).not.toHaveBeenCalled()
   })
 })

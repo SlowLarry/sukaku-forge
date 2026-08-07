@@ -5,6 +5,7 @@ import type {
   ApplicationResponseDto,
   EngineInputDto,
   HintEffectsDto,
+  HintSummaryDto,
   NonZeroDecimalString,
   PortErrorDto,
   PortGapDto,
@@ -36,11 +37,19 @@ export type HintResult =
   | { kind: 'none' }
   | { kind: 'incomplete'; gap: PortGapDto }
 
+export type HintCatalogResult =
+  | { kind: 'complete' }
+  | { kind: 'confirmation-required' }
+  | { kind: 'incomplete'; gap: PortGapDto }
+
 export interface SessionControllerState {
   snapshot: BoardSnapshot | null
   topology: BoardTopology | null
   hint: HintPresentation | null
   hintResult: HintResult | null
+  hintCatalog: HintSummaryDto[]
+  hintCatalogResult: HintCatalogResult | null
+  selectedHintId: NonZeroDecimalString | null
   busy: boolean
   pendingRequestId: RequestId | null
   pendingCommand: CommandName | null
@@ -52,6 +61,9 @@ export const initialSessionControllerState: SessionControllerState = {
   topology: null,
   hint: null,
   hintResult: null,
+  hintCatalog: [],
+  hintCatalogResult: null,
+  selectedHintId: null,
   busy: false,
   pendingRequestId: null,
   pendingCommand: null,
@@ -72,6 +84,14 @@ export type SessionControllerEvent =
     requestId: RequestId
     hint: HintPresentation | null
     result: HintResult
+    selectedHintId: NonZeroDecimalString | null
+    retainCatalog: boolean
+  }
+  | {
+    type: 'hint-catalog-received'
+    requestId: RequestId
+    hints: HintSummaryDto[]
+    result: HintCatalogResult
   }
   | { type: 'request-failed'; requestId: RequestId; error: PortErrorDto }
   | { type: 'local-error'; error: PortErrorDto }
@@ -112,6 +132,9 @@ export function sessionControllerReducer(
         topology: event.topology,
         hint: null,
         hintResult: null,
+        hintCatalog: [],
+        hintCatalogResult: null,
+        selectedHintId: null,
       }
     case 'snapshot-received':
       return {
@@ -120,6 +143,9 @@ export function sessionControllerReducer(
         snapshot: event.snapshot,
         hint: null,
         hintResult: null,
+        hintCatalog: [],
+        hintCatalogResult: null,
+        selectedHintId: null,
       }
     case 'hint-received':
       return {
@@ -127,6 +153,19 @@ export function sessionControllerReducer(
         ...settled,
         hint: event.hint,
         hintResult: event.result,
+        hintCatalog: event.retainCatalog ? state.hintCatalog : [],
+        hintCatalogResult: event.retainCatalog ? state.hintCatalogResult : null,
+        selectedHintId: event.selectedHintId,
+      }
+    case 'hint-catalog-received':
+      return {
+        ...state,
+        ...settled,
+        hint: null,
+        hintResult: null,
+        hintCatalog: event.hints,
+        hintCatalogResult: event.result,
+        selectedHintId: null,
       }
     case 'request-failed':
       return { ...state, ...settled, error: event.error }
@@ -141,6 +180,8 @@ export interface CreateSessionOptions {
 export interface SessionControllerActions {
   createSession(puzzle: string, options?: CreateSessionOptions): Promise<boolean>
   nextHint(): Promise<void>
+  getAllHints(includeExpensive?: boolean): Promise<void>
+  selectHint(hintId: NonZeroDecimalString): Promise<void>
   applyHint(): Promise<void>
   applyAndNext(): Promise<void>
   placeValue(cell: CellRef, digit: number): Promise<void>
@@ -189,6 +230,37 @@ class InjectedSessionController implements SessionController {
     const revision = this.currentRevision()
     if (revision == null) return
     await this.dispatch({ command: 'next_hint', expected_revision: revision }, 'next_hint')
+  }
+
+  getAllHints = async (includeExpensive = false) => {
+    const revision = this.currentRevision()
+    if (revision == null) return
+    const accepted = await this.dispatch({
+      command: 'get_all_hints',
+      expected_revision: revision,
+      ...(includeExpensive ? { include_expensive: true } : {}),
+    }, 'all_hints')
+    if (!accepted) return
+    const first = this.state.hintCatalog[0]
+    if (first != null) await this.selectHint(first.hint_id)
+  }
+
+  selectHint = async (hintId: NonZeroDecimalString) => {
+    const revision = this.currentRevision()
+    if (revision == null) return
+    if (!this.state.hintCatalog.some((hint) => hint.hint_id === hintId)) {
+      this.publish({
+        type: 'local-error',
+        error: controllerError('unknown_hint', 'the selected hint is not in the current catalog'),
+      })
+      return
+    }
+    if (this.state.selectedHintId === hintId && this.state.hintResult != null) return
+    await this.dispatch({
+      command: 'get_hint',
+      expected_revision: revision,
+      hint_id: hintId,
+    }, 'hint')
   }
 
   applyHint = async () => {
@@ -340,6 +412,36 @@ class InjectedSessionController implements SessionController {
       })
       return false
     }
+    if (
+      command.command === 'get_hint'
+      && response.response === 'hint'
+      && response.hint_id !== command.hint_id
+    ) {
+      this.publish({
+        type: 'request-failed',
+        requestId,
+        error: controllerError(
+          'hint_id_mismatch',
+          `response hint ${response.hint_id} does not match requested hint ${command.hint_id}`,
+        ),
+      })
+      return false
+    }
+    if (
+      'expected_revision' in command
+      && 'revision' in response
+      && response.revision !== command.expected_revision
+    ) {
+      this.publish({
+        type: 'request-failed',
+        requestId,
+        error: controllerError(
+          'revision_mismatch',
+          `response revision ${response.revision} does not match requested revision ${command.expected_revision}`,
+        ),
+      })
+      return false
+    }
 
     this.acceptResponse(requestId, response)
     return !this.state.busy && this.state.error == null
@@ -367,11 +469,17 @@ class InjectedSessionController implements SessionController {
         })
         return
       case 'next_hint':
-        this.acceptHint(requestId, response)
+        this.acceptNextHint(requestId, response)
+        return
+      case 'all_hints':
+        this.acceptHintCatalog(requestId, response)
+        return
+      case 'hint':
+        this.acceptMaterializedHint(requestId, response)
     }
   }
 
-  private acceptHint(
+  private acceptNextHint(
     requestId: RequestId,
     response: Extract<ApplicationResponseDto, { response: 'next_hint' }>,
   ) {
@@ -408,6 +516,8 @@ class InjectedSessionController implements SessionController {
           requestId,
           hint,
           result: { kind: 'presented', hintId: outcome.hint_id },
+          selectedHintId: outcome.hint_id,
+          retainCatalog: false,
         })
         return
       }
@@ -422,10 +532,19 @@ class InjectedSessionController implements SessionController {
             unsupported: outcome.unsupported,
             effects: outcome.effects,
           },
+          selectedHintId: outcome.hint_id,
+          retainCatalog: false,
         })
         return
       case 'none':
-        this.publish({ type: 'hint-received', requestId, hint: null, result: { kind: 'none' } })
+        this.publish({
+          type: 'hint-received',
+          requestId,
+          hint: null,
+          result: { kind: 'none' },
+          selectedHintId: null,
+          retainCatalog: false,
+        })
         return
       case 'incomplete':
         this.publish({
@@ -433,8 +552,109 @@ class InjectedSessionController implements SessionController {
           requestId,
           hint: null,
           result: { kind: 'incomplete', gap: outcome.gap },
+          selectedHintId: null,
+          retainCatalog: false,
         })
     }
+  }
+
+  private acceptHintCatalog(
+    requestId: RequestId,
+    response: Extract<ApplicationResponseDto, { response: 'all_hints' }>,
+  ) {
+    const outcome = response.outcome
+    switch (outcome.outcome) {
+      case 'complete':
+        this.publish({
+          type: 'hint-catalog-received',
+          requestId,
+          hints: outcome.hints,
+          result: { kind: 'complete' },
+        })
+        return
+      case 'confirmation_required':
+        this.publish({
+          type: 'hint-catalog-received',
+          requestId,
+          hints: [],
+          result: { kind: 'confirmation-required' },
+        })
+        return
+      case 'incomplete':
+        this.publish({
+          type: 'hint-catalog-received',
+          requestId,
+          hints: outcome.hints,
+          result: { kind: 'incomplete', gap: outcome.gap },
+        })
+    }
+  }
+
+  private acceptMaterializedHint(
+    requestId: RequestId,
+    response: Extract<ApplicationResponseDto, { response: 'hint' }>,
+  ) {
+    const outcome = response.outcome
+    if (outcome.outcome === 'presented') {
+      if (this.wireTopology == null) {
+        this.publish({
+          type: 'request-failed',
+          requestId,
+          error: controllerError('topology_unavailable', 'a presented hint requires session topology'),
+        })
+        return
+      }
+      let hint: HintPresentation
+      try {
+        hint = mapHintPresentation({
+          hintId: response.hint_id,
+          revision: response.revision,
+          presentation: outcome.presentation,
+          effects: outcome.effects,
+          topology: this.wireTopology,
+        })
+      } catch (error) {
+        this.publish({
+          type: 'request-failed',
+          requestId,
+          error: controllerError('wire_mapping_error', errorMessage(error)),
+        })
+        return
+      }
+      this.publish({
+        type: 'hint-received',
+        requestId,
+        hint,
+        result: { kind: 'presented', hintId: response.hint_id },
+        selectedHintId: response.hint_id,
+        retainCatalog: true,
+      })
+      return
+    }
+    if (outcome.outcome === 'unsupported') {
+      this.publish({
+        type: 'hint-received',
+        requestId,
+        hint: null,
+        result: {
+          kind: 'unsupported',
+          hintId: response.hint_id,
+          unsupported: outcome.unsupported,
+          effects: outcome.effects,
+        },
+        selectedHintId: response.hint_id,
+        retainCatalog: true,
+      })
+      return
+    }
+    this.publish({
+      type: 'hint-received',
+      requestId,
+      hint: null,
+      result: { kind: 'incomplete', gap: outcome.gap },
+      selectedHintId: response.hint_id,
+      retainCatalog: true,
+    })
   }
 
   private isCurrent(requestId: RequestId) {
@@ -462,6 +682,8 @@ export function useSessionController(port: ApplicationPort): SessionControllerVi
     ...state,
     createSession: controller.createSession,
     nextHint: controller.nextHint,
+    getAllHints: controller.getAllHints,
+    selectHint: controller.selectHint,
     applyHint: controller.applyHint,
     applyAndNext: controller.applyAndNext,
     placeValue: controller.placeValue,

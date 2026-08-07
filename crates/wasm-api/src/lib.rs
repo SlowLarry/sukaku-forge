@@ -35,8 +35,8 @@ mod tests {
 
     #[test]
     fn wrapper_matches_the_domain_port_and_retains_session_state() {
-        let create = r#"{"protocol_version":2,"request_id":1,"command":"create_session","puzzle":"12345678........................................................................."}"#;
-        let next = r#"{"protocol_version":2,"request_id":2,"command":"next_hint","expected_revision":"0"}"#;
+        let create = r#"{"protocol_version":3,"request_id":1,"command":"create_session","puzzle":"12345678........................................................................."}"#;
+        let next = r#"{"protocol_version":3,"request_id":2,"command":"next_hint","expected_revision":"0"}"#;
         let mut wrapper = WasmApplicationPort::new();
         let mut direct = sukaku_forge_app::port::ApplicationPort::new();
 

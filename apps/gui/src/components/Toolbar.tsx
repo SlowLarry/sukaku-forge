@@ -2,6 +2,7 @@ import {
   Check,
   Eye,
   EyeOff,
+  ListTree,
   PencilLine,
   Redo2,
   SkipForward,
@@ -17,6 +18,7 @@ interface ToolbarProps {
   canUndo: boolean
   canRedo: boolean
   canRequestHint: boolean
+  canRequestAllHints: boolean
   canApply: boolean
   candidatesVisible: boolean
   candidateEntry: boolean
@@ -24,6 +26,7 @@ interface ToolbarProps {
   onUndo: () => void
   onRedo: () => void
   onRequestHint: () => void
+  onRequestAllHints: () => void
   onToggleCandidates: () => void
   onToggleCandidateEntry: () => void
   onApply: () => void
@@ -66,6 +69,7 @@ export function Toolbar({
   canUndo,
   canRedo,
   canRequestHint,
+  canRequestAllHints,
   canApply,
   candidatesVisible,
   candidateEntry,
@@ -73,6 +77,7 @@ export function Toolbar({
   onUndo,
   onRedo,
   onRequestHint,
+  onRequestAllHints,
   onToggleCandidates,
   onToggleCandidateEntry,
   onApply,
@@ -126,6 +131,12 @@ export function Toolbar({
             onClick={onRequestHint}
             title="Get next hint"
           >Next hint</ToolButton>
+          <ToolButton
+            icon={<ListTree />}
+            disabled={busy || !canRequestAllHints}
+            onClick={onRequestAllHints}
+            title="Get all hints"
+          >All hints</ToolButton>
           <button
             className="primary-button"
             onClick={onApply}

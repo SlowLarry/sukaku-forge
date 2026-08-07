@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import golden from './fixtures/protocol-v2-hidden-single.json'
+import golden from './fixtures/protocol-v3-hidden-single.json'
 import {
   ApplicationProtocolError,
   type ApplicationRequestDto,

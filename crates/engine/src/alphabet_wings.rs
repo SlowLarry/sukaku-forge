@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::HashSet};
 
 use sukaku_forge_core::{
     CandidateMask, CandidateRemovals, CandidateRemovalsBuilder, CellId, CellMask, Digit, Grid,
@@ -23,9 +23,31 @@ pub fn find_alphabet_wing(grid: &Grid, degree: u8) -> Option<Inference> {
         values: [CandidateMask::EMPTY; 6],
         best: None,
         all: None,
+        public_all: None,
     };
     search.run();
     search.best.map(|draft| draft.inference)
+}
+
+/// Collect every Java-compatible generalized ALS wing of size `degree` in
+/// the producer's stable rank order.
+#[must_use]
+pub fn collect_alphabet_wing(grid: &Grid, degree: u8) -> Vec<Inference> {
+    assert!((4..=7).contains(&degree));
+    let mut search = AlphabetWingSearch {
+        grid,
+        degree,
+        cells: [0; 6],
+        values: [CandidateMask::EMPTY; 6],
+        best: None,
+        all: None,
+        public_all: Some(Vec::new()),
+    };
+    search.run();
+    finish_public_hints(
+        degree,
+        search.public_all.expect("public alphabet-wing collector"),
+    )
 }
 
 /// Java runs every hint from the first productive advanced-rule family before
@@ -41,6 +63,7 @@ pub(crate) fn collect_alphabet_wing_advanced(grid: &Grid, degree: u8) -> Vec<Adv
         values: [CandidateMask::EMPTY; 6],
         best: None,
         all: Some(Vec::new()),
+        public_all: None,
     };
     search.run();
     let mut result = search.all.expect("advanced alphabet-wing collector");
@@ -74,8 +97,10 @@ struct AlphabetWingSearch<'a> {
     values: [CandidateMask; 6],
     best: Option<AlphabetWingDraft>,
     all: Option<Vec<AdvancedAlphabetWing>>,
+    public_all: Option<Vec<AlphabetWingDraft>>,
 }
 
+#[derive(Clone)]
 struct AlphabetWingDraft {
     inference: Inference,
     rating: u16,
@@ -324,6 +349,14 @@ impl AlphabetWingSearch<'_> {
                 suffix: candidate.suffix.clone(),
             });
         }
+        if let Some(public_all) = &mut self.public_all {
+            public_all.push(AlphabetWingDraft {
+                inference: candidate.inference.clone(),
+                rating: candidate.rating,
+                eliminations: candidate.eliminations,
+                suffix: candidate.suffix.clone(),
+            });
+        }
         if self
             .best
             .as_ref()
@@ -372,6 +405,53 @@ impl AlphabetWingDraft {
     }
 }
 
+#[derive(Eq, Hash, PartialEq)]
+struct JavaEqualityKey {
+    cells: [u8; 7],
+    len: u8,
+    z_digit: u8,
+}
+
+fn finish_public_hints(degree: u8, mut hints: Vec<AlphabetWingDraft>) -> Vec<Inference> {
+    // Collections.sort is stable and the GUI accumulator subsequently uses
+    // the concrete wing hint's Java equality. VWXYZWingHint's released
+    // equality compares two distinct candidate cells to the same cell and
+    // therefore cannot match a valid pattern; preserve that compatibility
+    // quirk by retaining every degree-five discovery.
+    hints.sort_by(|left, right| {
+        left.rating
+            .cmp(&right.rating)
+            .then_with(|| right.eliminations.cmp(&left.eliminations))
+            .then_with(|| right.suffix.cmp(&left.suffix))
+    });
+    let mut seen = HashSet::new();
+    hints
+        .into_iter()
+        .filter(|hint| degree == 5 || seen.insert(java_equality_key(&hint.inference)))
+        .map(|hint| hint.inference)
+        .collect()
+}
+
+fn java_equality_key(inference: &Inference) -> JavaEqualityKey {
+    let Evidence::AlphabetWing {
+        pattern_cells,
+        z_digit,
+        ..
+    } = inference.evidence()
+    else {
+        unreachable!("alphabet-wing collector evidence")
+    };
+    let mut cells = [0; 7];
+    for (index, cell) in pattern_cells.iter().enumerate() {
+        cells[index] = cell.raw();
+    }
+    JavaEqualityKey {
+        cells,
+        len: pattern_cells.len() as u8,
+        z_digit: z_digit.get(),
+    }
+}
+
 const fn technique(degree: u8) -> Technique {
     match degree {
         4 => Technique::WXYZWing,
@@ -409,7 +489,7 @@ mod tests {
 
     use sukaku_forge_core::{ConstraintTopology, Grid, Puzzle, VariantConfig};
 
-    use super::find_alphabet_wing;
+    use super::{collect_alphabet_wing, find_alphabet_wing};
     use crate::{Rating, Technique};
 
     fn sparse_snapshot(entries: &[(usize, &[u8])]) -> Grid {
@@ -524,6 +604,99 @@ mod tests {
             "WXYZ-Wing 126: Cells r7c4,r7c5,r8c4,r7c7 on value 2"
         );
         assert_eq!(inference.removals().iter().next().unwrap().cell().raw(), 59);
+    }
+
+    #[test]
+    fn full_collectors_preserve_java_order_dedup_and_compact_winner() {
+        let wxyz = sparse_snapshot(&[
+            (0, &[1, 2, 3]),
+            (1, &[1, 3]),
+            (2, &[2]),
+            (3, &[1, 2]),
+            (9, &[2, 4]),
+            (57, &[1, 2]),
+            (58, &[1, 3]),
+            (59, &[2]),
+            (60, &[1, 2]),
+            (66, &[2, 4]),
+        ]);
+        let hints = collect_alphabet_wing(&wxyz, 4);
+        assert_eq!(hints.len(), 2);
+        assert_eq!(find_alphabet_wing(&wxyz, 4).as_ref(), hints.first());
+        assert_eq!(
+            hints
+                .iter()
+                .map(|hint| hint.description(wxyz.topology()))
+                .collect::<Vec<_>>(),
+            [
+                "WXYZ-Wing 126: Cells r7c4,r7c5,r8c4,r7c7 on value 2",
+                "WXYZ-Wing 137: Cells r1c1,r1c2,r2c1,r1c4 on value 2",
+            ]
+        );
+
+        for (degree, grid) in [
+            (
+                5,
+                sparse_snapshot(&[
+                    (0, &[1, 3]),
+                    (1, &[1, 4]),
+                    (2, &[3, 5]),
+                    (3, &[2, 5]),
+                    (9, &[1, 2]),
+                    (12, &[2, 8]),
+                ]),
+            ),
+            (
+                6,
+                sparse_snapshot(&[
+                    (0, &[1, 3]),
+                    (1, &[1, 4]),
+                    (2, &[3, 5]),
+                    (3, &[2, 6]),
+                    (4, &[5, 6]),
+                    (9, &[1, 2]),
+                    (12, &[2, 8]),
+                ]),
+            ),
+            (
+                7,
+                sparse_snapshot(&[
+                    (0, &[1, 3]),
+                    (1, &[1, 4]),
+                    (2, &[3, 5]),
+                    (3, &[2, 6]),
+                    (4, &[5, 7]),
+                    (5, &[6, 7]),
+                    (9, &[1, 2]),
+                    (12, &[2, 8]),
+                ]),
+            ),
+        ] {
+            let collected = collect_alphabet_wing(&grid, degree);
+            assert!(!collected.is_empty(), "degree {degree}");
+            assert_eq!(
+                find_alphabet_wing(&grid, degree).as_ref(),
+                collected.first(),
+                "degree {degree}"
+            );
+        }
+
+        let duplicate = hints[0].clone();
+        let draft = || super::AlphabetWingDraft {
+            rating: duplicate.rating().tenths(),
+            eliminations: duplicate.removals().elimination_count(),
+            suffix: "126".to_owned(),
+            inference: duplicate.clone(),
+        };
+        assert_eq!(
+            super::finish_public_hints(4, vec![draft(), draft()]).len(),
+            1
+        );
+        assert_eq!(
+            super::finish_public_hints(5, vec![draft(), draft()]).len(),
+            2,
+            "released VWXYZWingHint.equals never matches a valid pattern"
+        );
     }
 
     #[test]

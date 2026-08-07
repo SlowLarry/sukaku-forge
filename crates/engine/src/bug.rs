@@ -19,6 +19,13 @@ pub fn find_bivalue_universal_grave(grid: &Grid, config: EngineConfig) -> Option
     BugSearch::new(grid, config).find()
 }
 
+/// Collect every Java-compatible Bivalue Universal Grave hint in producer
+/// order, including all shared-region Type 4 and naked-set Type 3 variants.
+#[must_use]
+pub fn collect_bivalue_universal_grave(grid: &Grid, config: EngineConfig) -> Vec<Inference> {
+    BugSearch::new(grid, config).collect()
+}
+
 struct BugSearch<'a> {
     grid: &'a Grid,
     config: EngineConfig,
@@ -48,7 +55,7 @@ impl<'a> BugSearch<'a> {
         }
     }
 
-    fn find(mut self) -> Option<Inference> {
+    fn prepare(mut self) -> Option<Self> {
         if !self.discover_bug_cells()
             || !self.validate_stripped_grid()
             || self.is_restricted()
@@ -56,28 +63,67 @@ impl<'a> BugSearch<'a> {
         {
             return None;
         }
+        Some(self)
+    }
 
-        if self.bug_count == 1 {
-            return self.type_1();
+    fn find(self) -> Option<Inference> {
+        let self_ = self.prepare()?;
+
+        if self_.bug_count == 1 {
+            return self_.type_1();
         }
-        if self.all_bug_values.count() == 1 {
-            return self.type_2().or_else(|| {
-                if self.bug_count == 2 {
-                    self.type_4()
+        if self_.all_bug_values.count() == 1 {
+            return self_.type_2().or_else(|| {
+                if self_.bug_count == 2 {
+                    self_.type_4()
                 } else {
                     None
                 }
             });
         }
-        if self.common_cells.is_some_and(|cells| !cells.is_empty()) {
-            if self.bug_count == 2
-                && let Some(inference) = self.type_4()
+        if self_.common_cells.is_some_and(|cells| !cells.is_empty()) {
+            if self_.bug_count == 2
+                && let Some(inference) = self_.type_4()
             {
                 return Some(inference);
             }
-            return self.type_3();
+            return self_.type_3();
         }
         None
+    }
+
+    fn collect(self) -> Vec<Inference> {
+        let Some(self_) = self.prepare() else {
+            return Vec::new();
+        };
+        let mut result = Vec::new();
+        if self_.bug_count == 1 {
+            if let Some(inference) = self_.type_1() {
+                result.push(inference);
+            }
+        } else if self_.all_bug_values.count() == 1 {
+            if let Some(inference) = self_.type_2() {
+                result.push(inference);
+            }
+            if self_.bug_count == 2 {
+                self_.visit_type_4(&mut |inference| {
+                    result.push(inference);
+                    true
+                });
+            }
+        } else if self_.common_cells.is_some_and(|cells| !cells.is_empty()) {
+            if self_.bug_count == 2 {
+                self_.visit_type_4(&mut |inference| {
+                    result.push(inference);
+                    true
+                });
+            }
+            self_.visit_type_3(&mut |inference| {
+                result.push(inference);
+                true
+            });
+        }
+        result
     }
 
     fn discover_bug_cells(&mut self) -> bool {
@@ -304,13 +350,25 @@ impl<'a> BugSearch<'a> {
     }
 
     fn type_4(&self) -> Option<Inference> {
+        let mut result = None;
+        self.visit_type_4(&mut |inference| {
+            result = Some(inference);
+            false
+        });
+        result
+    }
+
+    fn visit_type_4(&self, emit: &mut dyn FnMut(Inference) -> bool) {
         let bug_cells = [self.bug_cells[0], self.bug_cells[1]];
-        let locked = self
+        let Some(locked) = self
             .grid
             .candidates(bug_cells[0])
             .intersect(self.grid.candidates(bug_cells[1]))
             .without(self.all_bug_values)
-            .single()?;
+            .single()
+        else {
+            return;
+        };
 
         for type_index in self.type_range() {
             if !self.region_type_enabled(type_index) {
@@ -343,44 +401,58 @@ impl<'a> BugSearch<'a> {
                     all_extra_values: self.all_bug_values,
                 },
             ) {
-                return Some(inference);
+                if !emit(inference) {
+                    return;
+                }
             }
         }
-        None
     }
 
     fn type_3(&self) -> Option<Inference> {
+        let mut result = None;
+        self.visit_type_3(&mut |inference| {
+            result = Some(inference);
+            false
+        });
+        result
+    }
+
+    fn visit_type_3(&self, emit: &mut dyn FnMut(Inference) -> bool) {
         if self.config.bug_fix {
             for degree in 2_u8..=6 {
                 for type_index in self.type_range() {
-                    if let Some(inference) = self.type_3_in_family(degree, type_index, true) {
-                        return Some(inference);
+                    if !self.visit_type_3_in_family(degree, type_index, true, emit) {
+                        return;
                     }
                 }
             }
         } else {
             for type_index in self.type_range() {
                 for degree in 2_u8..=6 {
-                    if let Some(inference) = self.type_3_in_family(degree, type_index, false) {
-                        return Some(inference);
+                    if !self.visit_type_3_in_family(degree, type_index, false, emit) {
+                        return;
                     }
                 }
             }
         }
-        None
     }
 
-    fn type_3_in_family(
+    fn visit_type_3_in_family(
         &self,
         degree: u8,
         type_index: usize,
         fixed_order: bool,
-    ) -> Option<Inference> {
+        emit: &mut dyn FnMut(Inference) -> bool,
+    ) -> bool {
         if !self.region_type_enabled(type_index) {
-            return None;
+            return true;
         }
-        let region = self.shared_region(type_index)?;
-        let common = self.common_cells?;
+        let Some(region) = self.shared_region(type_index) else {
+            return true;
+        };
+        let Some(common) = self.common_cells else {
+            return true;
+        };
         let mut region_cells = [cell(0); 9];
         let mut region_cell_count = 0;
         for common_cell in common.iter() {
@@ -395,7 +467,7 @@ impl<'a> BugSearch<'a> {
             }
         }
         if region_cell_count < usize::from(degree) {
-            return None;
+            return true;
         }
 
         let choose = degree - 1;
@@ -447,10 +519,12 @@ impl<'a> BugSearch<'a> {
                     generalized,
                 },
             ) {
-                return Some(inference);
+                if !emit(inference) {
+                    return false;
+                }
             }
         }
-        None
+        true
     }
 
     fn regional_type_3_removals(
@@ -593,7 +667,7 @@ mod tests {
         CandidateMask, ConstraintTopology, Digit, Grid, Puzzle, VariantConfig,
     };
 
-    use super::{cell, find_bivalue_universal_grave};
+    use super::{cell, collect_bivalue_universal_grave, find_bivalue_universal_grave};
     use crate::{BugKind, EngineConfig, Evidence, Inference, Rating, RatingMode};
 
     const SOLUTION: &str =
@@ -735,6 +809,58 @@ mod tests {
             panic!("BUG4 evidence");
         };
         assert_eq!(extra_values, [mask("8"), mask("9")]);
+    }
+
+    #[test]
+    fn full_collector_keeps_java_type_and_degree_order_and_compact_winner() {
+        for grid in [bug_grid(&[(0, "567")]), bug_grid(&[(0, "567"), (1, "347")])] {
+            let collected = collect_bivalue_universal_grave(&grid, EngineConfig::default());
+            assert_eq!(collected.len(), 1);
+            assert_eq!(
+                find_bivalue_universal_grave(&grid, EngineConfig::default()).as_ref(),
+                collected.first()
+            );
+        }
+
+        let type_four_and_three = bug_grid(&[(0, "568"), (3, "679")]);
+        let collected =
+            collect_bivalue_universal_grave(&type_four_and_three, EngineConfig::default());
+        assert_eq!(collected.len(), 10);
+        assert_eq!(
+            find_bivalue_universal_grave(&type_four_and_three, EngineConfig::default()).as_ref(),
+            collected.first()
+        );
+        assert_eq!(
+            collected
+                .iter()
+                .map(|hint| (hint.rating().tenths(), hint.name()))
+                .collect::<Vec<_>>(),
+            [
+                (57, "BUG type 4".to_owned()),
+                (58, "BUG type 3".to_owned()),
+                (59, "BUG type 3".to_owned()),
+                (59, "BUG type 3".to_owned()),
+                (60, "BUG type 3".to_owned()),
+                (60, "BUG type 3".to_owned()),
+                (61, "BUG type 3".to_owned()),
+                (61, "BUG type 3".to_owned()),
+                (62, "BUG type 3".to_owned()),
+                (62, "BUG type 3".to_owned()),
+            ]
+        );
+
+        let type_three = bug_grid(&[(0, "568"), (1, "349")]);
+        let collected = collect_bivalue_universal_grave(&type_three, EngineConfig::default());
+        assert_eq!(collected.len(), 22);
+        assert_eq!(
+            find_bivalue_universal_grave(&type_three, EngineConfig::default()).as_ref(),
+            collected.first()
+        );
+        assert_eq!(
+            collected[0].description(type_three.topology()),
+            collected[1].description(type_three.topology()),
+            "BUG hints retain Java identity equality rather than effect deduplication"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use sukaku_forge_core::{
-    CandidateMask, CandidateRemovalsBuilder, CellId, Digit, Grid, PositionMask, REGION_TYPE_COUNT,
-    RegionId,
+    CandidateMask, CandidateRemovalsBuilder, CellId, CellMask, Digit, Grid, PositionMask,
+    REGION_TYPE_COUNT, RegionId,
 };
 
 use crate::{EngineConfig, Evidence, Inference, Rating, RatingMode, Technique};
@@ -8,6 +8,23 @@ use crate::{EngineConfig, Evidence, Inference, Rating, RatingMode, Technique};
 /// Find the first Java-compatible Hidden Single inference.
 #[must_use]
 pub fn find_hidden_single(grid: &Grid, config: EngineConfig) -> Option<Inference> {
+    first_inference(|emit| visit_hidden_singles(grid, config, emit))
+}
+
+/// Collect every Java-compatible Hidden Single inference in discovery order.
+#[must_use]
+pub fn collect_hidden_singles(grid: &Grid, config: EngineConfig) -> Vec<Inference> {
+    collect_unique_inferences(
+        |emit| visit_hidden_singles(grid, config, emit),
+        direct_hint_equality_key,
+    )
+}
+
+fn visit_hidden_singles(
+    grid: &Grid,
+    config: EngineConfig,
+    emit: &mut dyn FnMut(Inference) -> bool,
+) {
     for alone_only in [true, false] {
         for type_index in hidden_set_family_order(grid, config) {
             for region_index in 0..grid.topology().region_count(type_index) {
@@ -36,23 +53,37 @@ pub fn find_hidden_single(grid: &Grid, config: EngineConfig) -> Option<Inference
                     } else {
                         Rating::from_tenths(15)
                     };
-                    return Some(Inference::placement(
+                    if !emit(Inference::placement(
                         Technique::HiddenSingle,
                         rating,
                         cell,
                         digit,
                         Evidence::HiddenSingle { region, alone },
-                    ));
+                    )) {
+                        return;
+                    }
                 }
             }
         }
     }
-    None
 }
 
 /// Find the first unresolved cell with exactly one candidate.
 #[must_use]
 pub fn find_naked_single(grid: &Grid, config: EngineConfig) -> Option<Inference> {
+    first_inference(|emit| visit_naked_singles(grid, config, emit))
+}
+
+/// Collect every unresolved cell with exactly one candidate, in cell order.
+#[must_use]
+pub fn collect_naked_singles(grid: &Grid, config: EngineConfig) -> Vec<Inference> {
+    collect_unique_inferences(
+        |emit| visit_naked_singles(grid, config, emit),
+        direct_hint_equality_key,
+    )
+}
+
+fn visit_naked_singles(grid: &Grid, config: EngineConfig, emit: &mut dyn FnMut(Inference) -> bool) {
     for raw_cell in 0_u8..81 {
         let cell = cell_id(raw_cell);
         if grid.value(cell) != 0 {
@@ -65,20 +96,38 @@ pub fn find_naked_single(grid: &Grid, config: EngineConfig) -> Option<Inference>
             RatingMode::Original => Rating::from_tenths(23),
             RatingMode::Revised => Rating::from_tenths(16),
         };
-        return Some(Inference::placement(
+        if !emit(Inference::placement(
             Technique::NakedSingle,
             rating,
             cell,
             digit,
             Evidence::NakedSingle,
-        ));
+        )) {
+            return;
+        }
     }
-    None
 }
 
 /// Find the first direct Hidden Pair or Triplet.
 #[must_use]
 pub fn find_direct_hidden_set(grid: &Grid, config: EngineConfig, degree: u8) -> Option<Inference> {
+    first_inference(|emit| visit_direct_hidden_sets(grid, config, degree, emit))
+}
+
+/// Collect every direct Hidden Pair or Triplet in Java discovery order.
+#[must_use]
+pub fn collect_direct_hidden_sets(grid: &Grid, config: EngineConfig, degree: u8) -> Vec<Inference> {
+    // DirectHiddenSetHint inherits Object identity: Java retains structurally
+    // equal discoveries, so this collector deliberately performs no dedup.
+    collect_inferences(|emit| visit_direct_hidden_sets(grid, config, degree, emit))
+}
+
+fn visit_direct_hidden_sets(
+    grid: &Grid,
+    config: EngineConfig,
+    degree: u8,
+    emit: &mut dyn FnMut(Inference) -> bool,
+) {
     assert!(matches!(degree, 2 | 3));
     for type_index in hidden_set_family_order(grid, config) {
         for region_index in 0..grid.topology().region_count(type_index) {
@@ -134,7 +183,7 @@ pub fn find_direct_hidden_set(grid: &Grid, config: EngineConfig, degree: u8) -> 
                         }
                         _ => unreachable!("degree is checked above"),
                     };
-                    return Some(Inference::placement(
+                    if !emit(Inference::placement(
                         technique,
                         rating,
                         target,
@@ -145,19 +194,33 @@ pub fn find_direct_hidden_set(grid: &Grid, config: EngineConfig, degree: u8) -> 
                             tuple_digits,
                             tuple_positions,
                         },
-                    ));
+                    )) {
+                        return;
+                    }
                 }
             }
         }
     }
-    None
 }
 
 /// Find the first direct Pointing/Claiming placement in Java producer order.
 #[must_use]
 pub fn find_direct_locking(grid: &Grid) -> Option<Inference> {
+    first_inference(|emit| visit_direct_locking(grid, emit))
+}
+
+/// Collect every direct Pointing/Claiming placement in Java discovery order.
+#[must_use]
+pub fn collect_direct_locking(grid: &Grid) -> Vec<Inference> {
+    collect_unique_inferences(
+        |emit| visit_direct_locking(grid, emit),
+        |inference| locking_hint_equality_key(grid, inference),
+    )
+}
+
+fn visit_direct_locking(grid: &Grid, emit: &mut dyn FnMut(Inference) -> bool) {
     if !grid.topology().config().blocks {
-        return None;
+        return;
     }
     for (primary_type, secondary_type) in locking_family_pairs(grid) {
         for value in 1_u8..=9 {
@@ -209,7 +272,7 @@ pub fn find_direct_locking(grid: &Grid) -> Option<Inference> {
                         } else {
                             (Technique::DirectClaiming, Rating::from_tenths(19))
                         };
-                        return Some(Inference::placement(
+                        if !emit(Inference::placement(
                             technique,
                             rating,
                             target,
@@ -219,20 +282,34 @@ pub fn find_direct_locking(grid: &Grid) -> Option<Inference> {
                                 secondary,
                                 pattern_positions,
                             },
-                        ));
+                        )) {
+                            return;
+                        }
                     }
                 }
             }
         }
     }
-    None
 }
 
 /// Find the first ordinary Pointing/Claiming elimination.
 #[must_use]
 pub fn find_locking(grid: &Grid) -> Option<Inference> {
+    first_inference(|emit| visit_locking(grid, emit))
+}
+
+/// Collect every ordinary Pointing/Claiming elimination in discovery order.
+#[must_use]
+pub fn collect_locking(grid: &Grid) -> Vec<Inference> {
+    collect_unique_inferences(
+        |emit| visit_locking(grid, emit),
+        |inference| locking_hint_equality_key(grid, inference),
+    )
+}
+
+fn visit_locking(grid: &Grid, emit: &mut dyn FnMut(Inference) -> bool) {
     if !grid.topology().config().blocks {
-        return None;
+        return;
     }
     for (primary_type, secondary_type) in locking_family_pairs(grid) {
         for value in 1_u8..=9 {
@@ -273,7 +350,7 @@ pub fn find_locking(grid: &Grid) -> Option<Inference> {
                     } else {
                         (Technique::Claiming, Rating::from_tenths(28))
                     };
-                    return Some(Inference::elimination(
+                    if !emit(Inference::elimination(
                         technique,
                         rating,
                         removals,
@@ -283,17 +360,30 @@ pub fn find_locking(grid: &Grid) -> Option<Inference> {
                             digit: candidate,
                             pattern_positions,
                         },
-                    ));
+                    )) {
+                        return;
+                    }
                 }
             }
         }
     }
-    None
 }
 
 /// Find the first Generalized Intersections elimination.
 #[must_use]
 pub fn find_generalized_intersections(grid: &Grid) -> Option<Inference> {
+    first_inference(|emit| visit_generalized_intersections(grid, emit))
+}
+
+/// Collect every Generalized Intersections elimination in discovery order.
+#[must_use]
+pub fn collect_generalized_intersections(grid: &Grid) -> Vec<Inference> {
+    // VLockingHint compares its freshly allocated Cell[] by reference, so no
+    // two producer discoveries compare equal in released Java.
+    collect_inferences(|emit| visit_generalized_intersections(grid, emit))
+}
+
+fn visit_generalized_intersections(grid: &Grid, emit: &mut dyn FnMut(Inference) -> bool) {
     for type_index in generalized_intersection_family_order(grid) {
         for value in 1_u8..=9 {
             let candidate = digit(value);
@@ -327,7 +417,7 @@ pub fn find_generalized_intersections(grid: &Grid) -> Option<Inference> {
                 if removals.is_empty() {
                     continue;
                 }
-                return Some(Inference::elimination(
+                if !emit(Inference::elimination(
                     Technique::GeneralizedIntersections,
                     Rating::from_tenths(29),
                     removals,
@@ -336,11 +426,101 @@ pub fn find_generalized_intersections(grid: &Grid) -> Option<Inference> {
                         digit: candidate,
                         locked_positions,
                     },
-                ));
+                )) {
+                    return;
+                }
             }
         }
     }
-    None
+}
+
+fn first_inference(visit: impl FnOnce(&mut dyn FnMut(Inference) -> bool)) -> Option<Inference> {
+    let mut first = None;
+    visit(&mut |inference| {
+        first = Some(inference);
+        false
+    });
+    first
+}
+
+fn collect_inferences(visit: impl FnOnce(&mut dyn FnMut(Inference) -> bool)) -> Vec<Inference> {
+    let mut inferences = Vec::new();
+    visit(&mut |inference| {
+        inferences.push(inference);
+        true
+    });
+    inferences
+}
+
+fn collect_unique_inferences<K: Eq>(
+    visit: impl FnOnce(&mut dyn FnMut(Inference) -> bool),
+    equality_key: impl Fn(&Inference) -> K,
+) -> Vec<Inference> {
+    let mut keys = Vec::new();
+    let mut inferences = Vec::new();
+    visit(&mut |inference| {
+        let key = equality_key(&inference);
+        if !keys.contains(&key) {
+            keys.push(key);
+            inferences.push(inference);
+        }
+        true
+    });
+    inferences
+}
+
+fn direct_hint_equality_key(inference: &Inference) -> (CellId, Digit) {
+    // DirectHint.equals also compares the producer instance; it is constant
+    // within either visitor, leaving cell and value as the local key.
+    (
+        inference.placement_cell().expect("direct hint placement"),
+        inference
+            .placement_digit()
+            .expect("direct hint placement digit"),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LockingHintEqualityKey {
+    // DirectLockingHint and LockingHint both compare only the candidate value
+    // and the unordered highlighted-cell set.
+    digit: Digit,
+    pattern_cell_count: u8,
+    pattern_cells: CellMask,
+}
+
+fn locking_hint_equality_key(grid: &Grid, inference: &Inference) -> LockingHintEqualityKey {
+    let (secondary, pattern_positions, digit) = match inference.evidence() {
+        Evidence::DirectLocking {
+            secondary,
+            pattern_positions,
+            ..
+        } => (
+            secondary,
+            pattern_positions,
+            inference
+                .placement_digit()
+                .expect("direct locking placement"),
+        ),
+        Evidence::Locking {
+            secondary,
+            digit,
+            pattern_positions,
+            ..
+        } => (secondary, pattern_positions, digit),
+        _ => unreachable!("locking equality key evidence"),
+    };
+    let mut pattern_cells = CellMask::EMPTY;
+    for position in pattern_positions.iter() {
+        pattern_cells.insert(cell_id(
+            grid.topology().region_cells(secondary)[usize::from(position)],
+        ));
+    }
+    LockingHintEqualityKey {
+        digit,
+        pattern_cell_count: pattern_positions.count() as u8,
+        pattern_cells,
+    }
 }
 
 fn hidden_set_family_order(grid: &Grid, config: EngineConfig) -> Vec<usize> {
@@ -409,8 +589,10 @@ mod tests {
     use sukaku_forge_core::{ConstraintTopology, Grid, Puzzle, VariantConfig};
 
     use super::{
-        find_direct_hidden_set, find_direct_locking, find_generalized_intersections,
-        find_hidden_single, find_locking, find_naked_single,
+        collect_direct_hidden_sets, collect_direct_locking, collect_generalized_intersections,
+        collect_hidden_singles, collect_locking, collect_naked_singles, find_direct_hidden_set,
+        find_direct_locking, find_generalized_intersections, find_hidden_single, find_locking,
+        find_naked_single,
     };
     use crate::{EngineConfig, Evidence, Rating, RatingMode, Technique};
 
@@ -425,6 +607,12 @@ mod tests {
             &puzzle,
         );
         let inference = find_hidden_single(&grid, EngineConfig::default()).unwrap();
+        assert_eq!(
+            Some(inference.clone()),
+            collect_hidden_singles(&grid, EngineConfig::default())
+                .first()
+                .cloned()
+        );
         assert_eq!(inference.placement_cell().unwrap().raw(), 8);
         assert_eq!(inference.placement_digit().unwrap().get(), 9);
         assert_eq!(inference.rating(), Rating::from_tenths(10));
@@ -432,6 +620,36 @@ mod tests {
             inference.evidence(),
             Evidence::HiddenSingle { alone: true, .. }
         ));
+    }
+
+    #[test]
+    fn hidden_single_dedup_matches_direct_hint_cell_value_equality() {
+        let mut solved =
+            "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
+                .chars()
+                .collect::<Vec<_>>();
+        solved[0] = '.';
+        let puzzle = Puzzle::parse(&solved.into_iter().collect::<String>()).unwrap();
+        let grid = Grid::from_puzzle(
+            Arc::new(ConstraintTopology::new(VariantConfig::default())),
+            &puzzle,
+        );
+
+        let mut raw = Vec::new();
+        super::visit_hidden_singles(&grid, EngineConfig::default(), &mut |inference| {
+            raw.push(inference);
+            true
+        });
+        assert_eq!(raw.len(), 3, "block, column, and row discoveries");
+
+        let retained = collect_hidden_singles(&grid, EngineConfig::default());
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            find_hidden_single(&grid, EngineConfig::default()),
+            retained.first().cloned()
+        );
+        assert_eq!(retained[0].placement_cell().unwrap().raw(), 0);
+        assert_eq!(retained[0].placement_digit().unwrap().get(), 5);
     }
 
     #[test]
@@ -452,6 +670,14 @@ mod tests {
         )
         .unwrap();
         let original = find_naked_single(&grid, EngineConfig::default()).unwrap();
+        let all = collect_naked_singles(&grid, EngineConfig::default());
+        assert_eq!(Some(original.clone()), all.first().cloned());
+        assert_eq!(
+            all.iter()
+                .map(|inference| inference.placement_cell().unwrap().raw())
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
         assert_eq!(original.placement_cell().unwrap().raw(), 1);
         assert_eq!(original.rating(), Rating::from_tenths(23));
         assert_eq!(
@@ -494,6 +720,12 @@ mod tests {
         )
         .unwrap();
         let inference = find_direct_hidden_set(&grid, EngineConfig::default(), 3).unwrap();
+        assert_eq!(
+            Some(inference.clone()),
+            collect_direct_hidden_sets(&grid, EngineConfig::default(), 3)
+                .first()
+                .cloned()
+        );
         assert_eq!(inference.technique(), Technique::DirectHiddenTriplet);
         assert_eq!(inference.rating(), Rating::from_tenths(25));
         assert_eq!(inference.placement_cell().unwrap().raw(), 8);
@@ -507,6 +739,40 @@ mod tests {
         assert!(
             grid.candidates(sukaku_forge_core::CellId::new(0).unwrap())
                 .contains(sukaku_forge_core::Digit::new(5).unwrap())
+        );
+    }
+
+    #[test]
+    fn direct_hidden_set_retains_identity_distinct_region_explanations() {
+        let values = Puzzle::parse(&".".repeat(81)).unwrap();
+        let mut display = ['.'; 729];
+        for (cell, digits) in [(0, &[1, 2, 3][..]), (1, &[1, 2]), (2, &[3])] {
+            for &value in digits {
+                display[cell * 9 + value - 1] = char::from(b'0' + value as u8);
+            }
+        }
+        let candidates = Puzzle::parse(&display.iter().collect::<String>()).unwrap();
+        let grid = Grid::from_snapshot(
+            Arc::new(ConstraintTopology::new(VariantConfig::default())),
+            &values,
+            &candidates,
+        )
+        .unwrap();
+
+        let retained = collect_direct_hidden_sets(&grid, EngineConfig::default(), 2);
+        assert_eq!(
+            retained
+                .iter()
+                .map(|inference| inference.description(grid.topology()))
+                .collect::<Vec<_>>(),
+            [
+                "Direct Hidden Pair: Cells r1c1,r1c2: 1,2 in block",
+                "Direct Hidden Pair: Cells r1c1,r1c2: 1,2 in row",
+            ]
+        );
+        assert_eq!(
+            find_direct_hidden_set(&grid, EngineConfig::default(), 2),
+            retained.first().cloned()
         );
     }
 
@@ -525,6 +791,10 @@ mod tests {
         )
         .unwrap();
         let inference = find_direct_locking(&grid).unwrap();
+        assert_eq!(
+            Some(inference.clone()),
+            collect_direct_locking(&grid).first().cloned()
+        );
         assert_eq!(inference.technique(), Technique::DirectPointing);
         assert_eq!(inference.rating(), Rating::from_tenths(17));
         assert_eq!(inference.placement_cell().unwrap().raw(), 28);
@@ -538,6 +808,40 @@ mod tests {
             grid.candidates(sukaku_forge_core::CellId::new(54).unwrap())
                 .contains(sukaku_forge_core::Digit::new(1).unwrap())
         );
+    }
+
+    #[test]
+    fn direct_locking_dedup_ignores_the_alternate_target() {
+        let values = Puzzle::parse(&".".repeat(81)).unwrap();
+        let mut display = ['.'; 729];
+        for cell in [0, 9, 27, 28, 54, 55] {
+            display[cell * 9] = '1';
+        }
+        let candidates = Puzzle::parse(&display.iter().collect::<String>()).unwrap();
+        let grid = Grid::from_snapshot(
+            Arc::new(ConstraintTopology::new(VariantConfig::default())),
+            &values,
+            &candidates,
+        )
+        .unwrap();
+
+        let mut raw = Vec::new();
+        super::visit_direct_locking(&grid, &mut |inference| {
+            raw.push(inference);
+            true
+        });
+        assert_eq!(raw.len(), 2);
+        assert_eq!(
+            raw.iter()
+                .map(|inference| inference.placement_cell().unwrap().raw())
+                .collect::<Vec<_>>(),
+            [28, 55]
+        );
+
+        let retained = collect_direct_locking(&grid);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(find_direct_locking(&grid), retained.first().cloned());
+        assert_eq!(retained[0].placement_cell().unwrap().raw(), 28);
     }
 
     #[test]
@@ -578,6 +882,10 @@ mod tests {
         )
         .unwrap();
         let inference = find_locking(&grid).unwrap();
+        assert_eq!(
+            Some(inference.clone()),
+            collect_locking(&grid).first().cloned()
+        );
         assert_eq!(inference.technique(), Technique::Pointing);
         assert_eq!(inference.rating(), Rating::from_tenths(26));
         assert_eq!(
@@ -621,6 +929,10 @@ mod tests {
         )
         .unwrap();
         let inference = find_generalized_intersections(&grid).unwrap();
+        assert_eq!(
+            Some(inference.clone()),
+            collect_generalized_intersections(&grid).first().cloned()
+        );
         assert_eq!(inference.technique(), Technique::GeneralizedIntersections);
         assert_eq!(inference.rating(), Rating::from_tenths(29));
         assert_eq!(

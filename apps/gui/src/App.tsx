@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   ApplicationPort,
   HintEffectsDto,
+  HintSummaryDto,
+  NonZeroDecimalString,
   RatingModeDto,
   VariantInputDto,
 } from './applicationPort'
@@ -70,6 +72,8 @@ const pendingMessage = (command: SessionControllerView['pendingCommand']) => {
   switch (command) {
     case 'create_session': return 'Creating puzzle session…'
     case 'next_hint': return 'Finding the next hint…'
+    case 'get_all_hints': return 'Collecting all applicable hints…'
+    case 'get_hint': return 'Loading the selected hint…'
     case 'apply_hint': return 'Applying the active hint…'
     case 'place_value': return 'Placing value…'
     case 'toggle_candidate': return 'Updating candidate…'
@@ -84,6 +88,16 @@ const statusDescriptor = (session: SessionControllerView, localNotice: string | 
   if (session.busy) return { state: 'running', message: pendingMessage(session.pendingCommand) }
   if (localNotice) return { state: 'idle', message: localNotice }
   if (!session.snapshot) return { state: 'idle', message: 'Waiting to create puzzle session…' }
+
+  if (session.hintCatalogResult?.kind === 'confirmation-required') {
+    return { state: 'idle', message: 'No ordinary hints found. Advanced hint search requires confirmation.' }
+  }
+  if (session.hintCatalogResult?.kind === 'complete' && session.hintCatalog.length === 0) {
+    return { state: 'idle', message: 'No applicable logical hints were found.' }
+  }
+  if (session.hintCatalogResult?.kind === 'incomplete' && session.hintCatalog.length === 0) {
+    return { state: 'idle', message: `Hint search incomplete: ${session.hintCatalogResult.gap.message}` }
+  }
 
   switch (session.hintResult?.kind) {
     case 'presented':
@@ -153,13 +167,68 @@ const hintItems = (hint: HintPresentation | null, result: HintResult | null): Hi
   return []
 }
 
-const emptyHintMessage = (result: HintResult | null) => {
+const catalogItems = (
+  catalog: HintSummaryDto[],
+  selectedId: NonZeroDecimalString | null,
+  result: HintResult | null,
+): HintBrowserItem[] => catalog.map((summary) => {
+  const selected = summary.hint_id === selectedId
+  const kind = !selected
+    ? 'available'
+    : result?.kind === 'presented'
+      ? 'presented'
+      : result?.kind === 'unsupported'
+        ? 'unsupported'
+        : result?.kind === 'incomplete'
+          ? 'incomplete'
+          : 'available'
+
+  return {
+    id: summary.hint_id,
+    label: summary.identity.name,
+    detail: effectSummary(summary.effects),
+    kind,
+    rating: summary.identity.rating_tenths / 10,
+    category: summary.category,
+    groupKey: summary.group_key,
+    groupName: summary.group_name,
+    techniqueKey: summary.identity.technique_key,
+    shortName: summary.identity.short_name,
+    effects: summary.effects,
+    filterEffects: summary.filter_effects,
+  }
+})
+
+const emptyHintMessage = (
+  result: HintResult | null,
+  catalogResult: SessionControllerView['hintCatalogResult'] = null,
+  catalogCount = 0,
+) => {
   if (result?.kind === 'none') return 'The engine reports no applicable next hint.'
   if (result?.kind === 'incomplete') return result.gap.message
+  if (catalogResult?.kind === 'confirmation-required') {
+    return 'Confirm an advanced search to include nested-chain techniques.'
+  }
+  if (catalogResult?.kind === 'complete') {
+    return catalogCount === 0
+      ? 'The engine found no applicable logical hints.'
+      : 'Select an available hint to load its proof and explanation.'
+  }
+  if (catalogResult?.kind === 'incomplete') return catalogResult.gap.message
   return 'Request the next hint to inspect its presentation and effects.'
 }
 
-function HintOutcomeDetails({ hint, result }: { hint: HintPresentation | null; result: HintResult | null }) {
+function HintOutcomeDetails({
+  hint,
+  result,
+  catalogResult,
+  catalogCount,
+}: {
+  hint: HintPresentation | null
+  result: HintResult | null
+  catalogResult: SessionControllerView['hintCatalogResult']
+  catalogCount: number
+}) {
   if (hint && result?.kind === 'presented') {
     const effects = [
       hint.placement ? `${cellName(hint.placement)} = ${hint.placement.digit}` : null,
@@ -203,11 +272,19 @@ function HintOutcomeDetails({ hint, result }: { hint: HintPresentation | null; r
 
   const heading = result?.kind === 'none'
     ? 'No applicable hint'
-    : result?.kind === 'incomplete' ? 'Hint search incomplete' : 'No hint requested'
+    : result?.kind === 'incomplete'
+      ? 'Hint search incomplete'
+      : catalogResult?.kind === 'confirmation-required'
+    ? 'Advanced search available'
+    : catalogResult?.kind === 'complete'
+      ? catalogCount === 0 ? 'No applicable logical hint' : 'Select a hint'
+      : catalogResult?.kind === 'incomplete'
+        ? 'Hint search incomplete'
+        : 'No hint requested'
   return (
     <section className="hint-details hint-details--empty" aria-labelledby="hint-details-title">
       <div className="details-title-row"><h2 id="hint-details-title">{heading}</h2></div>
-      <p>{emptyHintMessage(result)}</p>
+      <p>{emptyHintMessage(result, catalogResult, catalogCount)}</p>
     </section>
   )
 }
@@ -234,12 +311,22 @@ export function SessionWorkspace({
     ?? session.hint?.views[0]
     ?? null
   const items = useMemo(
-    () => hintItems(session.hint, session.hintResult),
-    [session.hint, session.hintResult],
+    () => session.hintCatalogResult == null
+      ? hintItems(session.hint, session.hintResult)
+      : catalogItems(session.hintCatalog, session.selectedHintId, session.hintResult),
+    [
+      session.hint,
+      session.hintCatalog,
+      session.hintCatalogResult,
+      session.hintResult,
+      session.selectedHintId,
+    ],
   )
   const status = statusDescriptor(session, localNotice)
   const sessionBusy = session.busy
   const createSession = session.createSession
+  const getAllHints = session.getAllHints
+  const selectHint = session.selectHint
   const sessionReady = session.snapshot != null && session.topology != null
   const canApply = session.hintResult?.kind === 'presented' || session.hintResult?.kind === 'unsupported'
   const variantPreset = variantPresetFromTopology(session.topology)
@@ -306,6 +393,15 @@ export function SessionWorkspace({
   const handleUndo = useCallback(() => run(session.undo), [run, session.undo])
   const handleRedo = useCallback(() => run(session.redo), [run, session.redo])
   const handleNextHint = useCallback(() => run(session.nextHint), [run, session.nextHint])
+  const handleAllHints = useCallback(() => {
+    run(() => getAllHints())
+  }, [getAllHints, run])
+  const handleAdvancedHints = useCallback(() => {
+    run(() => getAllHints(true))
+  }, [getAllHints, run])
+  const handleSelectHint = useCallback((hintId: NonZeroDecimalString) => {
+    run(() => selectHint(hintId))
+  }, [run, selectHint])
   const handleApply = useCallback(() => run(session.applyHint), [run, session.applyHint])
   const handleToggleCandidates = useCallback(() => {
     setCandidatesVisible((current) => !current)
@@ -357,7 +453,7 @@ export function SessionWorkspace({
 
     if (event.key === 'Delete' || event.key === 'Backspace') {
       event.preventDefault()
-      setLocalNotice('Clearing a value is not available in protocol v2.')
+      setLocalNotice('Clearing a value is not available in protocol v3.')
       return
     }
     if (!/^[1-9]$/.test(event.key)) return
@@ -397,6 +493,7 @@ export function SessionWorkspace({
       canUndo={Boolean(session.snapshot?.canUndo)}
       canRedo={Boolean(session.snapshot?.canRedo)}
       canRequestHint={session.snapshot != null}
+      canRequestAllHints={session.snapshot != null}
       canApply={canApply}
       candidatesVisible={candidatesVisible}
       candidateEntry={candidateEntry}
@@ -409,6 +506,7 @@ export function SessionWorkspace({
       onUndo={handleUndo}
       onRedo={handleRedo}
       onNextHint={handleNextHint}
+      onAllHints={handleAllHints}
       onApply={handleApply}
       onApplyAndNext={handleApplyAndContinue}
       onToggleCandidates={handleToggleCandidates}
@@ -430,6 +528,7 @@ export function SessionWorkspace({
         canUndo={Boolean(session.snapshot?.canUndo)}
         canRedo={Boolean(session.snapshot?.canRedo)}
         canRequestHint={session.snapshot != null}
+        canRequestAllHints={session.snapshot != null}
         canApply={canApply}
         candidatesVisible={candidatesVisible}
         candidateEntry={candidateEntry}
@@ -437,6 +536,7 @@ export function SessionWorkspace({
         onUndo={handleUndo}
         onRedo={handleRedo}
         onRequestHint={handleNextHint}
+        onRequestAllHints={handleAllHints}
         onToggleCandidates={handleToggleCandidates}
         onToggleCandidateEntry={handleToggleCandidateEntry}
         onApply={handleApply}
@@ -470,10 +570,23 @@ export function SessionWorkspace({
           >
             <HintBrowser
               items={items}
-              selectedId={items[0]?.id ?? null}
-              emptyMessage={emptyHintMessage(session.hintResult)}
+              selectedId={session.selectedHintId}
+              emptyMessage={emptyHintMessage(
+                session.hintResult,
+                session.hintCatalogResult,
+                session.hintCatalog.length,
+              )}
+              catalogResult={session.hintCatalogResult}
+              busy={session.busy}
+              onSelect={session.hintCatalogResult == null ? undefined : handleSelectHint}
+              onSearchAdvanced={handleAdvancedHints}
             />
-            <HintOutcomeDetails hint={session.hint} result={session.hintResult} />
+            <HintOutcomeDetails
+              hint={session.hint}
+              result={session.hintResult}
+              catalogResult={session.hintCatalogResult}
+              catalogCount={session.hintCatalog.length}
+            />
           </ViewTabs>
         </aside>
         <Explanation hint={session.hint} view={selectedView} applied={false} />

@@ -1,12 +1,25 @@
 use core::fmt;
 
-use sukaku_forge_core::{Grid, NonConsecutiveMode};
+use sukaku_forge_core::{
+    CellId, CellMask, Digit, Grid, NonConsecutiveMode, PositionMask, RegionId,
+};
 
 use crate::SelectedChainProof;
+use crate::nested_chains::{EffectKey, chaining_effect_key};
 use crate::{
-    EngineConfig, Evidence, Inference, LegacyFcPlusBoundary, NonConsecutiveHint,
-    NonConsecutiveHintKind, Rating, RatingResult, RatingTracker, SearchPolicy, Technique,
-    TechniqueGate, find_aligned_pair_exclusion, find_aligned_triplet_exclusion, find_alphabet_wing,
+    EngineConfig, Evidence, Inference, LegacyFcPlusBoundary, NonConsecutiveGeometry,
+    NonConsecutiveHint, NonConsecutiveHintKind, Rating, RatingMode, RatingResult, RatingTracker,
+    SearchPolicy, Technique, TechniqueGate, collect_aligned_pair_exclusions,
+    collect_aligned_triplet_exclusions, collect_alphabet_wing, collect_bivalue_universal_grave,
+    collect_direct_hidden_sets, collect_direct_locking, collect_dynamic_forcing_chain_plus_checked,
+    collect_dynamic_forcing_chains, collect_fish, collect_forcing_cell_ferz_non_consecutive,
+    collect_forcing_cell_non_consecutive, collect_forcing_chain_cycles, collect_four_strong_links,
+    collect_generalized_intersections, collect_hidden_sets, collect_hidden_singles,
+    collect_locked_ferz_non_consecutive, collect_locked_non_consecutive, collect_locking,
+    collect_multiple_forcing_chains, collect_naked_sets, collect_naked_singles,
+    collect_nested_forcing_chains_checked, collect_nishio_forcing_chains,
+    collect_three_strong_links, collect_two_strong_links, collect_unique_loop, collect_wings,
+    find_aligned_pair_exclusion, find_aligned_triplet_exclusion, find_alphabet_wing,
     find_bivalue_universal_grave, find_direct_hidden_set, find_direct_locking,
     find_dynamic_forcing_chain, find_dynamic_forcing_chain_plus_checked,
     find_dynamic_forcing_chain_plus_with_proof_checked, find_dynamic_forcing_chain_with_proof,
@@ -18,7 +31,10 @@ use crate::{
     find_naked_single, find_nested_forcing_chain_checked,
     find_nested_forcing_chain_with_proof_checked, find_nishio_forcing_chain,
     find_nishio_forcing_chain_with_proof, find_three_strong_links, find_two_strong_links,
-    find_unique_loop, find_wing,
+    find_unique_loop, find_wing, replay_dynamic_forcing_chain_plus_proof,
+    replay_dynamic_forcing_chain_proof, replay_forcing_chain_cycle_proof,
+    replay_multiple_forcing_chain_proof, replay_nested_forcing_chain_proof_checked,
+    replay_nishio_forcing_chain_proof,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,6 +70,420 @@ pub enum ProducerKind {
     LockedNonConsecutive,
     ForcingCellFerzNonConsecutive,
     LockedFerzNonConsecutive,
+}
+
+impl ProducerKind {
+    /// Whether this producer publishes a Java `ChainingHint` subtype.
+    #[must_use]
+    pub const fn is_chaining_hint(self) -> bool {
+        matches!(
+            self,
+            Self::ForcingChainCycle
+                | Self::NishioForcingChain
+                | Self::MultipleForcingChain
+                | Self::DynamicForcingChain
+                | Self::DynamicForcingChainPlus
+                | Self::NestedForcingChain { .. }
+        )
+    }
+
+    /// Stable identity of the legacy rule node that produced this hint.
+    #[must_use]
+    pub fn hint_group_key(self, inference: &Inference) -> &'static str {
+        match self {
+            Self::HiddenSingle => "hidden_single",
+            Self::NakedSingle => "naked_single",
+            Self::DirectLocking => "direct_intersections",
+            Self::DirectHiddenSet { degree: 2 } => "direct_hidden_pair",
+            Self::DirectHiddenSet { degree: 3 } => "direct_hidden_triplet",
+            Self::DirectHiddenSet { .. } => "direct_hidden_set",
+            Self::Locking => "intersections",
+            Self::GeneralizedIntersections => "generalized_intersections",
+            Self::NakedSet {
+                degree: 2,
+                generalized: false,
+            } => "naked_pair",
+            Self::NakedSet {
+                degree: 2,
+                generalized: true,
+            } => "generalized_naked_pair",
+            Self::NakedSet {
+                degree: 3,
+                generalized: false,
+            } => "naked_triplet",
+            Self::NakedSet {
+                degree: 3,
+                generalized: true,
+            } => "generalized_naked_triplet",
+            Self::NakedSet {
+                degree: 4,
+                generalized: false,
+            } => "naked_quad",
+            Self::NakedSet {
+                degree: 4,
+                generalized: true,
+            } => "generalized_naked_quad",
+            Self::NakedSet { .. } => "naked_set",
+            Self::Fish { degree: 2 } => "x_wing",
+            Self::Fish { degree: 3 } => "swordfish",
+            Self::Fish { degree: 4 } => "jellyfish",
+            Self::Fish { .. } => "fish",
+            Self::HiddenSet { degree: 2 } => "hidden_pair",
+            Self::HiddenSet { degree: 3 } => "hidden_triplet",
+            Self::HiddenSet { degree: 4 } => "hidden_quad",
+            Self::HiddenSet { .. } => "hidden_set",
+            Self::TurbotFish => match inference.evidence() {
+                Evidence::TwoStrongLinks {
+                    rating_mode: RatingMode::Original,
+                    ..
+                } => "two_strong_links",
+                Evidence::TwoStrongLinks { .. } => "turbot_fishes",
+                _ => "two_strong_links",
+            },
+            Self::XYWing | Self::XYZWing => "xy_wings",
+            Self::UniqueLoops | Self::BivalueUniversalGrave => "unique_patterns",
+            Self::StrongLinks { degree: 3 } => "three_strong_links",
+            Self::StrongLinks { degree: 4 } => "four_strong_links",
+            Self::StrongLinks { .. } => "strong_links",
+            Self::WXYZWing => "wxyz_wing",
+            Self::VWXYZWing => "vwxyz_wing",
+            Self::AlignedPairExclusion => "aligned_pair_exclusion",
+            Self::UVWXYZWing => "uvwxyz_wing",
+            Self::ForcingChainCycle => "forcing_chains_cycles",
+            Self::TUVWXYZWing => "tuvwxyz_wing",
+            Self::AlignedTripletExclusion => "aligned_triplet_exclusion",
+            Self::NishioForcingChain => "nishio_forcing_chains",
+            Self::MultipleForcingChain => "multiple_forcing_chains",
+            Self::DynamicForcingChain => "dynamic_forcing_chains",
+            Self::DynamicForcingChainPlus => "dynamic_forcing_chains_plus",
+            Self::NestedForcingChain { level: 2, .. } => "nested_forcing_chains_l2",
+            Self::NestedForcingChain { level: 3, .. } => "nested_forcing_chains_l3",
+            Self::NestedForcingChain { level: 4, .. } => "nested_forcing_chains_l4",
+            Self::NestedForcingChain { .. } => "nested_forcing_chains",
+            Self::ForcingCellNonConsecutive | Self::ForcingCellFerzNonConsecutive => {
+                "non_consecutive_forcing_cell"
+            }
+            Self::LockedNonConsecutive | Self::LockedFerzNonConsecutive => "locked_non_consecutive",
+        }
+    }
+
+    /// Display label of the legacy rule tree node.
+    #[must_use]
+    pub fn hint_group_name(self, inference: &Inference) -> &'static str {
+        match self {
+            Self::DirectLocking => "Direct Intersections",
+            Self::Locking => "Intersections",
+            Self::TurbotFish => match inference.evidence() {
+                Evidence::TwoStrongLinks {
+                    rating_mode: RatingMode::Original,
+                    ..
+                } => "2 Strong links",
+                Evidence::TwoStrongLinks { .. } => "Turbot Fishes",
+                _ => "2 Strong links",
+            },
+            Self::XYWing | Self::XYZWing => "XY-Wings",
+            Self::UniqueLoops | Self::BivalueUniversalGrave => "Unique patterns",
+            Self::ForcingChainCycle => "Forcing Chains & Cycles",
+            Self::NishioForcingChain => "Nishio Forcing Chains",
+            Self::MultipleForcingChain => "Multiple Forcing Chains",
+            Self::DynamicForcingChain => "Dynamic Forcing Chains",
+            Self::DynamicForcingChainPlus => "Dynamic Forcing Chains (+)",
+            Self::NestedForcingChain { level: 2, .. } => {
+                "Dynamic Forcing Chains (+ Forcing Chains)"
+            }
+            Self::NestedForcingChain { level: 3, .. } => {
+                "Dynamic Forcing Chains (+ Multiple Forcing Chains)"
+            }
+            Self::NestedForcingChain { level: 4, .. } => {
+                "Dynamic Forcing Chains (+ Dynamic Forcing Chains)"
+            }
+            Self::NestedForcingChain { .. } => "Nested Forcing Chains",
+            Self::ForcingCellNonConsecutive | Self::ForcingCellFerzNonConsecutive => {
+                "NC Forcing Cell"
+            }
+            Self::LockedNonConsecutive | Self::LockedFerzNonConsecutive => "Locked NC",
+            _ => self.default_hint_group_name(),
+        }
+    }
+
+    const fn default_hint_group_name(self) -> &'static str {
+        match self {
+            Self::HiddenSingle => "Hidden Single",
+            Self::NakedSingle => "Naked Single",
+            Self::DirectHiddenSet { degree: 2 } => "Direct Hidden Pair",
+            Self::DirectHiddenSet { degree: 3 } => "Direct Hidden Triplet",
+            Self::DirectHiddenSet { .. } => "Direct Hidden Set",
+            Self::GeneralizedIntersections => "Generalized Intersections",
+            Self::NakedSet {
+                degree: 2,
+                generalized: false,
+            } => "Naked Pair",
+            Self::NakedSet {
+                degree: 2,
+                generalized: true,
+            } => "Generalized Naked Pair",
+            Self::NakedSet {
+                degree: 3,
+                generalized: false,
+            } => "Naked Triplet",
+            Self::NakedSet {
+                degree: 3,
+                generalized: true,
+            } => "Generalized Naked Triplet",
+            Self::NakedSet {
+                degree: 4,
+                generalized: false,
+            } => "Naked Quad",
+            Self::NakedSet {
+                degree: 4,
+                generalized: true,
+            } => "Generalized Naked Quad",
+            Self::NakedSet { .. } => "Naked Set",
+            Self::Fish { degree: 2 } => "X-Wing",
+            Self::Fish { degree: 3 } => "Swordfish",
+            Self::Fish { degree: 4 } => "Jellyfish",
+            Self::Fish { .. } => "Fish",
+            Self::HiddenSet { degree: 2 } => "Hidden Pair",
+            Self::HiddenSet { degree: 3 } => "Hidden Triplet",
+            Self::HiddenSet { degree: 4 } => "Hidden Quad",
+            Self::HiddenSet { .. } => "Hidden Set",
+            Self::TurbotFish => "Turbot Fish",
+            Self::XYWing | Self::XYZWing => "XY-Wings",
+            Self::StrongLinks { degree: 3 } => "3 Strong links",
+            Self::StrongLinks { degree: 4 } => "4 Strong links",
+            Self::StrongLinks { .. } => "Strong links",
+            Self::WXYZWing => "WXYZ-Wing",
+            Self::VWXYZWing => "VWXYZ-Wing",
+            Self::AlignedPairExclusion => "Aligned Pair Exclusion",
+            Self::UVWXYZWing => "UVWXYZ-Wing",
+            Self::TUVWXYZWing => "TUVWXYZ-Wing",
+            Self::AlignedTripletExclusion => "Aligned Triplet Exclusion",
+            Self::ForcingCellNonConsecutive
+            | Self::LockedNonConsecutive
+            | Self::ForcingCellFerzNonConsecutive
+            | Self::LockedFerzNonConsecutive
+            | Self::BivalueUniversalGrave => unreachable!(),
+            Self::DirectLocking
+            | Self::Locking
+            | Self::UniqueLoops
+            | Self::ForcingChainCycle
+            | Self::NishioForcingChain
+            | Self::MultipleForcingChain
+            | Self::DynamicForcingChain
+            | Self::DynamicForcingChainPlus
+            | Self::NestedForcingChain { .. } => unreachable!(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProducerBand {
+    Direct,
+    Indirect,
+    Chaining,
+    ChainingPlus,
+    Advanced,
+}
+
+const fn producer_band(kind: ProducerKind) -> ProducerBand {
+    match kind {
+        ProducerKind::HiddenSingle
+        | ProducerKind::NakedSingle
+        | ProducerKind::DirectLocking
+        | ProducerKind::DirectHiddenSet { .. }
+        | ProducerKind::ForcingCellNonConsecutive
+        | ProducerKind::LockedNonConsecutive
+        | ProducerKind::ForcingCellFerzNonConsecutive
+        | ProducerKind::LockedFerzNonConsecutive => ProducerBand::Direct,
+        ProducerKind::ForcingChainCycle
+        | ProducerKind::TUVWXYZWing
+        | ProducerKind::AlignedTripletExclusion
+        | ProducerKind::NishioForcingChain
+        | ProducerKind::MultipleForcingChain
+        | ProducerKind::DynamicForcingChain => ProducerBand::Chaining,
+        ProducerKind::DynamicForcingChainPlus => ProducerBand::ChainingPlus,
+        ProducerKind::NestedForcingChain { .. } => ProducerBand::Advanced,
+        _ => ProducerBand::Indirect,
+    }
+}
+
+// Swing's HintsTreeBuilder groups by concrete Java hint subtype, not by the
+// producer tier used by Solver.getAllHints. Direct hidden sets, direct locking,
+// and non-consecutive direct producers all publish IndirectHint instances.
+const fn hint_category(kind: ProducerKind) -> HintCategory {
+    match kind {
+        ProducerKind::HiddenSingle | ProducerKind::NakedSingle => HintCategory::Direct,
+        _ => HintCategory::Indirect,
+    }
+}
+
+const fn is_chaining_hint(kind: ProducerKind) -> bool {
+    kind.is_chaining_hint()
+}
+
+const fn is_locking_hint(kind: ProducerKind) -> bool {
+    matches!(kind, ProducerKind::Locking | ProducerKind::Fish { .. })
+}
+
+const fn is_wing_hint(kind: ProducerKind) -> bool {
+    matches!(kind, ProducerKind::XYWing | ProducerKind::XYZWing)
+}
+
+const fn is_aligned_exclusion_hint(kind: ProducerKind) -> bool {
+    matches!(
+        kind,
+        ProducerKind::AlignedPairExclusion | ProducerKind::AlignedTripletExclusion
+    )
+}
+
+fn region_position_cells(grid: &Grid, region: RegionId, positions: PositionMask) -> CellMask {
+    let mut cells = CellMask::EMPTY;
+    for position in positions.iter() {
+        let raw = grid.topology().region_cells(region)[usize::from(position)];
+        cells.insert(CellId::new(raw).expect("topology stores valid cell indexes"));
+    }
+    cells
+}
+
+fn direct_locking_key(grid: &Grid, inference: &Inference) -> Option<(Digit, CellMask)> {
+    let Evidence::DirectLocking {
+        secondary,
+        pattern_positions,
+        ..
+    } = inference.evidence()
+    else {
+        return None;
+    };
+    Some((
+        inference.placement_digit()?,
+        region_position_cells(grid, secondary, pattern_positions),
+    ))
+}
+
+fn locking_key(grid: &Grid, inference: &Inference) -> Option<(Digit, CellMask)> {
+    match inference.evidence() {
+        Evidence::Locking {
+            secondary,
+            digit,
+            pattern_positions,
+            ..
+        } => Some((
+            digit,
+            region_position_cells(grid, secondary, pattern_positions),
+        )),
+        Evidence::Fish {
+            digit,
+            selected_cells,
+            ..
+        } => {
+            let mut cells = CellMask::EMPTY;
+            for cell in selected_cells.iter() {
+                cells.insert(cell);
+            }
+            Some((digit, cells))
+        }
+        _ => None,
+    }
+}
+
+fn wing_key(kind: ProducerKind, inference: &Inference) -> Option<(bool, CellId, Digit, CellMask)> {
+    let Evidence::Wing {
+        pivot,
+        xz,
+        yz,
+        digit,
+    } = inference.evidence()
+    else {
+        return None;
+    };
+    let mut pincers = CellMask::EMPTY;
+    pincers.insert(xz);
+    pincers.insert(yz);
+    Some((kind == ProducerKind::XYZWing, pivot, digit, pincers))
+}
+
+fn aligned_exclusion_key(inference: &Inference) -> Option<(CellMask, EffectKey)> {
+    let mut cells = CellMask::EMPTY;
+    match inference.evidence() {
+        Evidence::AlignedPairExclusion {
+            cells: base_cells, ..
+        } => {
+            for cell in base_cells {
+                cells.insert(cell);
+            }
+        }
+        Evidence::AlignedTripletExclusion {
+            cells: base_cells, ..
+        } => {
+            for cell in base_cells {
+                cells.insert(cell);
+            }
+        }
+        _ => return None,
+    }
+    Some((cells, EffectKey::new(inference.removals())))
+}
+
+fn non_consecutive_forcing_key(inference: &Inference) -> Option<(NonConsecutiveGeometry, CellId)> {
+    match inference.evidence() {
+        Evidence::NonConsecutive {
+            geometry,
+            kind: NonConsecutiveHintKind::ForcingCell { cell, .. },
+        } => Some((geometry, cell)),
+        _ => None,
+    }
+}
+
+/// Released `DefaultHintsAccumulator` calls `candidate.equals(existing)`.
+/// This models only equality families that cross producer calls; concrete
+/// collector-local equality and its historical quirks remain in each producer.
+fn java_hint_equals(
+    grid: &Grid,
+    candidate_kind: ProducerKind,
+    candidate: &Inference,
+    existing: &CollectedInference,
+) -> bool {
+    let existing_kind = existing.producer;
+    let existing_inference = &existing.inference;
+
+    match candidate_kind {
+        ProducerKind::HiddenSingle | ProducerKind::NakedSingle => {
+            candidate_kind == existing_kind
+                && candidate.placement_cell() == existing_inference.placement_cell()
+                && candidate.placement_digit() == existing_inference.placement_digit()
+        }
+        ProducerKind::DirectLocking => {
+            existing_kind == ProducerKind::DirectLocking
+                && direct_locking_key(grid, candidate)
+                    == direct_locking_key(grid, existing_inference)
+        }
+        kind if is_locking_hint(kind) => {
+            is_locking_hint(existing_kind)
+                && locking_key(grid, candidate) == locking_key(grid, existing_inference)
+        }
+        kind if is_wing_hint(kind) => {
+            is_wing_hint(existing_kind)
+                && wing_key(kind, candidate) == wing_key(existing_kind, existing_inference)
+        }
+        kind if is_aligned_exclusion_hint(kind) => {
+            is_aligned_exclusion_hint(existing_kind)
+                && aligned_exclusion_key(candidate) == aligned_exclusion_key(existing_inference)
+        }
+        kind if is_chaining_hint(kind) => {
+            is_chaining_hint(existing_kind)
+                && chaining_effect_key(grid, candidate)
+                    == chaining_effect_key(grid, existing_inference)
+        }
+        ProducerKind::ForcingCellNonConsecutive | ProducerKind::ForcingCellFerzNonConsecutive => {
+            matches!(
+                existing_kind,
+                ProducerKind::ForcingCellNonConsecutive
+                    | ProducerKind::ForcingCellFerzNonConsecutive
+            ) && non_consecutive_forcing_key(candidate)
+                == non_consecutive_forcing_key(existing_inference)
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,6 +578,54 @@ pub enum PresentationSearchOutcome {
     Found(PresentationInference),
     None,
     Incomplete(PortGap),
+}
+
+/// Legacy GUI classification used to build the two solving-hint tree roots.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HintCategory {
+    Direct,
+    Indirect,
+}
+
+/// One inference from the opt-in, insertion-ordered all-hints search.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectedInference {
+    producer: ProducerKind,
+    category: HintCategory,
+    inference: Inference,
+}
+
+impl CollectedInference {
+    #[must_use]
+    pub const fn producer(&self) -> ProducerKind {
+        self.producer
+    }
+
+    #[must_use]
+    pub const fn category(&self) -> HintCategory {
+        self.category
+    }
+
+    #[must_use]
+    pub const fn inference(&self) -> &Inference {
+        &self.inference
+    }
+
+    #[must_use]
+    pub fn into_inference(self) -> Inference {
+        self.inference
+    }
+}
+
+/// Result of the opt-in legacy `Get all hints` search.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AllHintsSearchOutcome {
+    Complete(Vec<CollectedInference>),
+    ConfirmationRequired,
+    Incomplete {
+        hints: Vec<CollectedInference>,
+        gap: PortGap,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -668,6 +1146,236 @@ impl Solver {
         result
     }
 
+    /// Collect the complete legacy GUI hint tier for the current grid.
+    ///
+    /// This path is deliberately separate from [`Self::next_inference`] and
+    /// [`Self::rate`]. It may allocate many inferences, but it never changes
+    /// the compact first-hint/rating path. Java gathers every direct and
+    /// indirect producer first, enters the ordinary chaining band only when
+    /// that result is empty, then DFC+, and finally the first productive
+    /// nested producer after an explicit expensive-search confirmation.
+    #[must_use]
+    pub fn all_inferences(&self, grid: &Grid, include_expensive: bool) -> AllHintsSearchOutcome {
+        if grid.is_solved() {
+            return AllHintsSearchOutcome::Complete(Vec::new());
+        }
+
+        let specs = self.producer_specs(grid);
+        let mut hints = Vec::new();
+
+        for band in [ProducerBand::Direct, ProducerBand::Indirect] {
+            if let Err(gap) = self.collect_band(grid, &specs, band, &mut hints) {
+                return AllHintsSearchOutcome::Incomplete { hints, gap };
+            }
+        }
+        if !hints.is_empty() {
+            return AllHintsSearchOutcome::Complete(hints);
+        }
+
+        if let Err(gap) = self.collect_band(grid, &specs, ProducerBand::Chaining, &mut hints) {
+            return AllHintsSearchOutcome::Incomplete { hints, gap };
+        }
+        if !hints.is_empty() {
+            return AllHintsSearchOutcome::Complete(hints);
+        }
+
+        if let Err(gap) = self.collect_band(grid, &specs, ProducerBand::ChainingPlus, &mut hints) {
+            return AllHintsSearchOutcome::Incomplete { hints, gap };
+        }
+        if !hints.is_empty() {
+            return AllHintsSearchOutcome::Complete(hints);
+        }
+
+        let has_advanced = specs
+            .iter()
+            .any(|producer| producer_band(producer.kind) == ProducerBand::Advanced);
+        if has_advanced && !include_expensive {
+            return AllHintsSearchOutcome::ConfirmationRequired;
+        }
+
+        for producer in specs
+            .iter()
+            .copied()
+            .filter(|producer| producer_band(producer.kind) == ProducerBand::Advanced)
+        {
+            if let Err(gap) = self.collect_producer(grid, producer, &mut hints) {
+                return AllHintsSearchOutcome::Incomplete { hints, gap };
+            }
+            if !hints.is_empty() {
+                return AllHintsSearchOutcome::Complete(hints);
+            }
+        }
+
+        AllHintsSearchOutcome::Complete(hints)
+    }
+
+    fn collect_band(
+        &self,
+        grid: &Grid,
+        specs: &[ProducerSpec],
+        band: ProducerBand,
+        hints: &mut Vec<CollectedInference>,
+    ) -> Result<(), PortGap> {
+        for producer in specs
+            .iter()
+            .copied()
+            .filter(|producer| producer_band(producer.kind) == band)
+        {
+            self.collect_producer(grid, producer, hints)?;
+        }
+        Ok(())
+    }
+
+    fn collect_producer(
+        &self,
+        grid: &Grid,
+        producer: ProducerSpec,
+        hints: &mut Vec<CollectedInference>,
+    ) -> Result<(), PortGap> {
+        match producer.state {
+            ProducerState::KnownEmpty => return Ok(()),
+            ProducerState::Unported => return Err(PortGap::Producer(producer.kind)),
+            ProducerState::Ported => {}
+        }
+
+        let inferences = match producer.kind {
+            ProducerKind::HiddenSingle => collect_hidden_singles(grid, self.config),
+            ProducerKind::NakedSingle => collect_naked_singles(grid, self.config),
+            ProducerKind::ForcingCellNonConsecutive => collect_forcing_cell_non_consecutive(grid)
+                .into_iter()
+                .map(non_consecutive_inference)
+                .collect(),
+            ProducerKind::LockedNonConsecutive => collect_locked_non_consecutive(grid)
+                .into_iter()
+                .map(non_consecutive_inference)
+                .collect(),
+            ProducerKind::ForcingCellFerzNonConsecutive => {
+                collect_forcing_cell_ferz_non_consecutive(grid)
+                    .into_iter()
+                    .map(non_consecutive_inference)
+                    .collect()
+            }
+            ProducerKind::LockedFerzNonConsecutive => collect_locked_ferz_non_consecutive(grid)
+                .into_iter()
+                .map(non_consecutive_inference)
+                .collect(),
+            ProducerKind::DirectLocking => collect_direct_locking(grid),
+            ProducerKind::DirectHiddenSet { degree } => {
+                collect_direct_hidden_sets(grid, self.config, degree)
+            }
+            ProducerKind::Locking => collect_locking(grid),
+            ProducerKind::GeneralizedIntersections => collect_generalized_intersections(grid),
+            ProducerKind::NakedSet {
+                degree,
+                generalized,
+            } => collect_naked_sets(grid, self.config, degree, generalized),
+            ProducerKind::Fish { degree } => collect_fish(grid, self.config, degree),
+            ProducerKind::HiddenSet { degree } => collect_hidden_sets(grid, self.config, degree),
+            ProducerKind::TurbotFish => collect_two_strong_links(grid, self.config),
+            ProducerKind::XYWing => collect_wings(grid, false),
+            ProducerKind::XYZWing => collect_wings(grid, true),
+            ProducerKind::UniqueLoops => collect_unique_loop(grid, self.config),
+            ProducerKind::StrongLinks { degree: 3 } => {
+                collect_three_strong_links(grid, self.config)
+            }
+            ProducerKind::StrongLinks { degree: 4 } => collect_four_strong_links(grid, self.config),
+            ProducerKind::WXYZWing => collect_alphabet_wing(grid, 4),
+            ProducerKind::BivalueUniversalGrave => {
+                collect_bivalue_universal_grave(grid, self.config)
+            }
+            ProducerKind::VWXYZWing => collect_alphabet_wing(grid, 5),
+            ProducerKind::AlignedPairExclusion => collect_aligned_pair_exclusions(grid),
+            ProducerKind::UVWXYZWing => collect_alphabet_wing(grid, 6),
+            ProducerKind::ForcingChainCycle => collect_forcing_chain_cycles(grid, self.config),
+            ProducerKind::TUVWXYZWing => collect_alphabet_wing(grid, 7),
+            ProducerKind::AlignedTripletExclusion => collect_aligned_triplet_exclusions(grid),
+            ProducerKind::NishioForcingChain => collect_nishio_forcing_chains(grid, self.config),
+            ProducerKind::MultipleForcingChain => {
+                collect_multiple_forcing_chains(grid, self.config)
+            }
+            ProducerKind::DynamicForcingChain => collect_dynamic_forcing_chains(grid, self.config),
+            ProducerKind::DynamicForcingChainPlus => {
+                collect_dynamic_forcing_chain_plus_checked(grid, self.config)
+                    .map_err(PortGap::LegacyFcPlus2)?
+            }
+            ProducerKind::NestedForcingChain {
+                level,
+                nesting_limit,
+            } => collect_nested_forcing_chains_checked(grid, self.config, level, nesting_limit)
+                .map_err(PortGap::LegacyFcPlus2)?,
+            ProducerKind::StrongLinks { .. } => {
+                unreachable!("unported producers stop before all-hints dispatch")
+            }
+        };
+
+        let category = hint_category(producer.kind);
+        // DefaultHintsAccumulator calls candidate.equals(existing) in this
+        // exact sequence. Most collectors implement their concrete Java hint
+        // equality locally; this final pass covers equality families that span
+        // producer instances. Never use structural `Inference` equality here:
+        // several released hint classes intentionally retain identity-equal
+        // duplicates.
+        for inference in inferences {
+            if hints
+                .iter()
+                .any(|existing| java_hint_equals(grid, producer.kind, &inference, existing))
+            {
+                continue;
+            }
+            hints.push(CollectedInference {
+                producer: producer.kind,
+                category,
+                inference,
+            });
+        }
+        Ok(())
+    }
+
+    /// Rebuild presentation proof data for one retained all-hints inference.
+    /// Non-chain families require no extra proof and return `Ok(None)`.
+    pub fn replay_selected_proof(
+        &self,
+        grid: &Grid,
+        producer: ProducerKind,
+        inference: &Inference,
+    ) -> Result<Option<SelectedChainProof>, PortGap> {
+        let proof = match producer {
+            ProducerKind::ForcingChainCycle => {
+                replay_forcing_chain_cycle_proof(grid, self.config, inference)
+            }
+            ProducerKind::NishioForcingChain => {
+                replay_nishio_forcing_chain_proof(grid, self.config, inference)
+            }
+            ProducerKind::MultipleForcingChain => {
+                replay_multiple_forcing_chain_proof(grid, self.config, inference)
+            }
+            ProducerKind::DynamicForcingChain => {
+                replay_dynamic_forcing_chain_proof(grid, self.config, inference)
+            }
+            ProducerKind::DynamicForcingChainPlus => {
+                return replay_dynamic_forcing_chain_plus_proof(grid, self.config, inference)
+                    .map(Some)
+                    .map_err(PortGap::LegacyFcPlus2);
+            }
+            ProducerKind::NestedForcingChain {
+                level,
+                nesting_limit,
+            } => {
+                return replay_nested_forcing_chain_proof_checked(
+                    grid,
+                    self.config,
+                    level,
+                    nesting_limit,
+                    inference,
+                )
+                .map(Some)
+                .map_err(PortGap::LegacyFcPlus2);
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(proof))
+    }
+
     #[must_use]
     pub fn next_inference(&self, grid: &Grid) -> SearchOutcome {
         if grid.is_solved() {
@@ -1045,7 +1753,8 @@ mod tests {
     use sukaku_forge_core::{ConstraintTopology, Grid, NonConsecutiveMode, Puzzle, VariantConfig};
 
     use super::{
-        PortGap, PresentationSearchOutcome, ProducerKind, ProducerState, SearchOutcome, Solver,
+        AllHintsSearchOutcome, HintCategory, PortGap, PresentationSearchOutcome, ProducerKind,
+        ProducerState, SearchOutcome, Solver,
     };
     use crate::{
         ChainProofViewKind, EngineConfig, LegacyFcPlusBoundary, Rating, RatingMode, SearchPolicy,
@@ -1315,6 +2024,52 @@ mod tests {
                     nesting_limit: 3,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn all_hints_collects_the_complete_direct_tier_without_changing_next() {
+        let puzzle = Puzzle::parse(&format!("12345678.45678912.{}", ".".repeat(63))).unwrap();
+        let grid = Grid::from_puzzle(
+            Arc::new(ConstraintTopology::new(VariantConfig::default())),
+            &puzzle,
+        );
+        let solver = Solver::default();
+        let SearchOutcome::Found(next) = solver.next_inference(&grid) else {
+            panic!("fixture must have a next inference");
+        };
+        let AllHintsSearchOutcome::Complete(hints) = solver.all_inferences(&grid, false) else {
+            panic!("ordinary direct tier must be complete");
+        };
+
+        assert!(hints.len() >= 2);
+        assert_eq!(hints[0].inference(), &next);
+        assert_eq!(hints[0].category(), HintCategory::Direct);
+        assert_eq!(hints[0].inference().placement_cell().unwrap().raw(), 8);
+        assert_eq!(hints[1].inference().placement_cell().unwrap().raw(), 17);
+    }
+
+    #[test]
+    fn legacy_hint_tree_category_follows_java_hint_subtype_not_search_tier() {
+        assert_eq!(
+            super::hint_category(ProducerKind::HiddenSingle),
+            HintCategory::Direct
+        );
+        assert_eq!(
+            super::hint_category(ProducerKind::NakedSingle),
+            HintCategory::Direct
+        );
+        assert_eq!(
+            super::hint_category(ProducerKind::DirectLocking),
+            HintCategory::Indirect
+        );
+        assert_eq!(
+            super::hint_category(ProducerKind::DirectHiddenSet { degree: 2 }),
+            HintCategory::Indirect
+        );
+        assert_eq!(
+            super::hint_category(ProducerKind::ForcingCellNonConsecutive),
+            HintCategory::Indirect
         );
     }
 

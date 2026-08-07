@@ -46,7 +46,7 @@ These packages are unsigned until Windows Authenticode signing credentials are
 configured.
 
 Production session state comes only from authoritative Rust snapshots through
-the validated protocol-v2 `ApplicationPort`. The typed Classic fixture remains
+the validated protocol-v3 `ApplicationPort`. The typed Classic fixture remains
 only for test-only renderer, component and session-view coverage.
 Candidate masks use the same wire bits as Rust and Java: digit `d` is `1 << d`
 and the full mask is `0x03fe`.
@@ -70,11 +70,13 @@ The current shell boots a built-in Classic puzzle and exposes the legacy-style
 puzzles, 81-character value-grid import (`.` or `0` for empty cells),
 next/apply/apply-and-next, value and candidate entry, candidate visibility,
 undo/redo, persistent light/dark themes, original/revised rating mode, and
-Classic, Anti-knight, and Sudoku X session presets. Solver settings can be
-changed only while the session is at its original puzzle state, because the
-change recreates the authoritative Rust session.
+Classic, Anti-knight, and Sudoku X session presets. Get all hints preserves the
+legacy tier and producer order, filters similar outcomes by default, and
+materializes only the selected proof. Solver settings can be changed only while
+the session is at its original puzzle state, because the change recreates the
+authoritative Rust session.
 
-Value clearing, filesystem open/save, all-hints/Solve, generation, cooperative
+Value clearing, filesystem open/save, automatic Solve, generation, cooperative
 cancellation, signed releases, and macOS/Linux packaging remain follow-up work.
 
 See [DESIGN.md](DESIGN.md) for the design tokens and
