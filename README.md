@@ -1,8 +1,9 @@
 # Sukaku Forge
 
-Sukaku Forge is a behavior-compatible Rust reimplementation of
-[Sukaku Explainer](https://github.com/dclamage/SukakuExplainer), with one
-React interface shared by the Windows/Tauri and browser/WASM builds.
+Sukaku Forge is a behavior-compatible Rust reimplementation of the original
+Sukaku Explainer and
+[SudokuMonster's updated v1.18.1 release](https://github.com/SudokuMonster/SukakuExplainer),
+with one React interface shared by the Windows/Tauri and browser/WASM builds.
 
 The project is pre-1.0. Original and Revised compatibility modes preserve the
 legacy rating order while the Forge policy provides an explicit seam for
@@ -47,11 +48,12 @@ The focused path removes GUI and presentation work, freezes the Classic
 producer schedule, reuses topology and chain-search storage, and rejects
 provably impossible inner forcing-chain roots before the original ordered
 search. On one pinned Xeon 8370C core, the native 0.5.0 binary completed the
-protected 11.8 benchmark in 33.1 seconds with `11.8/1.2/1.2`; the reproducibly
-pinned SE 1.2.1 Java oracle exceeded a 30-minute timeout. This is a `>54×`
-timeout-floor speedup, not a completed Java/Rust ratio or a corpus average:
-each engine received one fresh-process run without warm-up, and Rust used its
-corrected, uniqueness-off default.
+protected 11.8 benchmark in 33.57 seconds; the exact released
+[SudokuMonster v1.18.1](https://github.com/SudokuMonster/SukakuExplainer/releases/tag/v1.18.1)
+JAR completed it in 761.22 seconds. Both emitted `11.8/1.2/1.2`, a measured
+`22.7×` speedup for this case. This is one fresh-process run per engine without
+warm-up, not a corpus average; both were pinned to one CPU, Java was forced to
+one thread, and Rust used its corrected, uniqueness-off default.
 
 See the [Classic-rater documentation](docs/CLASSIC_RATER.md) for the precise
 correctness policy, optimized build profiles, batch formatting, oracle pin,

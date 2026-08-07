@@ -72,10 +72,10 @@ class ProtectedTraceGateTests(unittest.TestCase):
         self.assertEqual(case["copies"], 1)
         self.assertEqual(case["expected_rating"], "11.8/1.2/1.2")
 
-    def test_pinned_original_digest_requires_an_exact_sha256(self) -> None:
+    def test_pinned_comparator_digest_requires_an_exact_sha256(self) -> None:
         digest = "a" * 64
         VERIFIER.require_sha256_match(digest, digest)
-        with self.assertRaisesRegex(RuntimeError, "malformed frozen"):
+        with self.assertRaisesRegex(RuntimeError, "malformed pinned"):
             VERIFIER.require_sha256_match(digest, "not-a-digest")
         with self.assertRaisesRegex(RuntimeError, "does not match"):
             VERIFIER.require_sha256_match("b" * 64, digest)

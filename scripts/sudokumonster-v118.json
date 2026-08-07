@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/SudokuMonster/SukakuExplainer.git",
+  "tag_baseline": "v1.18.1",
+  "commit": "362854eea4e983017726d406ac9ee8a28909bcc7",
+  "release_url": "https://github.com/SudokuMonster/SukakuExplainer/releases/tag/v1.18.1",
+  "asset_url": "https://github.com/SudokuMonster/SukakuExplainer/releases/download/v1.18.1/SukakuExplainer.jar",
+  "main_class": "diuf.sudoku.test.serate",
+  "jdk_version": "17.0.19",
+  "java_version_output_sha256": "5cb21f48e9122d5890258861880a6298b1c8e0ab6aa455ebd556989e0e15bd7d",
+  "jar_sha256": "37831647bf1727be02c159f25aefd8602918185d79d4aee73472eff40cd6736c",
+  "jar_size": 636042
+}

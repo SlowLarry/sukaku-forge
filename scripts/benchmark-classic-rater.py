@@ -2,8 +2,9 @@
 """Benchmark the corrected Classic rater against explicit rating engines.
 
 The harness is intentionally independent of the old sibling SukakuExplainer
-checkout.  Every measured run starts a fresh process, retains its output, and
-accepts only the frozen ER/EP/ED rating for the selected puzzle.
+checkout. Every measured run starts a fresh process and retains its output.
+The headless rater must preserve its frozen ER/EP/ED result; updated Java and
+other explicitly unfrozen comparators may report a different stable rating.
 """
 
 from __future__ import annotations
@@ -27,8 +28,12 @@ from typing import Any, Callable, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 SE121_METADATA = Path(__file__).with_name("se121-oracle.json")
+SUDOKUMONSTER_V118_METADATA = Path(__file__).with_name("sudokumonster-v118.json")
 PG_METADATA = Path(__file__).with_name("pgexplainer.json")
 DEFAULT_SE121_JAR = ROOT / "target" / "se121-oracle" / "serate.jar"
+DEFAULT_SUDOKUMONSTER_V118_JAR = (
+    ROOT / "target" / "sudokumonster" / "SukakuExplainer-v1.18.1.jar"
+)
 DEFAULT_PG_JAR = ROOT / "target" / "pgexplainer" / "PGExplainer.jar"
 PROTECTED_CASE_ID = "user_extreme_major_milestone_probe"
 RATING_PATTERN = re.compile(r"[0-9]+\.[0-9]/[0-9]+\.[0-9]/[0-9]+\.[0-9]")
@@ -159,6 +164,13 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs="?",
         const=DEFAULT_SE121_JAR,
         help="include the pinned SE 1.2.1 source oracle",
+    )
+    parser.add_argument(
+        "--sudokumonster-v118-jar",
+        type=Path,
+        nargs="?",
+        const=DEFAULT_SUDOKUMONSTER_V118_JAR,
+        help="include the pinned SudokuMonster v1.18.1 release comparator",
     )
     parser.add_argument(
         "--pg-jar",
@@ -425,6 +437,39 @@ def build_engines(
                 ],
                 jar,
                 f"{java_version}; SE121 commit {metadata['commit']}",
+            )
+        )
+    if arguments.sudokumonster_v118_jar is not None:
+        metadata = load_metadata(SUDOKUMONSTER_V118_METADATA)
+        jar = require_artifact(
+            arguments.sudokumonster_v118_jar,
+            metadata,
+            "SudokuMonster v1.18.1",
+        )
+        java_version = require_java_runtime(arguments.java, metadata)
+        main_class = metadata["main_class"]
+        engines.append(
+            Engine(
+                "java-sudokumonster-v118",
+                lambda preferences, java=arguments.java, artifact=jar, main=main_class: [
+                    java,
+                    "-Xrs",
+                    "-Xmx500m",
+                    f"-Djava.util.prefs.userRoot={preferences}",
+                    "-cp",
+                    str(artifact),
+                    main,
+                    "--threads=1",
+                    "--format=%r/%p/%d",
+                    "--input=-",
+                ],
+                jar,
+                (
+                    f"{java_version}; SudokuMonster {metadata['tag_baseline']} "
+                    f"commit {metadata['commit']}"
+                ),
+                enforce_frozen_rating=False,
+                thread_policy="single-threaded (--threads=1)",
             )
         )
     if arguments.pg_jar is not None:

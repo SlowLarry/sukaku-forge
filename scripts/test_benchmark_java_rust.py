@@ -20,6 +20,26 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class CompactTraceTests(unittest.TestCase):
+    def test_original_comparator_is_sudokumonster_v118_release(self) -> None:
+        metadata = BENCHMARK.load_sudokumonster_v118_metadata()
+        self.assertEqual(
+            BENCHMARK.DEFAULT_ORIGINAL_JAR,
+            BENCHMARK.ROOT
+            / "target"
+            / "sudokumonster"
+            / "SukakuExplainer-v1.18.1.jar",
+        )
+        self.assertEqual(metadata["tag_baseline"], "v1.18.1")
+        self.assertEqual(
+            metadata["commit"],
+            "362854eea4e983017726d406ac9ee8a28909bcc7",
+        )
+        self.assertEqual(metadata["jar_size"], 636042)
+        self.assertEqual(
+            metadata["jar_sha256"],
+            "37831647bf1727be02c159f25aefd8602918185d79d4aee73472eff40cd6736c",
+        )
+
     def test_crlf_is_reduced_to_the_exact_version_one_contract(self) -> None:
         grid = "1" * 81
         candidates = "." * 729

@@ -30,10 +30,12 @@ A separate slow, still non-protected corpus pins AI Escargot at
 ordinary differential gate take several minutes. It is never run by normal
 workspace verification.
 
-This is not the later `v1.18.1-rangsk` oracle used by the general Forge
-compatibility engine, and it is not PGExplainer. PG replaces the original
-level-4/level-5 nested tail with three capped level-4 producers and predates
-the 2022 chaining-order changes, so it remains only a performance comparator.
+This historical source oracle is not the
+[updated SudokuMonster v1.18.1 release](https://github.com/SudokuMonster/SukakuExplainer)
+used as the Java performance comparator, and it is not PGExplainer. PG replaces
+the original level-4/level-5 nested tail with three capped level-4 producers
+and predates the 2022 chaining-order changes, so it remains only a performance
+comparator.
 
 The SE 1.2.1-derived registry contains 30 producers. It excludes Strong
 Links, alphabet wings, generalized/variant rules and Revised mode, and retains
@@ -144,6 +146,33 @@ Rust against `expected_rating`, making every intentional rating divergence
 explicit. The oracle build refuses a different source tree, archive, JDK,
 class count, JAR size or JAR hash. It is not part of normal `make verify`, so
 contributors do not silently depend on a sibling Java checkout.
+
+## Performance benchmark
+
+Performance comparisons use the exact released SudokuMonster v1.18.1 JAR,
+not the historical SE 1.2.1 correctness oracle. Fetch and verify that artifact
+before running the guarded benchmark harness:
+
+```sh
+make fetch-sudokumonster-v118
+python3 scripts/benchmark-classic-rater.py \
+  --post-rater target/rater-native/rater/sukaku-forge-rate \
+  --sudokumonster-v118-jar
+```
+
+The pin records tag `v1.18.1`, commit
+`362854eea4e983017726d406ac9ee8a28909bcc7`, released-JAR size and SHA-256,
+and the Java runtime fingerprint. The harness starts fresh processes, pins
+both programs to one logical CPU when `taskset` is available, and explicitly
+passes Java `--threads=1`. Java is an unfrozen comparator because its updated
+technique schedule can legitimately rate a puzzle differently from the
+corrected SE 1.2.1-derived headless product.
+
+The retained 0.5.0 one-shot on the guarded 11.8 case measured 33.57 seconds
+for the native rater and 761.22 seconds for SudokuMonster v1.18.1. Both emitted
+`11.8/1.2/1.2`, giving a completed `22.7×` ratio for that single case. Each
+engine received one fresh process without warm-up on the same pinned Xeon
+8370C CPU; this result is not presented as a corpus average.
 
 ## Optimization policy
 

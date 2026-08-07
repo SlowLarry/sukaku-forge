@@ -144,14 +144,8 @@ def require_artifacts(
         if not artifact.is_file():
             raise FileNotFoundError(f"artifact not found: {artifact}")
     if cross_engine:
-        oracle = json.loads(BENCHMARK.DEFAULT_ORACLE.read_text(encoding="utf-8"))
-        expected = oracle["oracle"]["sha256"]
-        actual = BENCHMARK.sha256(original_jar)
-        if actual != expected:
-            raise RuntimeError(
-                "java-original JAR does not match the frozen oracle: "
-                f"{actual} != {expected}"
-            )
+        metadata = BENCHMARK.load_sudokumonster_v118_metadata()
+        BENCHMARK.require_sudokumonster_v118_artifact(original_jar, metadata)
 
 
 def run_invocations_once(

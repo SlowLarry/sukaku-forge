@@ -1,4 +1,4 @@
-.PHONY: build build-native build-pgexplainer build-rater build-rater-native build-se121-oracle build-wasm build-web check check-wasm fmt gui-check gui-dev test verify verify-se121-rater verify-se121-rater-slow
+.PHONY: build build-native build-pgexplainer build-rater build-rater-native build-se121-oracle build-wasm build-web check check-wasm fetch-sudokumonster-v118 fmt gui-check gui-dev test verify verify-se121-rater verify-se121-rater-slow
 
 build:
 	cargo build --workspace
@@ -20,6 +20,11 @@ build-rater-native:
 build-se121-oracle:
 	test -n "$(SE121_SOURCE)"
 	sh scripts/build-se121-oracle.sh "$(SE121_SOURCE)"
+
+# Fetch the exact released SudokuMonster v1.18.1 comparator JAR and verify its
+# recorded size and SHA-256 before any benchmark uses it.
+fetch-sudokumonster-v118:
+	sh scripts/fetch-sudokumonster-v118.sh
 
 verify-se121-rater: build-rater
 	python3 scripts/verify-se121-oracle.py --classic-rater target/rater/sukaku-forge-rate

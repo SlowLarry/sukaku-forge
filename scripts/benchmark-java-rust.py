@@ -23,8 +23,11 @@ DEFAULT_RUST_BINARY = ROOT / "target" / "release" / (
     "sukaku-forge.exe" if os.name == "nt" else "sukaku-forge"
 )
 DEFAULT_OPTIMIZED_JAR = JAVA_ROOT / "build" / "SukakuExplainer.jar"
-DEFAULT_ORIGINAL_JAR = JAVA_ROOT / ".oracle" / "SukakuExplainer-v1.18.1-rangsk.jar"
+DEFAULT_ORIGINAL_JAR = (
+    ROOT / "target" / "sudokumonster" / "SukakuExplainer-v1.18.1.jar"
+)
 DEFAULT_PG_JAR = ROOT / "target" / "pgexplainer" / "PGExplainer.jar"
+SUDOKUMONSTER_V118_METADATA = ROOT / "scripts" / "sudokumonster-v118.json"
 PG_METADATA = ROOT / "scripts" / "pgexplainer.json"
 PG_LABEL = "pg-upstream-parallel"
 DEFAULT_CASE_IDS = (
@@ -546,6 +549,46 @@ def load_pg_metadata(path: Path = PG_METADATA) -> dict:
     return metadata
 
 
+def load_sudokumonster_v118_metadata(
+    path: Path = SUDOKUMONSTER_V118_METADATA,
+) -> dict:
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+    required = {
+        "repository",
+        "tag_baseline",
+        "commit",
+        "main_class",
+        "jar_sha256",
+        "jar_size",
+    }
+    missing = sorted(required - metadata.keys())
+    if missing:
+        raise RuntimeError(
+            f"SudokuMonster v1.18.1 metadata is missing: {', '.join(missing)}"
+        )
+    return metadata
+
+
+def require_sudokumonster_v118_artifact(path: Path, metadata: dict) -> None:
+    if not path.is_file():
+        raise FileNotFoundError(
+            "SudokuMonster v1.18.1 artifact not found: "
+            f"{path}; run make fetch-sudokumonster-v118"
+        )
+    actual_size = path.stat().st_size
+    if actual_size != metadata["jar_size"]:
+        raise RuntimeError(
+            "SudokuMonster v1.18.1 JAR size changed: "
+            f"{actual_size} != {metadata['jar_size']}"
+        )
+    actual_hash = sha256(path)
+    if actual_hash != metadata["jar_sha256"]:
+        raise RuntimeError(
+            "SudokuMonster v1.18.1 JAR does not match the pinned release: "
+            f"{actual_hash} != {metadata['jar_sha256']}"
+        )
+
+
 def require_pg_artifact(path: Path, metadata: dict) -> None:
     if not path.is_file():
         raise FileNotFoundError(
@@ -609,16 +652,11 @@ def main() -> int:
     optimized_jar = arguments.optimized_jar.resolve()
     original_jar = arguments.original_jar.resolve()
     rust_binary = arguments.rust_binary.resolve()
-    for artifact in (optimized_jar, original_jar, rust_binary):
+    for artifact in (optimized_jar, rust_binary):
         if not artifact.is_file():
             raise FileNotFoundError(f"artifact not found: {artifact}")
-    expected_original_hash = oracle_document["oracle"]["sha256"]
-    actual_original_hash = sha256(original_jar)
-    if actual_original_hash != expected_original_hash:
-        raise RuntimeError(
-            "java-original JAR does not match the frozen oracle: "
-            f"{actual_original_hash} != {expected_original_hash}"
-        )
+    original_metadata = load_sudokumonster_v118_metadata()
+    require_sudokumonster_v118_artifact(original_jar, original_metadata)
 
     pg_metadata = None
     pg_jar = arguments.pg_jar.resolve()
@@ -629,6 +667,10 @@ def main() -> int:
 
     print(version([arguments.java, "-version"]))
     print(version([str(rust_binary), "--version"]))
+    print(
+        "SudokuMonster SukakuExplainer "
+        f"{original_metadata['tag_baseline']} ({original_metadata['commit']})"
+    )
     if pg_metadata is not None:
         print(
             "PGExplainer "

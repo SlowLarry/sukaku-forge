@@ -93,12 +93,12 @@ def require_authorized_case(
 
 
 def require_sha256_match(actual: str, expected: str) -> None:
-    """Require a well-formed exact match for the pinned original JAR digest."""
+    """Require a well-formed exact match for the pinned comparator digest."""
     if SHA256_PATTERN.fullmatch(expected) is None:
-        raise RuntimeError(f"malformed frozen original JAR SHA-256: {expected!r}")
+        raise RuntimeError(f"malformed pinned comparator SHA-256: {expected!r}")
     if SHA256_PATTERN.fullmatch(actual) is None or actual != expected:
         raise RuntimeError(
-            "java-original JAR does not match the frozen oracle: "
+            "java-original JAR does not match SudokuMonster v1.18.1: "
             f"{actual} != {expected}"
         )
 
@@ -109,9 +109,9 @@ def require_artifacts(
     for artifact in (original_jar, optimized_jar, rust_binary):
         if not artifact.is_file():
             raise FileNotFoundError(f"artifact not found: {artifact}")
-    oracle_document = json.loads(BENCHMARK.DEFAULT_ORACLE.read_text(encoding="utf-8"))
-    expected_original_hash = oracle_document["oracle"]["sha256"]
-    require_sha256_match(BENCHMARK.sha256(original_jar), expected_original_hash)
+    metadata = BENCHMARK.load_sudokumonster_v118_metadata()
+    BENCHMARK.require_sudokumonster_v118_artifact(original_jar, metadata)
+    require_sha256_match(BENCHMARK.sha256(original_jar), metadata["jar_sha256"])
 
 
 def engine_invocations(

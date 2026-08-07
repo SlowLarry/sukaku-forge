@@ -7,6 +7,7 @@ import importlib.util
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("benchmark-classic-rater.py")
@@ -119,6 +120,53 @@ class ProtectedPolicyTests(unittest.TestCase):
 
 
 class OutputAndCommandTests(unittest.TestCase):
+    def test_sudokumonster_v118_metadata_pins_the_released_jar(self) -> None:
+        metadata = BENCHMARK.load_metadata(BENCHMARK.SUDOKUMONSTER_V118_METADATA)
+        self.assertEqual(metadata["tag_baseline"], "v1.18.1")
+        self.assertEqual(
+            metadata["commit"],
+            "362854eea4e983017726d406ac9ee8a28909bcc7",
+        )
+        self.assertEqual(metadata["main_class"], "diuf.sudoku.test.serate")
+        self.assertEqual(metadata["jar_size"], 636042)
+        self.assertEqual(
+            metadata["jar_sha256"],
+            "37831647bf1727be02c159f25aefd8602918185d79d4aee73472eff40cd6736c",
+        )
+
+    def test_sudokumonster_v118_is_an_unfrozen_single_thread_comparator(self) -> None:
+        arguments = BENCHMARK.parse_arguments(
+            ["--sudokumonster-v118-jar", "SukakuExplainer.jar"]
+        )
+        jar = Path("SukakuExplainer.jar").resolve()
+        with (
+            mock.patch.object(BENCHMARK, "require_artifact", return_value=jar),
+            mock.patch.object(
+                BENCHMARK, "require_java_runtime", return_value="OpenJDK 17.0.19"
+            ),
+        ):
+            engines = BENCHMARK.build_engines(arguments, Path("preferences"))
+        self.assertEqual(len(engines), 1)
+        engine = engines[0]
+        self.assertEqual(engine.label, "java-sudokumonster-v118")
+        self.assertFalse(engine.enforce_frozen_rating)
+        self.assertEqual(engine.thread_policy, "single-threaded (--threads=1)")
+        self.assertEqual(
+            engine.command_factory(Path("fresh-preferences")),
+            [
+                "java",
+                "-Xrs",
+                "-Xmx500m",
+                "-Djava.util.prefs.userRoot=fresh-preferences",
+                "-cp",
+                str(jar),
+                "diuf.sudoku.test.serate",
+                "--threads=1",
+                "--format=%r/%p/%d",
+                "--input=-",
+            ],
+        )
+
     def test_plain_and_generic_rust_ratings_are_parsed_strictly(self) -> None:
         self.assertEqual(
             BENCHMARK.parse_ratings("9.8/9.8/9.5\n", 1, "plain"),
