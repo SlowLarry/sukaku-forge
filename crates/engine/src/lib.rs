@@ -13,6 +13,7 @@ mod non_consecutive;
 mod presentation_proof;
 mod producers;
 mod rating;
+mod se121;
 mod sets;
 mod solver;
 mod strong_links;
@@ -73,6 +74,10 @@ pub use producers::{
     find_naked_single,
 };
 pub use rating::{RatedTechnique, Rating, RatingResult, RatingTracker};
+pub use se121::{
+    SE121_ENGINE_CONFIG, SE121_PRODUCERS, Se121Options, Se121Producer, Se121Rating, Se121Solver,
+    Se121VariantError,
+};
 pub use sets::{
     collect_fish, collect_hidden_sets, collect_naked_sets, find_fish, find_hidden_set,
     find_naked_set,

@@ -2,6 +2,7 @@
 members = [
     "crates/core",
     "crates/engine",
+    "crates/classic-rater",
     "crates/presentation",
     "crates/app",
     "crates/wasm-api",
@@ -10,7 +11,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
 license = "LGPL-2.1-or-later"
@@ -20,3 +21,14 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Maximum-throughput local build for the dedicated rating-only binary. Keep
+# portable releases on Cargo's normal `release` profile; host CPU tuning is an
+# explicit Make target so benchmark results cannot accidentally mix the two.
+[profile.rater]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

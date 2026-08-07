@@ -1,4 +1,4 @@
-.PHONY: build build-native build-pgexplainer build-wasm build-web check check-wasm fmt gui-check gui-dev test verify
+.PHONY: build build-native build-pgexplainer build-rater build-rater-native build-se121-oracle build-wasm build-web check check-wasm fmt gui-check gui-dev test verify verify-se121-rater verify-se121-rater-slow
 
 build:
 	cargo build --workspace
@@ -7,6 +7,25 @@ build:
 # separate target directory so it cannot replace the portable release binary.
 build-native:
 	CARGO_TARGET_DIR=target/native RUSTFLAGS="-C target-cpu=native" cargo build --workspace --release
+
+# Dedicated portable and host-tuned SE 1.2.1 classic-only rating binaries.
+build-rater:
+	cargo build -p sukaku-forge-classic-rater --profile rater
+
+build-rater-native:
+	CARGO_TARGET_DIR=target/rater-native RUSTFLAGS="-C target-cpu=native" cargo build -p sukaku-forge-classic-rater --profile rater
+
+# Build the frozen source-derived SE 1.2.1 oracle from a checkout containing
+# the pinned commit. This is intentionally separate from normal verification.
+build-se121-oracle:
+	test -n "$(SE121_SOURCE)"
+	sh scripts/build-se121-oracle.sh "$(SE121_SOURCE)"
+
+verify-se121-rater: build-rater
+	python3 scripts/verify-se121-oracle.py --classic-rater target/rater/sukaku-forge-rate
+
+verify-se121-rater-slow: build-rater
+	python3 scripts/verify-se121-oracle.py --classic-rater target/rater/sukaku-forge-rate --corpus scripts/se121-classic-slow-corpus.json --timeout 240
 
 build-pgexplainer:
 	sh scripts/build-pgexplainer.sh
@@ -46,9 +65,11 @@ gui-dev:
 	cd apps/gui && npm run dev -- --host 127.0.0.1
 
 verify: fmt check test build
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_benchmark_classic_rater.py
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_benchmark_java_rust.py
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_verify_protected_trace.py
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_verify_revised_trace.py
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_verify_se121_oracle.py
 	sh scripts/verify-java-topology.sh
 	python3 scripts/verify-hidden-single-oracle.py
 	python3 scripts/verify-direct-oracle.py

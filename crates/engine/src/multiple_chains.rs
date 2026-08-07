@@ -11,8 +11,8 @@ use crate::aligned_exclusion::find_aligned_triplet_exclusion;
 use crate::alphabet_wings::collect_alphabet_wing_advanced;
 use crate::bug::find_bivalue_universal_grave;
 use crate::forcing_chains::{
-    Implications, KEY_COUNT, active_region_types, collect_forcing_chain_proofs, decode_candidate,
-    is_on, potential_key,
+    Implications, KEY_COUNT, active_region_types, collect_forcing_chain_proofs,
+    collect_forcing_chain_proofs_se121, decode_candidate, is_on, potential_key,
 };
 use crate::nested_chains::{
     ChainProof, FullChainFingerprint, InferenceCollector, NestedHint, NestedHintCollector, OnCause,
@@ -32,7 +32,32 @@ enum MultiMode {
     Static,
     Dynamic,
     DynamicPlus,
-    Nested { level: u8, nesting_limit: u8 },
+    /// SE 1.2.1 level-one dynamic chaining, whose embedded Locking rule uses
+    /// the older region-before-digit traversal.
+    Se121DynamicPlus,
+    Nested {
+        level: u8,
+        nesting_limit: u8,
+    },
+    /// SE 1.2.1/serate nested schedule, with selected later search fixes.
+    /// Unlike later Sukaku Explainer releases, this has one producer at each
+    /// level 2 through 5.
+    Se121Nested {
+        level: u8,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdvancedTargetOrder {
+    CoordinateHash,
+    CellThenDigit,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Lets regression tests run the real SE121 search entry points with only
+    /// the post-1.2.1 target-order correction disabled.
+    static APPLY_SE121_ORDER_CORRECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
 /// Exact mutable-grid identity for inner-chain memoization. Topology and
@@ -69,11 +94,28 @@ struct InnerChainCache {
 
 impl InnerChainCache {
     fn forcing(&mut self, grid: &Grid, config: EngineConfig) -> Arc<[NestedHint]> {
+        self.forcing_impl(grid, config, false)
+    }
+
+    fn forcing_se121(&mut self, grid: &Grid, config: EngineConfig) -> Arc<[NestedHint]> {
+        self.forcing_impl(grid, config, true)
+    }
+
+    fn forcing_impl(
+        &mut self,
+        grid: &Grid,
+        config: EngineConfig,
+        use_root_prefilter: bool,
+    ) -> Arc<[NestedHint]> {
         let key = GridStateKey::new(grid);
         if let Some(hints) = self.forcing.get(&key) {
             return Arc::clone(hints);
         }
-        let hints = Arc::<[NestedHint]>::from(collect_forcing_chain_proofs(grid, config));
+        let hints = Arc::<[NestedHint]>::from(if use_root_prefilter {
+            collect_forcing_chain_proofs_se121(grid, config)
+        } else {
+            collect_forcing_chain_proofs(grid, config)
+        });
         self.forcing.insert(key, Arc::clone(&hints));
         hints
     }
@@ -92,9 +134,16 @@ impl InnerChainCache {
         let cache = match mode {
             MultiMode::Dynamic => &mut self.dynamic,
             MultiMode::DynamicPlus => &mut self.dynamic_plus,
-            MultiMode::Nested { level: 2, .. } => &mut self.nested_two,
-            MultiMode::Nested { level: 3, .. } => &mut self.nested_three,
-            MultiMode::Static | MultiMode::Nested { .. } => {
+            MultiMode::Nested { level: 2, .. } | MultiMode::Se121Nested { level: 2 } => {
+                &mut self.nested_two
+            }
+            MultiMode::Nested { level: 3, .. } | MultiMode::Se121Nested { level: 3 } => {
+                &mut self.nested_three
+            }
+            MultiMode::Static
+            | MultiMode::Se121DynamicPlus
+            | MultiMode::Nested { .. }
+            | MultiMode::Se121Nested { .. } => {
                 unreachable!("unsupported cached inner multi-chain mode")
             }
         };
@@ -118,8 +167,8 @@ impl MultiMode {
         match self {
             Self::Static => Technique::MultipleForcingChain,
             Self::Dynamic => Technique::DynamicForcingChain,
-            Self::DynamicPlus => Technique::DynamicForcingChainPlus,
-            Self::Nested { .. } => Technique::NestedForcingChain,
+            Self::DynamicPlus | Self::Se121DynamicPlus => Technique::DynamicForcingChainPlus,
+            Self::Nested { .. } | Self::Se121Nested { .. } => Technique::NestedForcingChain,
         }
     }
 
@@ -127,9 +176,9 @@ impl MultiMode {
         match self {
             Self::Static => (80, 8.0),
             Self::Dynamic => (85, 8.5),
-            Self::DynamicPlus => (90, 9.0),
-            Self::Nested { level, .. } => {
-                debug_assert!((2..=4).contains(&level));
+            Self::DynamicPlus | Self::Se121DynamicPlus => (90, 9.0),
+            Self::Nested { level, .. } | Self::Se121Nested { level } => {
+                debug_assert!((2..=5).contains(&level));
                 (85 + u16::from(level) * 5, 8.5 + f64::from(level) * 0.5)
             }
         }
@@ -138,15 +187,65 @@ impl MultiMode {
     fn level(self) -> u8 {
         match self {
             Self::Static | Self::Dynamic => 0,
-            Self::DynamicPlus => 1,
-            Self::Nested { level, .. } => level,
+            Self::DynamicPlus | Self::Se121DynamicPlus => 1,
+            Self::Nested { level, .. } | Self::Se121Nested { level } => level,
         }
     }
 
     fn nesting_limit(self) -> u8 {
         match self {
             Self::Nested { nesting_limit, .. } => nesting_limit,
-            Self::Static | Self::Dynamic | Self::DynamicPlus => 0,
+            Self::Static
+            | Self::Dynamic
+            | Self::DynamicPlus
+            | Self::Se121DynamicPlus
+            | Self::Se121Nested { .. } => 0,
+        }
+    }
+
+    const fn uses_se121_locking_order(self) -> bool {
+        matches!(self, Self::Se121DynamicPlus | Self::Se121Nested { .. })
+    }
+
+    const fn is_se121_search(self) -> bool {
+        matches!(self, Self::Se121DynamicPlus | Self::Se121Nested { .. })
+    }
+
+    const fn uses_corrected_se121_pruning(self) -> bool {
+        self.is_se121_search()
+    }
+
+    fn uses_corrected_se121_order(self) -> bool {
+        if !self.is_se121_search() {
+            return false;
+        }
+        #[cfg(test)]
+        {
+            APPLY_SE121_ORDER_CORRECTION.with(std::cell::Cell::get)
+        }
+        #[cfg(not(test))]
+        true
+    }
+
+    /// The corrected rater continues past an advanced family whose removals
+    /// were already known to the branch. Java and the general compatibility
+    /// modes retain the historical "hint found" stopping rule, which can
+    /// prematurely prune later inner families.
+    fn advanced_family_stops(self, scan: AdvancedScan) -> bool {
+        if scan.boundary.is_some() {
+            true
+        } else if self.uses_corrected_se121_pruning() {
+            scan.added
+        } else {
+            scan.productive
+        }
+    }
+
+    fn advanced_target_order(self) -> AdvancedTargetOrder {
+        if self.uses_corrected_se121_order() {
+            AdvancedTargetOrder::CellThenDigit
+        } else {
+            AdvancedTargetOrder::CoordinateHash
         }
     }
 }
@@ -489,11 +588,13 @@ struct Contradiction {
     off: u32,
 }
 
-/// Java's chaining hints historically expose their removals through a
-/// default-constructed HashMap. Preserve its capacity-16 bucket order even
-/// when the optimized Java implementation stores a compact removal payload
-/// before lazily materializing that compatibility map.
-fn legacy_hash_map_cell_order(cells: &[CellId], result: &mut Vec<CellId>) {
+/// Coordinate-hash bucket order used by the later compatibility engine.
+///
+/// The optimized Java implementation hashes `Cell` by its raw index before
+/// lazily materializing this compatibility map. General compatibility modes
+/// preserve that traversal. Corrected SE121 modes use the later bug-fix order
+/// (cell index, then digit) instead.
+fn coordinate_hash_map_cell_order(cells: &[CellId], result: &mut Vec<CellId>) {
     let mut capacity = 16_usize;
     while cells.len() > capacity * 3 / 4 {
         capacity *= 2;
@@ -504,6 +605,21 @@ fn legacy_hash_map_cell_order(cells: &[CellId], result: &mut Vec<CellId>) {
             if cell.index() & (capacity - 1) == bucket {
                 result.push(cell);
             }
+        }
+    }
+}
+
+fn order_advanced_target_cells(
+    cells: &[CellId],
+    order: AdvancedTargetOrder,
+    result: &mut Vec<CellId>,
+) {
+    match order {
+        AdvancedTargetOrder::CoordinateHash => coordinate_hash_map_cell_order(cells, result),
+        AdvancedTargetOrder::CellThenDigit => {
+            result.clear();
+            result.extend_from_slice(cells);
+            result.sort_unstable_by_key(|cell| cell.index());
         }
     }
 }
@@ -524,6 +640,7 @@ struct Branch {
     advanced_target_masks: [CandidateMask; 81],
     advanced_target_cells: Vec<CellId>,
     advanced_target_order: Vec<CellId>,
+    advanced_target_policy: AdvancedTargetOrder,
     advanced_nested: Option<Arc<ChainProof>>,
 }
 
@@ -544,6 +661,7 @@ impl Branch {
             advanced_target_masks: [CandidateMask::EMPTY; 81],
             advanced_target_cells: Vec::with_capacity(32),
             advanced_target_order: Vec::with_capacity(32),
+            advanced_target_policy: AdvancedTargetOrder::CoordinateHash,
             advanced_nested: None,
         }
     }
@@ -916,16 +1034,20 @@ impl Branch {
         }
     }
 
-    /// Java stores an indirect hint's removals in a `HashMap<Cell, BitSet>`.
-    /// Cell hashes are their raw indexes, so reproduce the table's bucket
-    /// iteration before appending the advanced OFF nodes.
+    /// Append advanced OFF nodes in the traversal selected for this chain
+    /// mode. Corrected SE121 modes use cell index followed by ascending digit;
+    /// general compatibility modes retain coordinate-hash bucket traversal.
     fn commit_advanced_hint(&mut self) -> AdvancedScan {
         if self.advanced_parents.is_empty() || self.advanced_target_cells.is_empty() {
             self.clear_advanced_hint();
             return AdvancedScan::default();
         }
 
-        legacy_hash_map_cell_order(&self.advanced_target_cells, &mut self.advanced_target_order);
+        order_advanced_target_cells(
+            &self.advanced_target_cells,
+            self.advanced_target_policy,
+            &mut self.advanced_target_order,
+        );
 
         let mut added = false;
         let nested = self.advanced_nested.clone();
@@ -1007,8 +1129,9 @@ impl Branch {
         mode: MultiMode,
         config: EngineConfig,
     ) -> AdvancedScan {
-        let base = self.collect_level_one_advanced(grid, state, config);
-        if base.productive || mode.level() == 1 {
+        self.advanced_target_policy = mode.advanced_target_order();
+        let base = self.collect_level_one_advanced(grid, state, config, mode);
+        if mode.advanced_family_stops(base) || mode.level() == 1 {
             return base;
         }
 
@@ -1020,7 +1143,7 @@ impl Branch {
             MultiMode::Nested { level: 3, .. } => {
                 let forcing = inner_cache.forcing(grid, config);
                 let scan = self.scan_nested_chain_hints(grid, state, &forcing);
-                if scan.productive {
+                if mode.advanced_family_stops(scan) {
                     return scan;
                 }
                 let multiple = inner_cache.multiple(grid, config);
@@ -1045,10 +1168,45 @@ impl Branch {
                     Err(boundary) => AdvancedScan::at_boundary(boundary),
                 }
             }
+            MultiMode::Se121Nested { level: 2 } => {
+                let hints = inner_cache.forcing_se121(grid, config);
+                self.scan_nested_chain_hints(grid, state, &hints)
+            }
+            MultiMode::Se121Nested { level: 3 } => {
+                let forcing = inner_cache.forcing_se121(grid, config);
+                let scan = self.scan_nested_chain_hints(grid, state, &forcing);
+                if mode.advanced_family_stops(scan) {
+                    return scan;
+                }
+                let multiple = inner_cache.multiple(grid, config);
+                self.scan_nested_chain_hints(grid, state, &multiple)
+            }
+            MultiMode::Se121Nested { level: 4 } => {
+                match inner_cache.multi(grid, config, MultiMode::Dynamic) {
+                    Ok(hints) => self.scan_nested_chain_hints(grid, state, &hints),
+                    Err(boundary) => AdvancedScan::at_boundary(boundary),
+                }
+            }
+            MultiMode::Se121Nested { level: 5 } => {
+                let dynamic = match inner_cache.multi(grid, config, MultiMode::Dynamic) {
+                    Ok(hints) => hints,
+                    Err(boundary) => return AdvancedScan::at_boundary(boundary),
+                };
+                let scan = self.scan_nested_chain_hints(grid, state, &dynamic);
+                if mode.advanced_family_stops(scan) {
+                    return scan;
+                }
+                match inner_cache.multi(grid, config, MultiMode::Se121Nested { level: 2 }) {
+                    Ok(hints) => self.scan_nested_chain_hints(grid, state, &hints),
+                    Err(boundary) => AdvancedScan::at_boundary(boundary),
+                }
+            }
             MultiMode::Static
             | MultiMode::Dynamic
             | MultiMode::DynamicPlus
-            | MultiMode::Nested { .. } => AdvancedScan::default(),
+            | MultiMode::Se121DynamicPlus
+            | MultiMode::Nested { .. }
+            | MultiMode::Se121Nested { .. } => AdvancedScan::default(),
         }
     }
 
@@ -1057,26 +1215,31 @@ impl Branch {
         grid: &Grid,
         state: &DynamicState,
         config: EngineConfig,
+        mode: MultiMode,
     ) -> AdvancedScan {
         let variant_latin = effective_variant_latin(grid, config);
         let first = if variant_latin {
-            self.scan_locking(grid, state)
+            if mode.uses_se121_locking_order() {
+                self.scan_locking_se121(grid, state)
+            } else {
+                self.scan_locking(grid, state)
+            }
         } else {
             self.scan_generalized_intersections(grid, state)
         };
-        if first.productive {
+        if mode.advanced_family_stops(first) {
             return first;
         }
         let hidden = self.scan_hidden_sets(grid, state, config, 2);
-        if hidden.productive {
+        if mode.advanced_family_stops(hidden) {
             return hidden;
         }
         let naked = self.scan_naked_sets(grid, state, config, !variant_latin, 2);
-        if naked.productive {
+        if mode.advanced_family_stops(naked) {
             return naked;
         }
         let fish = self.scan_fish(grid, state, 2);
-        if fish.productive {
+        if mode.advanced_family_stops(fish) {
             return fish;
         }
 
@@ -1087,36 +1250,36 @@ impl Branch {
             return AdvancedScan::default();
         }
         let xy = self.scan_xy_wings(grid, state, false);
-        if xy.productive {
+        if mode.advanced_family_stops(xy) {
             return xy;
         }
         let xyz = self.scan_xy_wings(grid, state, true);
-        if xyz.productive || config.forcing_chain_plus == 1 {
+        if mode.advanced_family_stops(xyz) || config.forcing_chain_plus == 1 {
             return xyz;
         }
 
         let hidden = self.scan_hidden_sets(grid, state, config, 3);
-        if hidden.productive {
+        if mode.advanced_family_stops(hidden) {
             return hidden;
         }
         let naked = self.scan_naked_sets(grid, state, config, !variant_latin, 3);
-        if naked.productive {
+        if mode.advanced_family_stops(naked) {
             return naked;
         }
         let fish = self.scan_fish(grid, state, 3);
-        if fish.productive {
+        if mode.advanced_family_stops(fish) {
             return fish;
         }
 
         // StrongLinks(3), scheduled only for classic/Latin configurations,
         // has the same inert initialGrid/initialGrid parent bug as TurbotFish.
         let wxyz = self.scan_alphabet_wings(grid, state, 4);
-        if wxyz.productive {
+        if mode.advanced_family_stops(wxyz) {
             return wxyz;
         }
         if variant_latin {
             let vwxyz = self.scan_alphabet_wings(grid, state, 5);
-            if vwxyz.productive {
+            if mode.advanced_family_stops(vwxyz) {
                 return vwxyz;
             }
             // The remaining legacy-only entries (Aligned Exclusion, Unique
@@ -1149,6 +1312,63 @@ impl Branch {
                         let secondary = region_id(secondary_type, secondary_index);
                         let overlap = grid.topology().overlap_positions(primary, secondary);
                         if overlap.is_empty() || !primary_positions.without(overlap).is_empty() {
+                            continue;
+                        }
+                        self.clear_advanced_hint();
+                        for &raw_cell in grid.topology().region_cells(primary) {
+                            let cell = cell_id(raw_cell);
+                            let in_secondary = grid
+                                .topology()
+                                .cell_position_in_region(cell, secondary_type)
+                                .is_some_and(|position| {
+                                    grid.topology().region_cells(secondary)[usize::from(position)]
+                                        == raw_cell
+                                });
+                            if !in_secondary {
+                                self.advanced_parent(grid, state, cell, digit);
+                            }
+                        }
+                        let secondary_overlap =
+                            grid.topology().overlap_positions(secondary, primary);
+                        let targets = grid
+                            .region_candidate_positions(secondary, digit)
+                            .without(secondary_overlap);
+                        for position in targets.iter() {
+                            self.advanced_target(
+                                region_cell(grid, secondary, position),
+                                CandidateMask::of(digit),
+                            );
+                        }
+                        let hint = self.commit_advanced_hint();
+                        family.productive |= hint.productive;
+                        family.added |= hint.added;
+                    }
+                }
+            }
+        }
+        family
+    }
+
+    fn scan_locking_se121(&mut self, grid: &Grid, state: &DynamicState) -> AdvancedScan {
+        if !grid.topology().config().blocks {
+            return AdvancedScan::default();
+        }
+        let mut family = AdvancedScan::default();
+        for (primary_type, secondary_type) in [(0_usize, 2_usize), (0, 1), (2, 0), (1, 0)] {
+            for primary_index in 0..grid.topology().region_count(primary_type) {
+                let primary = region_id(primary_type, primary_index);
+                for secondary_index in 0..grid.topology().region_count(secondary_type) {
+                    let secondary = region_id(secondary_type, secondary_index);
+                    let overlap = grid.topology().overlap_positions(primary, secondary);
+                    if overlap.is_empty() {
+                        continue;
+                    }
+                    for raw_digit in 1_u8..=9 {
+                        let digit = Digit::new(raw_digit).expect("digit loop");
+                        let primary_positions = grid.region_candidate_positions(primary, digit);
+                        if primary_positions.count() < 2
+                            || !primary_positions.without(overlap).is_empty()
+                        {
                             continue;
                         }
                         self.clear_advanced_hint();
@@ -1787,6 +2007,83 @@ pub fn find_dynamic_forcing_chain_plus(grid: &Grid, config: EngineConfig) -> Opt
         .expect("legacy Java FCPlus=2 boundary; use the checked DFC+ finder")
 }
 
+/// Find SE 1.2.1's level-one Dynamic Forcing Chain (+), with the corrected
+/// advanced-family pruning and target traversal.
+///
+/// Its embedded Locking producer retains the old region-before-digit
+/// traversal without changing the later compatibility implementation above.
+#[must_use]
+#[cfg(test)]
+pub(crate) fn find_se121_dynamic_forcing_chain_plus(
+    grid: &Grid,
+    config: EngineConfig,
+) -> Option<Inference> {
+    find_multi_chain_checked(grid, config, MultiMode::Se121DynamicPlus)
+        .expect("SE 1.2.1 FCPlus=0 cannot reach a legacy parent boundary")
+}
+
+/// Search the consecutive SE 1.2.1 multiple/dynamic/nested tail with one
+/// reusable set of branch arenas and one dynamic implication table.
+///
+/// The dedicated classic rater is the only caller. General compatibility
+/// entry points continue to create isolated workspaces, while this path can
+/// safely retain branch capacity and immutable weak links because every
+/// producer sees the same unchanged outer grid. Exact-state inner caches stay
+/// producer-local, avoiding a larger live working set on deep nested cases.
+pub(crate) fn find_se121_chain_tail(grid: &Grid, config: EngineConfig) -> Option<Inference> {
+    let region_types = active_region_types(grid, config);
+    let mut working = grid.clone();
+    let mut workspace = MultiWorkspace::new();
+
+    // Static MFC needs the full implication graph. Drop it before building
+    // the weak-only graph used by every later dynamic family.
+    let multiple = {
+        let implications = Implications::new(grid, config);
+        let mut inner_cache = InnerChainCache::default();
+        find_multi_chain_with_resources(
+            grid,
+            config,
+            MultiMode::Static,
+            &implications,
+            &region_types,
+            &mut working,
+            &mut workspace,
+            &mut inner_cache,
+        )
+        .expect("static multiple chains cannot reach an FCPlus boundary")
+    };
+    if multiple.is_some() {
+        return multiple;
+    }
+
+    let implications = Implications::weak_only(grid, config);
+    for mode in [
+        MultiMode::Dynamic,
+        MultiMode::Se121DynamicPlus,
+        MultiMode::Se121Nested { level: 2 },
+        MultiMode::Se121Nested { level: 3 },
+        MultiMode::Se121Nested { level: 4 },
+        MultiMode::Se121Nested { level: 5 },
+    ] {
+        let mut inner_cache = InnerChainCache::default();
+        let inference = find_multi_chain_with_resources(
+            grid,
+            config,
+            mode,
+            &implications,
+            &region_types,
+            &mut working,
+            &mut workspace,
+            &mut inner_cache,
+        )
+        .expect("SE 1.2.1 FCPlus=0 cannot reach a legacy parent boundary");
+        if inference.is_some() {
+            return inference;
+        }
+    }
+    None
+}
+
 /// Checked DFC+ entry point for Java's historically broken FCPlus=2 tail.
 pub fn find_dynamic_forcing_chain_plus_checked(
     grid: &Grid,
@@ -2383,6 +2680,35 @@ fn find_multi_chain_checked(
     Ok(best.map(|candidate| candidate.inference))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn find_multi_chain_with_resources(
+    grid: &Grid,
+    config: EngineConfig,
+    mode: MultiMode,
+    implications: &Implications,
+    region_types: &[usize],
+    working: &mut Grid,
+    workspace: &mut MultiWorkspace,
+    inner_cache: &mut InnerChainCache,
+) -> Result<Option<Inference>, LegacyFcPlusBoundary> {
+    let mut best = None;
+    {
+        let mut sink = MultiSink::First(&mut best);
+        search_multi_chain_with_resources(
+            grid,
+            config,
+            mode,
+            &mut sink,
+            implications,
+            region_types,
+            working,
+            workspace,
+            inner_cache,
+        )?;
+    }
+    Ok(best.map(|candidate| candidate.inference))
+}
+
 fn collect_multi_chain_summaries_checked(
     grid: &Grid,
     config: EngineConfig,
@@ -2430,6 +2756,31 @@ fn search_multi_chain(
     let mut workspace = MultiWorkspace::new();
     let mut inner_cache = InnerChainCache::default();
 
+    search_multi_chain_with_resources(
+        grid,
+        config,
+        mode,
+        sink,
+        &implications,
+        &region_types,
+        &mut working,
+        &mut workspace,
+        &mut inner_cache,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_multi_chain_with_resources(
+    grid: &Grid,
+    config: EngineConfig,
+    mode: MultiMode,
+    sink: &mut MultiSink<'_>,
+    implications: &Implications,
+    region_types: &[usize],
+    working: &mut Grid,
+    workspace: &mut MultiWorkspace,
+    inner_cache: &mut InnerChainCache,
+) -> Result<(), LegacyFcPlusBoundary> {
     for raw_cell in 0_u8..81 {
         let cell = CellId::new(raw_cell).expect("cell index loop");
         if grid.value(cell) != 0 {
@@ -2445,11 +2796,11 @@ fn search_multi_chain(
         for digit in values.iter() {
             let on_branch = &mut workspace.cell_branches[branch_count];
             let contradiction_on = on_branch.run(
-                &mut working,
-                &implications,
-                &region_types,
+                &mut *working,
+                implications,
+                region_types,
                 &mut workspace.state,
-                &mut inner_cache,
+                &mut *inner_cache,
                 mode,
                 config,
                 cell,
@@ -2514,11 +2865,11 @@ fn search_multi_chain(
             // closure nearly halves the static binary work.
             if mode.is_dynamic() {
                 let contradiction_off = workspace.off_branch.run(
-                    &mut working,
-                    &implications,
-                    &region_types,
+                    &mut *working,
+                    implications,
+                    region_types,
                     &mut workspace.state,
-                    &mut inner_cache,
+                    &mut *inner_cache,
                     mode,
                     config,
                     cell,
@@ -2592,9 +2943,9 @@ fn search_multi_chain(
 
             collect_region_reductions(
                 grid,
-                &mut working,
-                &implications,
-                &region_types,
+                &mut *working,
+                implications,
+                region_types,
                 mode,
                 config,
                 cell,
@@ -2602,7 +2953,7 @@ fn search_multi_chain(
                 on_branch,
                 &mut workspace.region_branches,
                 &mut workspace.state,
-                &mut inner_cache,
+                &mut *inner_cache,
                 &mut workspace.ordered_keys,
                 sink,
             )?;
@@ -3105,13 +3456,12 @@ mod tests {
         MultiMode, active_region_types, collect_dynamic_forcing_chain_plus_checked,
         collect_dynamic_forcing_chains, collect_multiple_chain_proofs,
         collect_multiple_forcing_chains, collect_nested_forcing_chains_checked,
-        find_dynamic_forcing_chain, find_dynamic_forcing_chain_plus,
-        find_dynamic_forcing_chain_plus_checked,
+        coordinate_hash_map_cell_order, find_dynamic_forcing_chain,
+        find_dynamic_forcing_chain_plus, find_dynamic_forcing_chain_plus_checked,
         find_dynamic_forcing_chain_plus_with_proof_checked, find_dynamic_forcing_chain_with_proof,
         find_multiple_forcing_chain, find_multiple_forcing_chain_with_proof,
         find_nested_forcing_chain, find_nested_forcing_chain_with_proof_checked,
-        first_broken_fcplus_two_family, legacy_hash_map_cell_order,
-        replay_dynamic_forcing_chain_plus_with_proof_checked,
+        first_broken_fcplus_two_family, replay_dynamic_forcing_chain_plus_with_proof_checked,
         replay_dynamic_forcing_chain_with_proof, replay_multiple_forcing_chain_with_proof,
         replay_nested_forcing_chain_with_proof_checked,
     };
@@ -3223,21 +3573,353 @@ mod tests {
             .collect()
     }
 
+    fn with_legacy_se121_target_order<T>(run: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                super::APPLY_SE121_ORDER_CORRECTION.with(|enabled| enabled.set(self.0));
+            }
+        }
+
+        let previous_order =
+            super::APPLY_SE121_ORDER_CORRECTION.with(|enabled| enabled.replace(false));
+        let _restore = Restore(previous_order);
+        run()
+    }
+
+    fn classic_grid(puzzle: &str) -> Grid {
+        Grid::from_puzzle(
+            Arc::new(ConstraintTopology::new(VariantConfig::default())),
+            &Puzzle::parse(puzzle).unwrap(),
+        )
+    }
+
     #[test]
-    fn nested_advanced_targets_preserve_legacy_hash_map_order() {
+    fn corrected_se121_public_finder_uses_cell_then_digit_target_order() {
+        let grid = classic_grid(
+            "........1.....2....34..........5..6...17..3..8....9..4...6...7...8..4..9.2..3.5..",
+        );
+        let config = crate::se121::SE121_ENGINE_CONFIG;
+        let corrected = super::find_se121_dynamic_forcing_chain_plus(&grid, config)
+            .expect("corrected SE121 DFC+ hint");
+        let legacy = with_legacy_se121_target_order(|| {
+            super::find_se121_dynamic_forcing_chain_plus(&grid, config)
+                .expect("coordinate-hash-order SE121 DFC+ hint")
+        });
+
+        assert_eq!(corrected.rating(), Rating::from_tenths(95));
+        assert_eq!(corrected.removals(), legacy.removals());
+        assert_ne!(corrected, legacy);
+
+        let Evidence::MultipleForcingChain {
+            dynamic: true,
+            level: 1,
+            kind:
+                MultipleChainKind::Cell {
+                    source_cell,
+                    target_cell,
+                    target_digit,
+                    target_on: false,
+                },
+            complexity: 26,
+        } = corrected.evidence()
+        else {
+            panic!("corrected cell-then-digit winner: {corrected:?}");
+        };
+        assert_eq!(source_cell, CellId::new(49).unwrap());
+        assert_eq!(target_cell, CellId::new(70).unwrap());
+        assert_eq!(target_digit, Digit::new(2).unwrap());
+
+        let Evidence::MultipleForcingChain {
+            dynamic: true,
+            level: 1,
+            kind:
+                MultipleChainKind::Double {
+                    source_cell,
+                    source_digit,
+                    target_cell,
+                    target_digit,
+                    target_on: false,
+                },
+            complexity: 25,
+        } = legacy.evidence()
+        else {
+            panic!("coordinate-hash-order winner: {legacy:?}");
+        };
+        assert_eq!(source_cell, CellId::new(58).unwrap());
+        assert_eq!(source_digit, Digit::new(2).unwrap());
+        assert_eq!(target_cell, CellId::new(70).unwrap());
+        assert_eq!(target_digit, Digit::new(2).unwrap());
+    }
+
+    #[test]
+    fn se121_modes_select_the_old_locking_traversal() {
+        assert!(MultiMode::Se121DynamicPlus.uses_se121_locking_order());
+        for level in 2..=5 {
+            assert!(MultiMode::Se121Nested { level }.uses_se121_locking_order());
+        }
+        assert!(!MultiMode::DynamicPlus.uses_se121_locking_order());
+        assert!(
+            !MultiMode::Nested {
+                level: 2,
+                nesting_limit: 0,
+            }
+            .uses_se121_locking_order()
+        );
+    }
+
+    #[test]
+    fn corrected_se121_modes_continue_after_a_stale_advanced_family() {
+        let stale = super::AdvancedScan {
+            productive: true,
+            added: false,
+            boundary: None,
+        };
+        let added = super::AdvancedScan {
+            productive: true,
+            added: true,
+            boundary: None,
+        };
+        let boundary = super::AdvancedScan::at_boundary(LegacyFcPlusBoundary::UniqueLoops);
+
+        for mode in [
+            MultiMode::DynamicPlus,
+            MultiMode::Nested {
+                level: 3,
+                nesting_limit: 0,
+            },
+        ] {
+            assert!(mode.advanced_family_stops(stale));
+            assert!(mode.advanced_family_stops(added));
+            assert!(mode.advanced_family_stops(boundary));
+        }
+
+        for mode in [
+            MultiMode::Se121DynamicPlus,
+            MultiMode::Se121Nested { level: 3 },
+        ] {
+            assert!(!mode.advanced_family_stops(stale));
+            assert!(mode.advanced_family_stops(added));
+            assert!(mode.advanced_family_stops(boundary));
+        }
+    }
+
+    #[test]
+    fn corrected_se121_scanner_ladder_continues_from_stale_locking_to_hidden_pair() {
+        fn setup() -> (Grid, Branch, DynamicState) {
+            let mut grid = sparse_snapshot(&[
+                (0, "2"),
+                (1, "2"),
+                (9, "2"),
+                (27, "2"),
+                (3, "1"),
+                (4, "1"),
+                (12, "1"),
+                (30, "1"),
+                (72, "789"),
+                (73, "678"),
+                (74, "78"),
+            ]);
+            let mut branch = Branch::new();
+            let mut state = DynamicState::new();
+
+            remove_for_advanced(&mut branch, &mut state, &mut grid, 1, 2);
+            remove_for_advanced(&mut branch, &mut state, &mut grid, 4, 1);
+            remove_for_advanced(&mut branch, &mut state, &mut grid, 74, 7);
+            remove_for_advanced(&mut branch, &mut state, &mut grid, 74, 8);
+
+            // The two genuine Locking effects are already known to the
+            // branch, but deliberately remain visible in this scanner-state
+            // fixture so the real family reports productive-but-stale.
+            for (raw_cell, raw_digit) in [(27, 2), (30, 1)] {
+                let key = super::potential_key(
+                    CellId::new(raw_cell).unwrap(),
+                    Digit::new(raw_digit).unwrap(),
+                    false,
+                );
+                let node = branch.arena.root(key);
+                assert!(branch.to_off.add_if_absent(&branch.arena, node));
+            }
+            (grid, branch, state)
+        }
+
+        let (grid, mut stale_branch, stale_state) = setup();
+        assert_eq!(
+            stale_branch.scan_locking_se121(&grid, &stale_state),
+            super::AdvancedScan {
+                productive: true,
+                added: false,
+                boundary: None,
+            },
+            "the first real family must be productive but entirely stale"
+        );
+
+        let config = crate::se121::SE121_ENGINE_CONFIG;
+        let (grid, mut corrected, state) = setup();
+        let corrected_scan = corrected.collect_advanced(
+            &grid,
+            &state,
+            &mut InnerChainCache::default(),
+            MultiMode::Se121DynamicPlus,
+            config,
+        );
+        assert_eq!(
+            corrected_scan,
+            super::AdvancedScan {
+                productive: true,
+                added: true,
+                boundary: None,
+            }
+        );
+        assert_eq!(
+            corrected
+                .pending_off
+                .iter()
+                .map(|&node| {
+                    let (cell, digit) = super::decode_candidate(corrected.arena.key(node));
+                    (cell.raw(), digit.get())
+                })
+                .collect::<Vec<_>>(),
+            [(72_u8, 9_u8), (73, 6)],
+            "the later Hidden Pair family must contribute the new OFFs"
+        );
+
+        let (grid, mut legacy, state) = setup();
+        let legacy_scan = legacy.collect_advanced(
+            &grid,
+            &state,
+            &mut InnerChainCache::default(),
+            MultiMode::DynamicPlus,
+            config,
+        );
+        assert_eq!(
+            legacy_scan,
+            super::AdvancedScan {
+                productive: true,
+                added: false,
+                boundary: None,
+            }
+        );
+        assert!(
+            legacy.pending_off.is_empty(),
+            "the historical general policy must still prune after stale Locking"
+        );
+    }
+
+    #[test]
+    fn se121_advanced_locking_visits_regions_before_digits() {
+        fn scan(se121: bool) -> Vec<(u8, u8)> {
+            let mut grid = sparse_snapshot(&[
+                (0, "2"),
+                (1, "2"),
+                (9, "2"),
+                (27, "2"),
+                (3, "1"),
+                (4, "1"),
+                (12, "1"),
+                (30, "1"),
+            ]);
+            let mut branch = Branch::new();
+            let mut state = DynamicState::new();
+            remove_for_advanced(&mut branch, &mut state, &mut grid, 1, 2);
+            remove_for_advanced(&mut branch, &mut state, &mut grid, 4, 1);
+
+            let result = if se121 {
+                branch.scan_locking_se121(&grid, &state)
+            } else {
+                branch.scan_locking(&grid, &state)
+            };
+            assert_eq!(
+                result,
+                super::AdvancedScan {
+                    productive: true,
+                    added: true,
+                    boundary: None,
+                }
+            );
+            branch
+                .pending_off
+                .iter()
+                .map(|&node| {
+                    let (cell, digit) = super::decode_candidate(branch.arena.key(node));
+                    (cell.raw(), digit.get())
+                })
+                .collect()
+        }
+
+        assert_eq!(scan(false), [(30, 1), (27, 2)]);
+        assert_eq!(scan(true), [(27, 2), (30, 1)]);
+    }
+
+    #[test]
+    fn nested_advanced_targets_preserve_coordinate_hash_bucket_order() {
         let first_touch =
             [31_u8, 49, 39, 41].map(|raw| CellId::new(raw).expect("advanced target cell"));
+        assert_eq!(
+            MultiMode::DynamicPlus.advanced_target_order(),
+            super::AdvancedTargetOrder::CoordinateHash
+        );
         assert_eq!(
             first_touch.map(CellId::raw),
             [31_u8, 49, 39, 41],
             "compact removal first-touch order"
         );
         let mut ordered = Vec::new();
-        legacy_hash_map_cell_order(&first_touch, &mut ordered);
+        coordinate_hash_map_cell_order(&first_touch, &mut ordered);
         assert_eq!(
             ordered.into_iter().map(CellId::raw).collect::<Vec<_>>(),
             [49_u8, 39, 41, 31],
-            "default-capacity Java HashMap bucket order"
+            "default-capacity coordinate-hash bucket order"
+        );
+    }
+
+    #[test]
+    fn corrected_se121_advanced_targets_are_cell_then_digit_ordered() {
+        let mut branch = Branch::new();
+        branch.advanced_target_policy = MultiMode::Se121Nested { level: 2 }.advanced_target_order();
+        assert_eq!(
+            branch.advanced_target_policy,
+            super::AdvancedTargetOrder::CellThenDigit
+        );
+
+        let parent = branch.arena.root(super::potential_key(
+            CellId::new(80).unwrap(),
+            Digit::new(9).unwrap(),
+            false,
+        ));
+        branch.advanced_parents.push(parent);
+        for (raw_cell, digits) in [(49, "31"), (31, "92"), (41, "4"), (39, "75")] {
+            branch.advanced_target(CellId::new(raw_cell).unwrap(), mask(digits));
+        }
+
+        assert_eq!(
+            branch.commit_advanced_hint(),
+            super::AdvancedScan {
+                productive: true,
+                added: true,
+                boundary: None,
+            }
+        );
+        let ordered = branch
+            .pending_off
+            .iter()
+            .map(|&node| {
+                let (cell, digit) = super::decode_candidate(branch.arena.key(node));
+                (cell.raw(), digit.get())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered,
+            [
+                (31_u8, 2_u8),
+                (31, 9),
+                (39, 5),
+                (39, 7),
+                (41, 4),
+                (49, 1),
+                (49, 3),
+            ]
         );
     }
 
@@ -3323,7 +4005,8 @@ mod tests {
                 rating_mode,
                 ..EngineConfig::default()
             };
-            let scan = branch.collect_level_one_advanced(&grid, &state, config);
+            let scan =
+                branch.collect_level_one_advanced(&grid, &state, config, MultiMode::DynamicPlus);
             assert_eq!(
                 scan,
                 super::AdvancedScan {
@@ -3344,7 +4027,12 @@ mod tests {
         let mut state = DynamicState::new();
         remove_for_advanced(&mut branch, &mut state, &mut grid, 0, 3);
         assert_eq!(
-            branch.collect_level_one_advanced(&grid, &state, EngineConfig::default()),
+            branch.collect_level_one_advanced(
+                &grid,
+                &state,
+                EngineConfig::default(),
+                MultiMode::DynamicPlus,
+            ),
             super::AdvancedScan::default(),
             "FCPlus=0 must retain the pinned legacy schedule"
         );

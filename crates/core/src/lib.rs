@@ -16,4 +16,7 @@ pub use config::{NonConsecutiveMode, VariantConfig};
 pub use grid::{Grid, GridStateError};
 pub use ids::{CellId, Digit, RegionId};
 pub use puzzle::{ParsePuzzleError, Puzzle};
-pub use topology::{ConstraintTopology, REGION_TYPE_COUNT, write_all_java_topologies};
+pub use topology::{
+    ConstraintTopology, REGION_TYPE_COUNT, SE121_CLASSIC_PEER_COUNT, se121_classic_peers,
+    write_all_java_topologies,
+};

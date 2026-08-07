@@ -32,6 +32,7 @@ make build-web
 - [Engine architecture](docs/ARCHITECTURE.md)
 - [GUI architecture](docs/GUI_ARCHITECTURE.md)
 - [PGExplainer benchmark](docs/PGEXPLAINER.md)
+- [SE 1.2.1 classic rater](docs/CLASSIC_RATER.md)
 
 ## License
 

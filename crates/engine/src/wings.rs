@@ -1,4 +1,6 @@
-use sukaku_forge_core::{CandidateMask, CandidateRemovalsBuilder, CellId, Grid};
+use sukaku_forge_core::{
+    CandidateMask, CandidateRemovalsBuilder, CellId, Grid, se121_classic_peers,
+};
 
 use crate::{Evidence, Inference, Rating, Technique};
 
@@ -10,8 +12,18 @@ use crate::{Evidence, Inference, Rating, Technique};
 /// hand, come from Java's `CellSet` and therefore use ascending cell order.
 #[must_use]
 pub fn find_wing(grid: &Grid, xyz: bool) -> Option<Inference> {
+    find_wing_with_order(grid, xyz, false)
+}
+
+/// Find an XY-/XYZ-Wing in the block-row-column peer order of SE 1.2.1.
+#[must_use]
+pub(crate) fn find_wing_se121(grid: &Grid, xyz: bool) -> Option<Inference> {
+    find_wing_with_order(grid, xyz, true)
+}
+
+fn find_wing_with_order(grid: &Grid, xyz: bool, se121_order: bool) -> Option<Inference> {
     let mut first = None;
-    visit_wings(grid, xyz, &mut |inference| {
+    visit_wings(grid, xyz, se121_order, &mut |inference| {
         first = Some(inference);
         false
     });
@@ -23,7 +35,7 @@ pub fn find_wing(grid: &Grid, xyz: bool) -> Option<Inference> {
 pub fn collect_wings(grid: &Grid, xyz: bool) -> Vec<Inference> {
     let mut keys = Vec::new();
     let mut inferences = Vec::new();
-    visit_wings(grid, xyz, &mut |inference| {
+    visit_wings(grid, xyz, false, &mut |inference| {
         let key = wing_equality_key(&inference);
         if !keys.contains(&key) {
             keys.push(key);
@@ -60,7 +72,7 @@ fn wing_equality_key(inference: &Inference) -> (bool, u8, u8, u8, u8) {
     )
 }
 
-fn visit_wings(grid: &Grid, xyz: bool, emit: &mut dyn FnMut(Inference) -> bool) {
+fn visit_wings(grid: &Grid, xyz: bool, se121_order: bool, emit: &mut dyn FnMut(Inference) -> bool) {
     let pivot_cardinality = if xyz { 3 } else { 2 };
     for raw_pivot in 0_u8..81 {
         let pivot = cell(raw_pivot);
@@ -69,7 +81,11 @@ fn visit_wings(grid: &Grid, xyz: bool, emit: &mut dyn FnMut(Inference) -> bool) 
             continue;
         }
 
-        let peers = grid.topology().visible_peers(pivot);
+        let peers: &[u8] = if se121_order {
+            se121_classic_peers(pivot)
+        } else {
+            grid.topology().visible_peers(pivot)
+        };
         for &raw_xz in peers {
             let xz = cell(raw_xz);
             let xz_values = grid.candidates(xz);
@@ -175,7 +191,7 @@ mod tests {
         );
         let inference = find_wing(&grid, false).unwrap();
         let mut raw = Vec::new();
-        super::visit_wings(&grid, false, &mut |inference| {
+        super::visit_wings(&grid, false, false, &mut |inference| {
             raw.push(inference);
             true
         });

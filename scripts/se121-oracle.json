@@ -1,0 +1,18 @@
+{
+  "repository": "https://github.com/dclamage/SukakuExplainer.git",
+  "tag_baseline": "v1.2.1.2",
+  "commit": "a4cdac080393a5a17147ab5794a35ed98a5ef2d2",
+  "tree": "e48ef86e71237faedc37f80639348b3933dc60b5",
+  "archive_format": "git archive --format=tar",
+  "archive_sha256": "0e450e7cc16f3479558eed673c2b657b6153ed6c91eeecbbf4828bdece4dc7b0",
+  "source": "Sudoku/diuf/sudoku/test/serate.java",
+  "main_class": "diuf.sudoku.test.serate",
+  "jdk_version": "17.0.19",
+  "java_version_output_sha256": "5cb21f48e9122d5890258861880a6298b1c8e0ab6aa455ebd556989e0e15bd7d",
+  "java_release": 8,
+  "source_encoding": "windows-1252",
+  "jar_timestamp": "2019-08-09T00:00:00Z",
+  "jar_sha256": "6bc0cebb8bf89563d97ee1f7f0525c4fd021cdf0f19a0dc05b55d769f2bb4797",
+  "jar_size": 163427,
+  "class_count": 90
+}

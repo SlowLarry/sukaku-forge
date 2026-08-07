@@ -1,4 +1,7 @@
-use sukaku_forge_core::{CandidateMask, CandidateRemovalsBuilder, CellId, CellMask, Digit, Grid};
+use sukaku_forge_core::{
+    CandidateMask, CandidateRemovalsBuilder, CellId, CellMask, ConstraintTopology, Digit, Grid,
+    se121_classic_peers,
+};
 
 use crate::{
     AlignedPairCombinationSequence, AlignedTripletCombinationSequence, Evidence, Inference, Rating,
@@ -17,8 +20,18 @@ const DUPLICATE_VALUE: i8 = -1;
 /// its 81-by-81 byte workspace.
 #[must_use]
 pub fn find_aligned_pair_exclusion(grid: &Grid) -> Option<Inference> {
+    find_aligned_pair_exclusion_with_order(grid, false)
+}
+
+/// Find an Aligned Pair Exclusion in SE 1.2.1 peer insertion order.
+#[must_use]
+pub(crate) fn find_aligned_pair_exclusion_se121(grid: &Grid) -> Option<Inference> {
+    find_aligned_pair_exclusion_with_order(grid, true)
+}
+
+fn find_aligned_pair_exclusion_with_order(grid: &Grid, se121_order: bool) -> Option<Inference> {
     let mut first = None;
-    visit_aligned_pair_exclusions(grid, &mut |inference| {
+    visit_aligned_pair_exclusions(grid, se121_order, &mut |inference| {
         first = Some(inference);
         false
     });
@@ -30,7 +43,7 @@ pub fn find_aligned_pair_exclusion(grid: &Grid) -> Option<Inference> {
 pub fn collect_aligned_pair_exclusions(grid: &Grid) -> Vec<Inference> {
     let mut keys = Vec::new();
     let mut inferences = Vec::new();
-    visit_aligned_pair_exclusions(grid, &mut |inference| {
+    visit_aligned_pair_exclusions(grid, false, &mut |inference| {
         let key = aligned_exclusion_equality_key(&inference);
         if !keys.contains(&key) {
             keys.push(key);
@@ -41,7 +54,11 @@ pub fn collect_aligned_pair_exclusions(grid: &Grid) -> Vec<Inference> {
     inferences
 }
 
-fn visit_aligned_pair_exclusions(grid: &Grid, emit: &mut dyn FnMut(Inference) -> bool) {
+fn visit_aligned_pair_exclusions(
+    grid: &Grid,
+    se121_order: bool,
+    emit: &mut dyn FnMut(Inference) -> bool,
+) {
     let mut naked_singles = CellMask::EMPTY;
     let mut bivalue_cells = CellMask::EMPTY;
     for raw in 0_u8..CellId::COUNT as u8 {
@@ -72,7 +89,7 @@ fn visit_aligned_pair_exclusions(grid: &Grid, emit: &mut dyn FnMut(Inference) ->
     for second in 1..candidate_count {
         for first in 0..second {
             let bases = [cell(candidate_cells[first]), cell(candidate_cells[second])];
-            if let Some(inference) = evaluate_pair(grid, bases, bivalue_cells) {
+            if let Some(inference) = evaluate_pair(grid, bases, bivalue_cells, se121_order) {
                 if !emit(inference) {
                     return;
                 }
@@ -90,8 +107,18 @@ fn visit_aligned_pair_exclusions(grid: &Grid, emit: &mut dyn FnMut(Inference) ->
 /// unsuccessful base sets without changing any observable traversal order.
 #[must_use]
 pub fn find_aligned_triplet_exclusion(grid: &Grid) -> Option<Inference> {
+    find_aligned_triplet_exclusion_with_order(grid, false)
+}
+
+/// Find an Aligned Triplet Exclusion in SE 1.2.1 peer insertion order.
+#[must_use]
+pub(crate) fn find_aligned_triplet_exclusion_se121(grid: &Grid) -> Option<Inference> {
+    find_aligned_triplet_exclusion_with_order(grid, true)
+}
+
+fn find_aligned_triplet_exclusion_with_order(grid: &Grid, se121_order: bool) -> Option<Inference> {
     let mut first = None;
-    visit_aligned_triplet_exclusions(grid, &mut |inference| {
+    visit_aligned_triplet_exclusions(grid, se121_order, &mut |inference| {
         first = Some(inference);
         false
     });
@@ -103,7 +130,7 @@ pub fn find_aligned_triplet_exclusion(grid: &Grid) -> Option<Inference> {
 pub fn collect_aligned_triplet_exclusions(grid: &Grid) -> Vec<Inference> {
     let mut keys = Vec::new();
     let mut inferences = Vec::new();
-    visit_aligned_triplet_exclusions(grid, &mut |inference| {
+    visit_aligned_triplet_exclusions(grid, false, &mut |inference| {
         let key = aligned_exclusion_equality_key(&inference);
         if !keys.contains(&key) {
             keys.push(key);
@@ -147,7 +174,11 @@ fn aligned_exclusion_equality_key(inference: &Inference) -> AlignedExclusionEqua
     }
 }
 
-fn visit_aligned_triplet_exclusions(grid: &Grid, emit: &mut dyn FnMut(Inference) -> bool) {
+fn visit_aligned_triplet_exclusions(
+    grid: &Grid,
+    se121_order: bool,
+    emit: &mut dyn FnMut(Inference) -> bool,
+) {
     let topology = grid.topology();
     let mut excluder_masks = [CellMask::EMPTY; CellId::COUNT];
     let mut candidate_bases = CellMask::EMPTY;
@@ -161,7 +192,7 @@ fn visit_aligned_triplet_exclusions(grid: &Grid, emit: &mut dyn FnMut(Inference)
         }
 
         let mut has_naked_single = false;
-        for &raw_peer in topology.visible_peers(base) {
+        for &raw_peer in ordered_peers(topology, base, se121_order) {
             let peer = cell(raw_peer);
             match grid.candidates(peer).count() {
                 1 => has_naked_single = true,
@@ -191,7 +222,7 @@ fn visit_aligned_triplet_exclusions(grid: &Grid, emit: &mut dyn FnMut(Inference)
 
             for source in [first_base, second_base] {
                 let source_excluders = excluder_masks[usize::from(source.raw())];
-                for &raw_peer in topology.visible_peers(source) {
+                for &raw_peer in ordered_peers(topology, source, se121_order) {
                     let peer = cell(raw_peer);
                     if peer != first_base
                         && peer != second_base
@@ -210,7 +241,8 @@ fn visit_aligned_triplet_exclusions(grid: &Grid, emit: &mut dyn FnMut(Inference)
             // complete Java tail-combination order.
             for &raw_tail in &twin_cells[..twin_count] {
                 let bases = [first_base, second_base, cell(raw_tail)];
-                if let Some(inference) = evaluate_triplet(grid, bases, &excluder_masks) {
+                if let Some(inference) = evaluate_triplet(grid, bases, &excluder_masks, se121_order)
+                {
                     if !emit(inference) {
                         return;
                     }
@@ -224,6 +256,7 @@ fn evaluate_triplet(
     grid: &Grid,
     bases: [CellId; 3],
     excluder_masks: &[CellMask; CellId::COUNT],
+    se121_order: bool,
 ) -> Option<Inference> {
     let topology = grid.topology();
     let common_mask = excluder_masks[usize::from(bases[0].raw())]
@@ -231,7 +264,7 @@ fn evaluate_triplet(
         .intersect(excluder_masks[usize::from(bases[2].raw())]);
     let mut common_excluders = [0_u8; CellId::COUNT];
     let mut common_count = 0_usize;
-    for &raw_peer in topology.visible_peers(bases[0]) {
+    for &raw_peer in ordered_peers(topology, bases[0], se121_order) {
         if common_mask.contains(cell(raw_peer)) {
             common_excluders[common_count] = raw_peer;
             common_count += 1;
@@ -357,7 +390,12 @@ fn triplet_locking_code(
     result
 }
 
-fn evaluate_pair(grid: &Grid, bases: [CellId; 2], bivalue_cells: CellMask) -> Option<Inference> {
+fn evaluate_pair(
+    grid: &Grid,
+    bases: [CellId; 2],
+    bivalue_cells: CellMask,
+    se121_order: bool,
+) -> Option<Inference> {
     let mut common_excluders = [0_u8; CellId::COUNT];
     let mut common_count = 0_usize;
     let common_mask = grid
@@ -365,7 +403,7 @@ fn evaluate_pair(grid: &Grid, bases: [CellId; 2], bivalue_cells: CellMask) -> Op
         .visible_mask(bases[0])
         .intersect(grid.topology().visible_mask(bases[1]))
         .intersect(bivalue_cells);
-    for &raw_peer in grid.topology().visible_peers(bases[0]) {
+    for &raw_peer in ordered_peers(grid.topology(), bases[0], se121_order) {
         let peer = cell(raw_peer);
         if common_mask.contains(peer) {
             common_excluders[common_count] = raw_peer;
@@ -476,6 +514,14 @@ fn locking_code(
 
 fn cell(raw: u8) -> CellId {
     CellId::new(raw).expect("cell index")
+}
+
+fn ordered_peers(topology: &ConstraintTopology, cell: CellId, se121_order: bool) -> &[u8] {
+    if se121_order {
+        se121_classic_peers(cell)
+    } else {
+        topology.visible_peers(cell)
+    }
 }
 
 #[cfg(test)]
@@ -679,7 +725,7 @@ mod tests {
         );
         let inference = find_aligned_triplet_exclusion(&grid).expect("Java ATE fixture");
         let mut raw = Vec::new();
-        super::visit_aligned_triplet_exclusions(&grid, &mut |inference| {
+        super::visit_aligned_triplet_exclusions(&grid, false, &mut |inference| {
             raw.push(inference);
             true
         });

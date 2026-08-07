@@ -488,6 +488,319 @@ impl Implications {
     }
 }
 
+/// Compact directed graph used only to reject impossible SE121 static-chain
+/// roots. The accepted roots still run through the original Java-ordered
+/// searches below, so this graph never chooses a proof or affects ranking.
+struct DirectedImplicationGraph {
+    offsets: Box<[u32; KEY_COUNT + 1]>,
+    targets: Vec<u16>,
+}
+
+impl DirectedImplicationGraph {
+    fn new(implications: &Implications, y_enabled: bool, x_enabled: bool) -> Self {
+        let mut result = Self {
+            offsets: Box::new([0; KEY_COUNT + 1]),
+            targets: Vec::with_capacity(16_384),
+        };
+        for raw_key in 0..KEY_COUNT {
+            result.offsets[raw_key] =
+                u32::try_from(result.targets.len()).expect("directed implication offset");
+            let key = u16::try_from(raw_key).expect("potential key");
+            if is_on(key) {
+                implications.for_each_off(key, y_enabled, |target| {
+                    result.targets.push(target);
+                });
+            } else {
+                implications.for_each_on_with_cause(key, y_enabled, x_enabled, |target, _| {
+                    result.targets.push(target)
+                });
+            }
+        }
+        result.offsets[KEY_COUNT] =
+            u32::try_from(result.targets.len()).expect("directed implication offset");
+        result
+    }
+
+    fn reversed(&self) -> Self {
+        let mut offsets = Box::new([0_u32; KEY_COUNT + 1]);
+        for &target in &self.targets {
+            offsets[usize::from(target) + 1] += 1;
+        }
+        for key in 0..KEY_COUNT {
+            offsets[key + 1] += offsets[key];
+        }
+
+        let mut cursors = offsets.clone();
+        let mut targets = vec![0_u16; self.targets.len()];
+        for raw_source in 0..KEY_COUNT {
+            let source = u16::try_from(raw_source).expect("potential key");
+            for &target in self.neighbors(source) {
+                let cursor = &mut cursors[usize::from(target)];
+                targets[usize::try_from(*cursor).expect("reverse implication offset")] = source;
+                *cursor += 1;
+            }
+        }
+        Self { offsets, targets }
+    }
+
+    fn neighbors(&self, source: u16) -> &[u16] {
+        let source = usize::from(source);
+        let start = usize::try_from(self.offsets[source]).expect("directed implication start");
+        let end = usize::try_from(self.offsets[source + 1]).expect("directed implication end");
+        &self.targets[start..end]
+    }
+
+    fn is_incident(&self, reverse: &Self, key: u16) -> bool {
+        !self.neighbors(key).is_empty() || !reverse.neighbors(key).is_empty()
+    }
+}
+
+/// Exact reachability of the immutable static implication graph, condensed by
+/// strongly connected component. A negative answer is therefore a proof that
+/// the much more expensive Java-compatible arena traversal cannot succeed.
+struct StaticRootPrefilter {
+    may_cycle: Box<[bool; KEY_COUNT]>,
+    may_force: Box<[bool; KEY_COUNT]>,
+}
+
+impl StaticRootPrefilter {
+    const NO_COMPONENT: u16 = u16::MAX;
+
+    fn new(
+        implications: &Implications,
+        y_enabled: bool,
+        x_enabled: bool,
+        build_forcing_reachability: bool,
+    ) -> Self {
+        let graph = DirectedImplicationGraph::new(implications, y_enabled, x_enabled);
+        let reverse = graph.reversed();
+        let finish_order = Self::finish_order(&graph, &reverse);
+
+        let mut component_by_key = Box::new([Self::NO_COMPONENT; KEY_COUNT]);
+        let mut component_on_count = Vec::new();
+        let mut component_off_count = Vec::new();
+        let mut pending = Vec::with_capacity(KEY_COUNT);
+        for &start in finish_order.iter().rev() {
+            if component_by_key[usize::from(start)] != Self::NO_COMPONENT {
+                continue;
+            }
+            let component =
+                u16::try_from(component_on_count.len()).expect("static implication components");
+            component_by_key[usize::from(start)] = component;
+            pending.push(start);
+            let mut on_count = 0_u16;
+            let mut off_count = 0_u16;
+            while let Some(source) = pending.pop() {
+                if is_on(source) {
+                    on_count += 1;
+                } else {
+                    off_count += 1;
+                }
+                for &target in reverse.neighbors(source) {
+                    let slot = &mut component_by_key[usize::from(target)];
+                    if *slot == Self::NO_COMPONENT {
+                        *slot = component;
+                        pending.push(target);
+                    }
+                }
+            }
+            component_on_count.push(on_count);
+            component_off_count.push(off_count);
+        }
+
+        let mut may_cycle = Box::new([false; KEY_COUNT]);
+        for raw_key in 0..KEY_COUNT {
+            let component = component_by_key[raw_key];
+            if component != Self::NO_COMPONENT {
+                let component = usize::from(component);
+                may_cycle[raw_key] =
+                    component_on_count[component] >= 2 && component_off_count[component] >= 2;
+            }
+        }
+        // Cycle rejection needs only SCC membership. X-forcing roots can use
+        // the XY graph's negative answer because XY is a strict edge superset,
+        // so only the XY filter needs the condensation reachability closure.
+        if !build_forcing_reachability {
+            return Self {
+                may_cycle,
+                may_force: Box::new([false; KEY_COUNT]),
+            };
+        }
+
+        let component_count = component_on_count.len();
+        let mut component_edges = Vec::new();
+        for raw_source in 0..KEY_COUNT {
+            let source = u16::try_from(raw_source).expect("potential key");
+            let source_component = component_by_key[raw_source];
+            if source_component == Self::NO_COMPONENT {
+                continue;
+            }
+            for &target in graph.neighbors(source) {
+                let target_component = component_by_key[usize::from(target)];
+                if source_component != target_component {
+                    component_edges.push((source_component, target_component));
+                }
+            }
+        }
+        component_edges.sort_unstable();
+        component_edges.dedup();
+
+        let mut component_offsets = vec![0_u32; component_count + 1];
+        let mut indegree = vec![0_u16; component_count];
+        for &(source, target) in &component_edges {
+            component_offsets[usize::from(source) + 1] += 1;
+            indegree[usize::from(target)] += 1;
+        }
+        for component in 0..component_count {
+            component_offsets[component + 1] += component_offsets[component];
+        }
+
+        let component_targets = component_edges
+            .iter()
+            .map(|&(_, target)| target)
+            .collect::<Vec<_>>();
+        let mut ready = VecDeque::with_capacity(component_count);
+        for (component, &incoming) in indegree.iter().enumerate() {
+            if incoming == 0 {
+                ready.push_back(u16::try_from(component).expect("static implication component"));
+            }
+        }
+        let mut topological = Vec::with_capacity(component_count);
+        while let Some(source) = ready.pop_front() {
+            topological.push(source);
+            let start = usize::try_from(component_offsets[usize::from(source)])
+                .expect("component edge start");
+            let end = usize::try_from(component_offsets[usize::from(source) + 1])
+                .expect("component edge end");
+            for &target in &component_targets[start..end] {
+                let incoming = &mut indegree[usize::from(target)];
+                *incoming -= 1;
+                if *incoming == 0 {
+                    ready.push_back(target);
+                }
+            }
+        }
+        debug_assert_eq!(topological.len(), component_count);
+
+        let reachability_words = component_count.div_ceil(64);
+        let mut reachable_components = vec![0_u64; component_count * reachability_words];
+        for &source in topological.iter().rev() {
+            let source = usize::from(source);
+            let source_base = source * reachability_words;
+            let start = usize::try_from(component_offsets[source]).expect("component edge start");
+            let end = usize::try_from(component_offsets[source + 1]).expect("component edge end");
+            for &target in &component_targets[start..end] {
+                let target = usize::from(target);
+                reachable_components[source_base + target / 64] |= 1_u64 << (target % 64);
+                let target_base = target * reachability_words;
+                for word in 0..reachability_words {
+                    let inherited = reachable_components[target_base + word];
+                    reachable_components[source_base + word] |= inherited;
+                }
+            }
+        }
+
+        let mut may_force = Box::new([false; KEY_COUNT]);
+        for raw_key in 0..KEY_COUNT {
+            let component = component_by_key[raw_key];
+            if component == Self::NO_COMPONENT {
+                continue;
+            }
+            let component = usize::from(component);
+            let target = component_by_key[raw_key ^ 1];
+            if target == Self::NO_COMPONENT {
+                continue;
+            }
+            let target = usize::from(target);
+            may_force[raw_key] = component == target
+                || reachable_components[component * reachability_words + target / 64]
+                    & (1_u64 << (target % 64))
+                    != 0;
+        }
+        Self {
+            may_cycle,
+            may_force,
+        }
+    }
+
+    fn finish_order(
+        graph: &DirectedImplicationGraph,
+        reverse: &DirectedImplicationGraph,
+    ) -> Vec<u16> {
+        let mut visited = Box::new([false; KEY_COUNT]);
+        let mut result = Vec::with_capacity(KEY_COUNT);
+        let mut stack = Vec::with_capacity(KEY_COUNT);
+        for raw_start in 0..KEY_COUNT {
+            let start = u16::try_from(raw_start).expect("potential key");
+            if visited[raw_start] || !graph.is_incident(reverse, start) {
+                continue;
+            }
+            visited[raw_start] = true;
+            stack.push((start, 0_usize));
+            while let Some((source, next_neighbor)) = stack.last_mut() {
+                let neighbors = graph.neighbors(*source);
+                if *next_neighbor == neighbors.len() {
+                    result.push(*source);
+                    stack.pop();
+                    continue;
+                }
+                let target = neighbors[*next_neighbor];
+                *next_neighbor += 1;
+                if !visited[usize::from(target)] {
+                    visited[usize::from(target)] = true;
+                    stack.push((target, 0));
+                }
+            }
+        }
+        result
+    }
+
+    /// A recorded cycle has at least four alternating links. Its simple
+    /// first-parent path therefore contains two distinct ON and two distinct
+    /// OFF keys in one strongly connected component.
+    fn cycle_possible(&self, source_key: u16) -> bool {
+        self.may_cycle[usize::from(source_key)]
+    }
+
+    /// Forcing succeeds only by reaching the opposite truth state of its root.
+    fn forcing_possible(&self, source_key: u16) -> bool {
+        self.may_force[usize::from(source_key)]
+    }
+}
+
+/// The three static link modes used by one FCC invocation. X and Y retain
+/// mode-exact SCC cycle flags, while one XY closure safely rejects forcing
+/// roots for both X and XY searches: reachability absent from the superset is
+/// necessarily absent from its subset.
+struct StaticModePrefilters {
+    x_cycle: StaticRootPrefilter,
+    y_cycle: StaticRootPrefilter,
+    xy: StaticRootPrefilter,
+}
+
+impl StaticModePrefilters {
+    fn new(implications: &Implications) -> Self {
+        Self {
+            x_cycle: StaticRootPrefilter::new(implications, false, true, false),
+            y_cycle: StaticRootPrefilter::new(implications, true, false, false),
+            xy: StaticRootPrefilter::new(implications, true, true, true),
+        }
+    }
+
+    fn cycle(&self, y_enabled: bool, x_enabled: bool) -> &StaticRootPrefilter {
+        match (y_enabled, x_enabled) {
+            (false, true) => &self.x_cycle,
+            (true, false) => &self.y_cycle,
+            (true, true) => &self.xy,
+            _ => unreachable!("unsupported static chain link mode"),
+        }
+    }
+
+    fn forcing(&self) -> &StaticRootPrefilter {
+        &self.xy
+    }
+}
+
 struct RankedInference {
     inference: Inference,
     java_difficulty: f64,
@@ -948,15 +1261,36 @@ pub fn replay_forcing_chain_cycle_proof(
 /// graph. Nested dynamic chains consume this path; the public first-hint path
 /// above remains compact and streaming.
 pub(crate) fn collect_forcing_chain_proofs(grid: &Grid, config: EngineConfig) -> Vec<NestedHint> {
+    collect_forcing_chain_proofs_impl(grid, config, false)
+}
+
+/// Corrected SE121 nested-chain collector with exact negative root pruning.
+pub(crate) fn collect_forcing_chain_proofs_se121(
+    grid: &Grid,
+    config: EngineConfig,
+) -> Vec<NestedHint> {
+    collect_forcing_chain_proofs_impl(grid, config, true)
+}
+
+fn collect_forcing_chain_proofs_impl(
+    grid: &Grid,
+    config: EngineConfig,
+    use_root_prefilter: bool,
+) -> Vec<NestedHint> {
     let implications = Implications::new(grid, config);
     let mut workspace = StaticChainWorkspace::new();
     let mut result = NestedHintCollector::new();
+    let root_prefilters = use_root_prefilter.then(|| StaticModePrefilters::new(&implications));
 
     for (kind_cycle, kind_forcing, y_enabled, x_enabled, sort_key) in [
         (ChainKind::XCycle, ChainKind::XForcing, false, true, 2),
         (ChainKind::YCycle, ChainKind::XForcing, true, false, 3),
         (ChainKind::XyCycle, ChainKind::XyForcing, true, true, 4),
     ] {
+        let cycle_prefilter = root_prefilters
+            .as_ref()
+            .map(|filters| filters.cycle(y_enabled, x_enabled));
+        let forcing_prefilter = root_prefilters.as_ref().map(StaticModePrefilters::forcing);
         for raw_cell in 0_u8..81 {
             let cell = CellId::new(raw_cell).expect("cell index loop");
             if grid.value(cell) != 0 {
@@ -967,9 +1301,10 @@ pub(crate) fn collect_forcing_chain_proofs(grid: &Grid, config: EngineConfig) ->
                 continue;
             }
             for digit in values.iter() {
-                search_cycles(
+                search_cycles_prefiltered(
                     &mut workspace,
                     &implications,
+                    cycle_prefilter,
                     cell,
                     digit,
                     y_enabled,
@@ -992,14 +1327,14 @@ pub(crate) fn collect_forcing_chain_proofs(grid: &Grid, config: EngineConfig) ->
                 }
 
                 if x_enabled {
-                    if let Some(terminal) = search_forcing(
+                    if let Some(terminal) = search_forcing_prefiltered(
                         &mut workspace,
                         &implications,
+                        forcing_prefilter,
                         cell,
                         digit,
                         true,
-                        y_enabled,
-                        x_enabled,
+                        (y_enabled, x_enabled),
                     ) {
                         result.offer(forcing_nested_hint(
                             grid,
@@ -1009,14 +1344,14 @@ pub(crate) fn collect_forcing_chain_proofs(grid: &Grid, config: EngineConfig) ->
                             sort_key,
                         ));
                     }
-                    if let Some(terminal) = search_forcing(
+                    if let Some(terminal) = search_forcing_prefiltered(
                         &mut workspace,
                         &implications,
+                        forcing_prefilter,
                         cell,
                         digit,
                         false,
-                        y_enabled,
-                        x_enabled,
+                        (y_enabled, x_enabled),
                     ) {
                         result.offer(forcing_nested_hint(
                             grid,
@@ -1323,6 +1658,57 @@ fn chain_cause(grid: &Grid, arena: &Arena, node_id: u32) -> ChainCause {
             }
         }
     }
+}
+
+fn search_cycles_prefiltered(
+    workspace: &mut StaticChainWorkspace,
+    implications: &Implications,
+    root_prefilter: Option<&StaticRootPrefilter>,
+    source_cell: CellId,
+    source_digit: Digit,
+    y_enabled: bool,
+    x_enabled: bool,
+) {
+    let source_key = potential_key(source_cell, source_digit, true);
+    if root_prefilter.is_some_and(|filter| !filter.cycle_possible(source_key)) {
+        // Callers inspect `cycles` immediately even when no traversal runs.
+        workspace.clear();
+        return;
+    }
+    search_cycles(
+        workspace,
+        implications,
+        source_cell,
+        source_digit,
+        y_enabled,
+        x_enabled,
+    );
+}
+
+fn search_forcing_prefiltered(
+    workspace: &mut StaticChainWorkspace,
+    implications: &Implications,
+    root_prefilter: Option<&StaticRootPrefilter>,
+    source_cell: CellId,
+    source_digit: Digit,
+    source_on: bool,
+    enabled_links: (bool, bool),
+) -> Option<u32> {
+    let source_key = potential_key(source_cell, source_digit, source_on);
+    if root_prefilter.is_some_and(|filter| !filter.forcing_possible(source_key)) {
+        // Preserve the same clean-workspace postcondition as a failed search.
+        workspace.clear();
+        return None;
+    }
+    search_forcing(
+        workspace,
+        implications,
+        source_cell,
+        source_digit,
+        source_on,
+        enabled_links.0,
+        enabled_links.1,
+    )
 }
 
 fn search_cycles(
@@ -1747,10 +2133,11 @@ mod tests {
     };
 
     use super::{
-        Arena, Implications, OnCause, chain_rating, collect_forcing_chain_cycles,
-        collect_forcing_chain_proofs, find_forcing_chain_cycle,
+        Arena, Implications, OnCause, StaticChainWorkspace, StaticModePrefilters,
+        StaticRootPrefilter, chain_rating, collect_forcing_chain_cycles,
+        collect_forcing_chain_proofs, collect_forcing_chain_proofs_se121, find_forcing_chain_cycle,
         find_forcing_chain_cycle_with_proof, potential_key, replay_forcing_chain_cycle_with_proof,
-        reversed_cycle_target,
+        reversed_cycle_target, search_cycles, search_cycles_prefiltered, search_forcing,
     };
     use crate::{
         ChainCause, ChainKind, ChainProofView, ChainProofViewKind, ChainState, EngineConfig,
@@ -1808,6 +2195,128 @@ mod tests {
             .iter()
             .flat_map(|node| node.parents().iter().map(|parent| parent.cause()))
             .collect()
+    }
+
+    fn assert_static_root_prefilter_equivalent(grid: &Grid) {
+        let config = EngineConfig::default();
+        let implications = Implications::new(grid, config);
+        let filters = StaticModePrefilters::new(&implications);
+        let mut workspace = StaticChainWorkspace::new();
+
+        for (y_enabled, x_enabled) in [(false, true), (true, false), (true, true)] {
+            let cycle_filter = filters.cycle(y_enabled, x_enabled);
+            for raw_cell in 0_u8..81 {
+                let cell = CellId::new(raw_cell).unwrap();
+                for digit in grid.candidates(cell).iter() {
+                    search_cycles(
+                        &mut workspace,
+                        &implications,
+                        cell,
+                        digit,
+                        y_enabled,
+                        x_enabled,
+                    );
+                    assert!(
+                        workspace.cycles.is_empty()
+                            || cycle_filter.cycle_possible(potential_key(cell, digit, true)),
+                        "cycle false negative at {cell:?}.{digit:?}, Y={y_enabled}, X={x_enabled}"
+                    );
+
+                    if x_enabled {
+                        for source_on in [true, false] {
+                            let found = search_forcing(
+                                &mut workspace,
+                                &implications,
+                                cell,
+                                digit,
+                                source_on,
+                                y_enabled,
+                                x_enabled,
+                            )
+                            .is_some();
+                            assert!(
+                                !found
+                                    || filters
+                                        .forcing()
+                                        .forcing_possible(potential_key(cell, digit, source_on,)),
+                                "forcing false negative at {cell:?}.{digit:?}={source_on}, Y={y_enabled}, X={x_enabled}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let unfiltered = collect_forcing_chain_proofs(grid, config);
+        let filtered = collect_forcing_chain_proofs_se121(grid, config);
+        assert_eq!(filtered.len(), unfiltered.len());
+        for (filtered, unfiltered) in filtered.iter().zip(&unfiltered) {
+            assert_eq!(filtered.removals, unfiltered.removals);
+            assert_eq!(filtered.java_difficulty, unfiltered.java_difficulty);
+            assert_eq!(filtered.complexity, unfiltered.complexity);
+            assert_eq!(filtered.sort_key, unfiltered.sort_key);
+            assert_eq!(filtered.proof.fingerprint(), unfiltered.proof.fingerprint());
+        }
+    }
+
+    #[test]
+    fn se121_root_prefilter_has_no_false_negatives_and_preserves_ordered_results() {
+        for grid in [
+            sparse_snapshot(
+                &[(0, "12"), (3, "13"), (30, "14"), (27, "15"), (6, "16")],
+                VariantConfig::default(),
+            ),
+            sparse_snapshot(
+                &[(0, "12"), (3, "23"), (30, "34"), (27, "14"), (54, "1")],
+                VariantConfig::default(),
+            ),
+            sparse_snapshot(
+                &[(0, "19"), (3, "12"), (30, "234"), (27, "29")],
+                VariantConfig::default(),
+            ),
+        ] {
+            assert_static_root_prefilter_equivalent(&grid);
+        }
+    }
+
+    #[test]
+    fn rejected_root_clears_reused_static_workspace() {
+        let grid = sparse_snapshot(
+            &[(0, "12"), (3, "13"), (30, "14"), (27, "15"), (6, "16")],
+            VariantConfig::default(),
+        );
+        let implications = Implications::new(&grid, EngineConfig::default());
+        let filter = StaticRootPrefilter::new(&implications, false, true, false);
+        let mut workspace = StaticChainWorkspace::new();
+        search_cycles(
+            &mut workspace,
+            &implications,
+            cell(0),
+            Digit::new(1).unwrap(),
+            false,
+            true,
+        );
+        assert!(!workspace.arena.nodes.is_empty());
+
+        let rejected = (0_u8..81).find_map(|raw_cell| {
+            let cell = cell(raw_cell);
+            grid.candidates(cell)
+                .iter()
+                .find(|&digit| !filter.cycle_possible(potential_key(cell, digit, true)))
+                .map(|digit| (cell, digit))
+        });
+        let (source_cell, source_digit) = rejected.expect("fixture has a rejected root");
+        search_cycles_prefiltered(
+            &mut workspace,
+            &implications,
+            Some(&filter),
+            source_cell,
+            source_digit,
+            false,
+            true,
+        );
+        assert!(workspace.arena.nodes.is_empty());
+        assert!(workspace.cycles.is_empty());
     }
 
     #[test]

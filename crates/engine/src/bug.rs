@@ -2,7 +2,7 @@ use std::array;
 
 use sukaku_forge_core::{
     CandidateMask, CandidateRemovals, CandidateRemovalsBuilder, CellId, CellMask, Digit, Grid,
-    NonConsecutiveMode, REGION_TYPE_COUNT, RegionId,
+    NonConsecutiveMode, REGION_TYPE_COUNT, RegionId, se121_classic_peers,
 };
 
 use crate::{
@@ -16,19 +16,29 @@ use crate::{
 /// snapshot, avoiding a topology/cache clone on every unsuccessful probe.
 #[must_use]
 pub fn find_bivalue_universal_grave(grid: &Grid, config: EngineConfig) -> Option<Inference> {
-    BugSearch::new(grid, config).find()
+    BugSearch::new(grid, config, false).find()
+}
+
+/// Find the first BUG using pristine SE 1.2.1 common-cell insertion order.
+#[must_use]
+pub(crate) fn find_bivalue_universal_grave_se121(
+    grid: &Grid,
+    config: EngineConfig,
+) -> Option<Inference> {
+    BugSearch::new(grid, config, true).find()
 }
 
 /// Collect every Java-compatible Bivalue Universal Grave hint in producer
 /// order, including all shared-region Type 4 and naked-set Type 3 variants.
 #[must_use]
 pub fn collect_bivalue_universal_grave(grid: &Grid, config: EngineConfig) -> Vec<Inference> {
-    BugSearch::new(grid, config).collect()
+    BugSearch::new(grid, config, false).collect()
 }
 
 struct BugSearch<'a> {
     grid: &'a Grid,
     config: EngineConfig,
+    se121_order: bool,
     variant_latin: bool,
     stripped: [CandidateMask; CellId::COUNT],
     bug_cells: [CellId; CellId::COUNT],
@@ -40,10 +50,11 @@ struct BugSearch<'a> {
 }
 
 impl<'a> BugSearch<'a> {
-    fn new(grid: &'a Grid, config: EngineConfig) -> Self {
+    fn new(grid: &'a Grid, config: EngineConfig, se121_order: bool) -> Self {
         Self {
             grid,
             config,
+            se121_order,
             variant_latin: effective_variant_latin(grid, config),
             stripped: array::from_fn(|index| grid.candidates(cell(index as u8))),
             bug_cells: [cell(0); CellId::COUNT],
@@ -334,9 +345,18 @@ impl<'a> BugSearch<'a> {
         let digit = self.all_bug_values.single()?;
         let common = self.common_cells?;
         let mut builder = CandidateRemovalsBuilder::with_capacity(common.count() as usize);
-        for victim in common.iter() {
-            if self.grid.candidates(victim).contains(digit) {
-                builder.add(victim, CandidateMask::of(digit));
+        if self.se121_order {
+            for &raw_peer in se121_classic_peers(self.bug_cells[0]) {
+                let victim = cell(raw_peer);
+                if common.contains(victim) && self.grid.candidates(victim).contains(digit) {
+                    builder.add(victim, CandidateMask::of(digit));
+                }
+            }
+        } else {
+            for victim in common.iter() {
+                if self.grid.candidates(victim).contains(digit) {
+                    builder.add(victim, CandidateMask::of(digit));
+                }
             }
         }
         inference(
@@ -455,7 +475,7 @@ impl<'a> BugSearch<'a> {
         };
         let mut region_cells = [cell(0); 9];
         let mut region_cell_count = 0;
-        for common_cell in common.iter() {
+        let mut add_if_in_region = |common_cell| {
             if self
                 .grid
                 .topology()
@@ -464,6 +484,18 @@ impl<'a> BugSearch<'a> {
             {
                 region_cells[region_cell_count] = common_cell;
                 region_cell_count += 1;
+            }
+        };
+        if self.se121_order {
+            for &raw_peer in se121_classic_peers(self.bug_cells[0]) {
+                let common_cell = cell(raw_peer);
+                if common.contains(common_cell) {
+                    add_if_in_region(common_cell);
+                }
+            }
+        } else {
+            for common_cell in common.iter() {
+                add_if_in_region(common_cell);
             }
         }
         if region_cell_count < usize::from(degree) {

@@ -40,12 +40,7 @@ fn visit_naked_sets(
         matches!(degree, 2..=4),
         "only pair through quad layers are currently registered"
     );
-    let families = if generalized {
-        extended_family_order(grid, config)
-    } else {
-        naked_set_family_order(grid)
-    };
-    for type_index in families {
+    for type_index in set_family_order(grid, config, generalized) {
         for region_index in 0..grid.topology().region_count(type_index) {
             let region = region_id(type_index, region_index);
             if empty_cell_count(grid, region) < usize::from(degree * 2) {
@@ -116,7 +111,7 @@ fn visit_hidden_sets(
         matches!(degree, 2..=4),
         "only pair through quad layers are currently registered"
     );
-    for type_index in extended_family_order(grid, config) {
+    for type_index in set_family_order(grid, config, true) {
         for region_index in 0..grid.topology().region_count(type_index) {
             let region = region_id(type_index, region_index);
             if empty_cell_count(grid, region) <= usize::from(degree * 2) {
@@ -432,36 +427,25 @@ fn tuple_cell_mask(grid: &Grid, region: RegionId, positions: PositionMask) -> Ce
     result
 }
 
-fn naked_set_family_order(grid: &Grid) -> Vec<usize> {
-    let mut result = Vec::with_capacity(5);
-    if grid.topology().config().blocks {
-        result.push(0);
-    }
-    result.extend([2, 1]);
-    if grid.topology().config().disjoint_groups {
-        result.push(3);
-    }
-    if grid.topology().config().windows {
-        result.push(4);
-    }
-    result
-}
+const SET_FAMILY_ORDER: &[usize; REGION_TYPE_COUNT] = &[0, 2, 1, 3, 4, 5, 6, 7, 8, 9];
 
-fn extended_family_order(grid: &Grid, config: EngineConfig) -> Vec<usize> {
-    let mut result = Vec::with_capacity(REGION_TYPE_COUNT);
-    if grid.topology().config().blocks {
-        result.push(0);
-    }
-    result.extend([2, 1]);
-    if config.variant_latin {
-        return result;
-    }
-    for type_index in [3, 4, 5, 6, 7, 8, 9] {
-        if grid.topology().is_region_type_active(type_index) {
-            result.push(type_index);
-        }
-    }
-    result
+fn set_family_order(
+    grid: &Grid,
+    config: EngineConfig,
+    generalized: bool,
+) -> impl Iterator<Item = usize> + '_ {
+    let topology = grid.topology();
+    SET_FAMILY_ORDER
+        .iter()
+        .copied()
+        .filter(move |&type_index| match type_index {
+            0 => topology.config().blocks,
+            1 | 2 => true,
+            3 if !generalized => topology.config().disjoint_groups,
+            4 if !generalized => topology.config().windows,
+            5.. if !generalized => false,
+            _ => !config.variant_latin && topology.is_region_type_active(type_index),
+        })
 }
 
 fn combination_masks(degree: u8) -> CombinationMasks {
@@ -515,7 +499,7 @@ mod tests {
 
     use super::{
         collect_fish, collect_hidden_sets, collect_naked_sets, combination_masks, find_fish,
-        find_hidden_set, find_naked_set,
+        find_hidden_set, find_naked_set, set_family_order,
     };
     use crate::{EngineConfig, Evidence, Inference, Rating, RatingMode, Technique};
 
@@ -546,6 +530,66 @@ mod tests {
             &candidates,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn stack_family_iterators_preserve_classic_and_variant_order() {
+        let classic = sparse_snapshot(VariantConfig::default(), &[]);
+        assert_eq!(
+            set_family_order(&classic, EngineConfig::default(), false).collect::<Vec<_>>(),
+            [0, 2, 1]
+        );
+        assert_eq!(
+            set_family_order(&classic, EngineConfig::default(), true).collect::<Vec<_>>(),
+            [0, 2, 1]
+        );
+
+        let all_variants = VariantConfig {
+            disjoint_groups: true,
+            windows: true,
+            sudoku_x: true,
+            girandola: true,
+            asterisk: true,
+            center_dot: true,
+            ..VariantConfig::default()
+        };
+        let every_region = sparse_snapshot(all_variants, &[]);
+        assert_eq!(
+            set_family_order(&every_region, EngineConfig::default(), false).collect::<Vec<_>>(),
+            [0, 2, 1, 3, 4]
+        );
+        assert_eq!(
+            set_family_order(&every_region, EngineConfig::default(), true).collect::<Vec<_>>(),
+            [0, 2, 1, 3, 4, 5, 6, 7, 8, 9]
+        );
+        assert_eq!(
+            set_family_order(
+                &every_region,
+                EngineConfig {
+                    variant_latin: true,
+                    ..EngineConfig::default()
+                },
+                true,
+            )
+            .collect::<Vec<_>>(),
+            [0, 2, 1]
+        );
+
+        let blockless = sparse_snapshot(
+            VariantConfig {
+                blocks: false,
+                ..all_variants
+            },
+            &[],
+        );
+        assert_eq!(
+            set_family_order(&blockless, EngineConfig::default(), false).collect::<Vec<_>>(),
+            [2, 1, 3, 4]
+        );
+        assert_eq!(
+            set_family_order(&blockless, EngineConfig::default(), true).collect::<Vec<_>>(),
+            [2, 1, 3, 4, 5, 6, 7, 8, 9]
+        );
     }
 
     #[test]

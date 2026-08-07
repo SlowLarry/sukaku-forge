@@ -1,0 +1,17 @@
+[package]
+name = "sukaku-forge-classic-rater"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sukaku-forge-core = { path = "../core" }
+sukaku-forge-engine = { path = "../engine" }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "sukaku-forge-rate"
+path = "src/main.rs"

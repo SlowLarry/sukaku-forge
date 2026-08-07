@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "description": "Slow, non-protected corrected nested-chain cases with pinned SE 1.2.1 baselines.",
+  "format": "%r/%p/%d",
+  "protected_cases_included": false,
+  "cases": [
+    {
+      "id": "ai_escargot_nested_10_5",
+      "puzzle": "1....7.9..3..2...8..96..5....53..9...1..8...26....4...3......1..4......7..7...3..",
+      "expected_rating": "10.5/1.2/1.2"
+    }
+  ]
+}

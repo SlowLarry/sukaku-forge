@@ -1,0 +1,53 @@
+{
+  "schema_version": 2,
+  "description": "Small, non-protected corrected-rater corpus with pinned SE 1.2.1 baselines. Cases may provide expected_oracle_rating when an intentional bug fix changes expected_rating.",
+  "format": "%r/%p/%d",
+  "protected_cases_included": false,
+  "cases": [
+    {
+      "id": "gui_default",
+      "puzzle": "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79",
+      "expected_rating": "1.2/1.2/1.2"
+    },
+    {
+      "id": "classic_1_2",
+      "puzzle": "200080300060070084030500209000105408000000000402706000301007040720040060004010003",
+      "expected_rating": "1.2/1.2/1.2"
+    },
+    {
+      "id": "classic_2_0",
+      "puzzle": "000000907000420180000705026100904000050000040000507009920108000034059000507000000",
+      "expected_rating": "2.0/1.2/1.2"
+    },
+    {
+      "id": "classic_2_6",
+      "puzzle": "4.....8.5.3..........7......2.....6.....8.4......1.......6.3.7.5..2.....1.4......",
+      "expected_rating": "2.6/1.2/1.2"
+    },
+    {
+      "id": "bug_uniqueness_opt_in_5_7",
+      "puzzle": "1.3.5..8...67.9.2.............3....7.6.......8...14..55316...7......8....7....6..",
+      "expected_rating": "5.7/1.2/1.2"
+    },
+    {
+      "id": "aligned_pair_and_dynamic_8_9",
+      "puzzle": "100000002520070049009000500000689000000703000090105030640010025010000070900000008",
+      "expected_rating": "8.9/1.5/1.5"
+    },
+    {
+      "id": "static_forcing_chain_7_2",
+      "puzzle": ".3...89.2..2....4.......567...76...34...53........485.96..3....28.41.6.......617.",
+      "expected_rating": "7.2/1.2/1.2"
+    },
+    {
+      "id": "dynamic_forcing_chain_plus_9_3",
+      "puzzle": "300205000000000010008060200000007604009300000600080000000000920500104006070000005",
+      "expected_rating": "9.3/1.2/1.2"
+    },
+    {
+      "id": "dynamic_forcing_chain_plus_9_8",
+      "puzzle": "........1.....2....34..........5..6...17..3..8....9..4...6...7...8..4..9.2..3.5..",
+      "expected_rating": "9.8/9.8/9.5"
+    }
+  ]
+}

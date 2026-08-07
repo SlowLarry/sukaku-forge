@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "sukaku-forge"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "sukaku-forge-core",
  "sukaku-forge-engine",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "sukaku-forge-app"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -119,19 +119,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "sukaku-forge-classic-rater"
+version = "0.5.0"
+dependencies = [
+ "sukaku-forge-core",
+ "sukaku-forge-engine",
+]
+
+[[package]]
 name = "sukaku-forge-core"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "sukaku-forge-engine"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "sukaku-forge-core",
 ]
 
 [[package]]
 name = "sukaku-forge-presentation"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -141,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "sukaku-forge-wasm-api"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "sukaku-forge-app",
  "wasm-bindgen",

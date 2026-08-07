@@ -4,9 +4,71 @@ use std::io::{self, Write};
 use crate::{CellId, CellMask, NonConsecutiveMode, PositionMask, RegionId, VariantConfig};
 
 pub const REGION_TYPE_COUNT: usize = 10;
+pub const SE121_CLASSIC_PEER_COUNT: usize = 20;
+
+const SE121_CLASSIC_PEERS: [[u8; SE121_CLASSIC_PEER_COUNT]; CellId::COUNT] =
+    build_se121_classic_peers();
 
 type PeerTable = [Vec<u8>; CellId::COUNT];
 type Regions = [Vec<[u8; 9]>; REGION_TYPE_COUNT];
+
+/// Classic peer order used by pristine Sudoku Explainer 1.2.1.
+///
+/// `Cell.getHouseCells()` inserted block cells, then row cells, then column
+/// cells into a `LinkedHashSet`. Later Sukaku Explainer releases replaced this
+/// with an ascending cell-index catalog. The difference is observable in a
+/// few producer tie-breaks, so the dedicated old rater keeps this fixed table
+/// rather than changing the general topology contract.
+#[must_use]
+pub const fn se121_classic_peers(cell: CellId) -> &'static [u8; SE121_CLASSIC_PEER_COUNT] {
+    &SE121_CLASSIC_PEERS[cell.index()]
+}
+
+const fn build_se121_classic_peers() -> [[u8; SE121_CLASSIC_PEER_COUNT]; CellId::COUNT] {
+    let mut result = [[0_u8; SE121_CLASSIC_PEER_COUNT]; CellId::COUNT];
+    let mut raw_cell = 0_usize;
+    while raw_cell < CellId::COUNT {
+        let row = raw_cell / 9;
+        let column = raw_cell % 9;
+        let block_row = row / 3 * 3;
+        let block_column = column / 3 * 3;
+        let mut length = 0_usize;
+
+        let mut block_offset = 0_usize;
+        while block_offset < 9 {
+            let peer_row = block_row + block_offset / 3;
+            let peer_column = block_column + block_offset % 3;
+            let peer = peer_row * 9 + peer_column;
+            if peer != raw_cell {
+                result[raw_cell][length] = peer as u8;
+                length += 1;
+            }
+            block_offset += 1;
+        }
+
+        let mut peer_column = 0_usize;
+        while peer_column < 9 {
+            if peer_column / 3 != column / 3 {
+                result[raw_cell][length] = (row * 9 + peer_column) as u8;
+                length += 1;
+            }
+            peer_column += 1;
+        }
+
+        let mut peer_row = 0_usize;
+        while peer_row < 9 {
+            if peer_row / 3 != row / 3 {
+                result[raw_cell][length] = (peer_row * 9 + column) as u8;
+                length += 1;
+            }
+            peer_row += 1;
+        }
+
+        debug_assert!(length == SE121_CLASSIC_PEER_COUNT);
+        raw_cell += 1;
+    }
+    result
+}
 
 const ORTHOGONAL_OFFSETS: [(i8, i8); 4] = [(-1, 0), (1, 0), (0, 1), (0, -1)];
 const DIAGONAL_OFFSETS: [(i8, i8); 4] = [(-1, -1), (-1, 1), (1, -1), (1, 1)];
@@ -585,7 +647,7 @@ impl OrderedCellIndexes {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConstraintTopology, REGION_TYPE_COUNT};
+    use super::{ConstraintTopology, REGION_TYPE_COUNT, se121_classic_peers};
     use crate::{CellId, VariantConfig};
 
     #[test]
@@ -603,6 +665,22 @@ mod tests {
             topology.visible_peers(cell)
         );
         assert!(topology.chess_only_peers(cell).is_empty());
+    }
+
+    #[test]
+    fn se121_peer_order_keeps_block_then_row_then_column_insertion() {
+        assert_eq!(
+            *se121_classic_peers(CellId::new(0).unwrap()),
+            [
+                1, 2, 9, 10, 11, 18, 19, 20, 3, 4, 5, 6, 7, 8, 27, 36, 45, 54, 63, 72
+            ]
+        );
+        assert_eq!(
+            *se121_classic_peers(CellId::new(40).unwrap()),
+            [
+                30, 31, 32, 39, 41, 48, 49, 50, 36, 37, 38, 42, 43, 44, 4, 13, 22, 58, 67, 76
+            ]
+        );
     }
 
     #[test]

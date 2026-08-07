@@ -209,6 +209,18 @@ pub fn find_direct_locking(grid: &Grid) -> Option<Inference> {
     first_inference(|emit| visit_direct_locking(grid, emit))
 }
 
+/// Find the first direct Pointing/Claiming placement in pristine SE 1.2.1
+/// producer order.
+///
+/// That release visits one primary region and each region crossing it before
+/// iterating the candidate digits. Later Sukaku Explainer releases move the
+/// digit loop outside the region loops; keep that behavior isolated in
+/// [`find_direct_locking`].
+#[must_use]
+pub(crate) fn find_direct_locking_se121(grid: &Grid) -> Option<Inference> {
+    first_inference(|emit| visit_direct_locking_se121(grid, emit))
+}
+
 /// Collect every direct Pointing/Claiming placement in Java discovery order.
 #[must_use]
 pub fn collect_direct_locking(grid: &Grid) -> Vec<Inference> {
@@ -292,10 +304,91 @@ fn visit_direct_locking(grid: &Grid, emit: &mut dyn FnMut(Inference) -> bool) {
     }
 }
 
+fn visit_direct_locking_se121(grid: &Grid, emit: &mut dyn FnMut(Inference) -> bool) {
+    if !grid.topology().config().blocks {
+        return;
+    }
+    for (primary_type, secondary_type) in locking_family_pairs(grid) {
+        for primary_index in 0..grid.topology().region_count(primary_type) {
+            let primary = region_id(primary_type, primary_index);
+            for secondary_index in 0..grid.topology().region_count(secondary_type) {
+                let secondary = region_id(secondary_type, secondary_index);
+                let primary_overlap = grid.topology().overlap_positions(primary, secondary);
+                if primary_overlap.is_empty() {
+                    continue;
+                }
+                for value in 1_u8..=9 {
+                    let candidate = digit(value);
+                    let primary_positions = grid.region_candidate_positions(primary, candidate);
+                    if primary_positions.count() < 2
+                        || !primary_positions.without(primary_overlap).is_empty()
+                    {
+                        continue;
+                    }
+                    for following_index in 0..grid.topology().region_count(primary_type) {
+                        if following_index == primary_index {
+                            continue;
+                        }
+                        let following = region_id(primary_type, following_index);
+                        let following_overlap =
+                            grid.topology().overlap_positions(following, secondary);
+                        if following_overlap.is_empty() {
+                            continue;
+                        }
+                        let following_positions =
+                            grid.region_candidate_positions(following, candidate);
+                        if following_positions.count() <= 1 {
+                            continue;
+                        }
+                        let Some(target_position) =
+                            following_positions.without(following_overlap).single()
+                        else {
+                            continue;
+                        };
+                        let target = cell_id(
+                            grid.topology().region_cells(following)[usize::from(target_position)],
+                        );
+                        let secondary_overlap =
+                            grid.topology().overlap_positions(secondary, primary);
+                        let pattern_positions = grid
+                            .region_candidate_positions(secondary, candidate)
+                            .intersect(secondary_overlap);
+                        let (technique, rating) = if primary_type == 0 {
+                            (Technique::DirectPointing, Rating::from_tenths(17))
+                        } else {
+                            (Technique::DirectClaiming, Rating::from_tenths(19))
+                        };
+                        if !emit(Inference::placement(
+                            technique,
+                            rating,
+                            target,
+                            candidate,
+                            Evidence::DirectLocking {
+                                primary,
+                                secondary,
+                                pattern_positions,
+                            },
+                        )) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Find the first ordinary Pointing/Claiming elimination.
 #[must_use]
 pub fn find_locking(grid: &Grid) -> Option<Inference> {
     first_inference(|emit| visit_locking(grid, emit))
+}
+
+/// Find the first ordinary Pointing/Claiming elimination in pristine SE 1.2.1
+/// producer order.
+#[must_use]
+pub(crate) fn find_locking_se121(grid: &Grid) -> Option<Inference> {
+    first_inference(|emit| visit_locking_se121(grid, emit))
 }
 
 /// Collect every ordinary Pointing/Claiming elimination in discovery order.
@@ -324,6 +417,68 @@ fn visit_locking(grid: &Grid, emit: &mut dyn FnMut(Inference) -> bool) {
                     let secondary = region_id(secondary_type, secondary_index);
                     let primary_overlap = grid.topology().overlap_positions(primary, secondary);
                     if primary_overlap.is_empty()
+                        || !primary_positions.without(primary_overlap).is_empty()
+                    {
+                        continue;
+                    }
+                    let secondary_overlap = grid.topology().overlap_positions(secondary, primary);
+                    let secondary_positions = grid.region_candidate_positions(secondary, candidate);
+                    let pattern_positions = secondary_positions.intersect(secondary_overlap);
+                    let removable_positions = secondary_positions.without(secondary_overlap);
+                    let mut builder = CandidateRemovalsBuilder::with_capacity(
+                        removable_positions.count() as usize,
+                    );
+                    for position in removable_positions.iter() {
+                        builder.add(
+                            cell_id(grid.topology().region_cells(secondary)[usize::from(position)]),
+                            CandidateMask::of(candidate),
+                        );
+                    }
+                    let removals = builder.build();
+                    if removals.is_empty() {
+                        continue;
+                    }
+                    let (technique, rating) = if matches!(secondary_type, 1 | 2) {
+                        (Technique::Pointing, Rating::from_tenths(26))
+                    } else {
+                        (Technique::Claiming, Rating::from_tenths(28))
+                    };
+                    if !emit(Inference::elimination(
+                        technique,
+                        rating,
+                        removals,
+                        Evidence::Locking {
+                            primary,
+                            secondary,
+                            digit: candidate,
+                            pattern_positions,
+                        },
+                    )) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn visit_locking_se121(grid: &Grid, emit: &mut dyn FnMut(Inference) -> bool) {
+    if !grid.topology().config().blocks {
+        return;
+    }
+    for (primary_type, secondary_type) in locking_family_pairs(grid) {
+        for primary_index in 0..grid.topology().region_count(primary_type) {
+            let primary = region_id(primary_type, primary_index);
+            for secondary_index in 0..grid.topology().region_count(secondary_type) {
+                let secondary = region_id(secondary_type, secondary_index);
+                let primary_overlap = grid.topology().overlap_positions(primary, secondary);
+                if primary_overlap.is_empty() {
+                    continue;
+                }
+                for value in 1_u8..=9 {
+                    let candidate = digit(value);
+                    let primary_positions = grid.region_candidate_positions(primary, candidate);
+                    if primary_positions.count() < 2
                         || !primary_positions.without(primary_overlap).is_empty()
                     {
                         continue;
@@ -523,51 +678,63 @@ fn locking_hint_equality_key(grid: &Grid, inference: &Inference) -> LockingHintE
     }
 }
 
-fn hidden_set_family_order(grid: &Grid, config: EngineConfig) -> Vec<usize> {
-    let mut result = Vec::with_capacity(REGION_TYPE_COUNT);
-    if grid.topology().config().blocks {
-        result.push(0);
-    }
-    result.push(2);
-    result.push(1);
-    if config.variant_latin {
-        return result;
-    }
-    for type_index in [3, 4, 5, 6, 7, 8, 9] {
-        if grid.topology().is_region_type_active(type_index) {
-            result.push(type_index);
-        }
-    }
-    result
-}
+const HIDDEN_SET_FAMILY_ORDER: &[usize; REGION_TYPE_COUNT] = &[0, 2, 1, 3, 4, 5, 6, 7, 8, 9];
+const GENERALIZED_INTERSECTION_FAMILY_ORDER: &[usize; REGION_TYPE_COUNT] =
+    &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+const CLASSIC_LOCKING_FAMILY_PAIRS: &[(usize, usize)] = &[(0, 2), (0, 1), (2, 0), (1, 0)];
+const DISJOINT_LOCKING_FAMILY_PAIRS: &[(usize, usize)] =
+    &[(3, 2), (3, 1), (2, 3), (1, 3), (0, 3), (3, 0)];
+const WINDOW_LOCKING_FAMILY_PAIRS: &[(usize, usize)] =
+    &[(4, 2), (4, 1), (2, 4), (1, 4), (0, 4), (4, 0)];
+const WINDOW_DISJOINT_LOCKING_FAMILY_PAIRS: &[(usize, usize)] = &[(4, 3), (3, 4)];
 
-fn locking_family_pairs(grid: &Grid) -> Vec<(usize, usize)> {
+fn hidden_set_family_order(grid: &Grid, config: EngineConfig) -> impl Iterator<Item = usize> + '_ {
     let topology = grid.topology();
-    let mut pairs = vec![(0, 2), (0, 1), (2, 0), (1, 0)];
-    if topology.config().disjoint_groups {
-        pairs.extend([(3, 2), (3, 1), (2, 3), (1, 3), (0, 3), (3, 0)]);
-    }
-    if topology.config().windows {
-        pairs.extend([(4, 2), (4, 1), (2, 4), (1, 4), (0, 4), (4, 0)]);
-    }
-    if topology.config().windows && topology.config().disjoint_groups {
-        pairs.extend([(4, 3), (3, 4)]);
-    }
-    pairs
+    HIDDEN_SET_FAMILY_ORDER
+        .iter()
+        .copied()
+        .filter(move |&type_index| match type_index {
+            0 => topology.config().blocks,
+            1 | 2 => true,
+            _ => !config.variant_latin && topology.is_region_type_active(type_index),
+        })
 }
 
-fn generalized_intersection_family_order(grid: &Grid) -> Vec<usize> {
-    let mut result = Vec::with_capacity(REGION_TYPE_COUNT);
-    if grid.topology().config().blocks {
-        result.push(0);
-    }
-    result.extend([1, 2]);
-    for type_index in [3, 4, 5, 6, 7, 8, 9] {
-        if grid.topology().is_region_type_active(type_index) {
-            result.push(type_index);
-        }
-    }
-    result
+fn locking_family_pairs(grid: &Grid) -> impl Iterator<Item = (usize, usize)> {
+    let variant = grid.topology().config();
+    CLASSIC_LOCKING_FAMILY_PAIRS
+        .iter()
+        .copied()
+        .chain(
+            DISJOINT_LOCKING_FAMILY_PAIRS
+                .iter()
+                .copied()
+                .filter(move |_| variant.disjoint_groups),
+        )
+        .chain(
+            WINDOW_LOCKING_FAMILY_PAIRS
+                .iter()
+                .copied()
+                .filter(move |_| variant.windows),
+        )
+        .chain(
+            WINDOW_DISJOINT_LOCKING_FAMILY_PAIRS
+                .iter()
+                .copied()
+                .filter(move |_| variant.windows && variant.disjoint_groups),
+        )
+}
+
+fn generalized_intersection_family_order(grid: &Grid) -> impl Iterator<Item = usize> + '_ {
+    let topology = grid.topology();
+    GENERALIZED_INTERSECTION_FAMILY_ORDER
+        .iter()
+        .copied()
+        .filter(move |&type_index| match type_index {
+            0 => topology.config().blocks,
+            1 | 2 => true,
+            _ => topology.is_region_type_active(type_index),
+        })
 }
 
 fn cell_id(raw: u8) -> CellId {
@@ -591,10 +758,85 @@ mod tests {
     use super::{
         collect_direct_hidden_sets, collect_direct_locking, collect_generalized_intersections,
         collect_hidden_singles, collect_locking, collect_naked_singles, find_direct_hidden_set,
-        find_direct_locking, find_generalized_intersections, find_hidden_single, find_locking,
-        find_naked_single,
+        find_direct_locking, find_direct_locking_se121, find_generalized_intersections,
+        find_hidden_single, find_locking, find_locking_se121, find_naked_single,
+        generalized_intersection_family_order, hidden_set_family_order, locking_family_pairs,
     };
     use crate::{EngineConfig, Evidence, Rating, RatingMode, Technique};
+
+    fn empty_grid(config: VariantConfig) -> Grid {
+        let puzzle = Puzzle::parse(&".".repeat(81)).unwrap();
+        Grid::from_puzzle(Arc::new(ConstraintTopology::new(config)), &puzzle)
+    }
+
+    #[test]
+    fn stack_order_iterators_preserve_all_general_variant_suffixes() {
+        let classic = empty_grid(VariantConfig::default());
+        assert_eq!(
+            hidden_set_family_order(&classic, EngineConfig::default()).collect::<Vec<_>>(),
+            [0, 2, 1]
+        );
+        assert_eq!(
+            generalized_intersection_family_order(&classic).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(
+            locking_family_pairs(&classic).collect::<Vec<_>>(),
+            [(0, 2), (0, 1), (2, 0), (1, 0)]
+        );
+
+        let every_region = empty_grid(VariantConfig {
+            disjoint_groups: true,
+            windows: true,
+            sudoku_x: true,
+            girandola: true,
+            asterisk: true,
+            center_dot: true,
+            ..VariantConfig::default()
+        });
+        assert_eq!(
+            hidden_set_family_order(&every_region, EngineConfig::default()).collect::<Vec<_>>(),
+            [0, 2, 1, 3, 4, 5, 6, 7, 8, 9]
+        );
+        assert_eq!(
+            generalized_intersection_family_order(&every_region).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        );
+        assert_eq!(
+            locking_family_pairs(&every_region).collect::<Vec<_>>(),
+            [
+                (0, 2),
+                (0, 1),
+                (2, 0),
+                (1, 0),
+                (3, 2),
+                (3, 1),
+                (2, 3),
+                (1, 3),
+                (0, 3),
+                (3, 0),
+                (4, 2),
+                (4, 1),
+                (2, 4),
+                (1, 4),
+                (0, 4),
+                (4, 0),
+                (4, 3),
+                (3, 4),
+            ]
+        );
+        assert_eq!(
+            hidden_set_family_order(
+                &every_region,
+                EngineConfig {
+                    variant_latin: true,
+                    ..EngineConfig::default()
+                },
+            )
+            .collect::<Vec<_>>(),
+            [0, 2, 1]
+        );
+    }
 
     #[test]
     fn alone_cell_precedes_hidden_position() {
@@ -845,6 +1087,39 @@ mod tests {
     }
 
     #[test]
+    fn se121_direct_locking_visits_regions_before_digits() {
+        let values = Puzzle::parse(&".".repeat(81)).unwrap();
+        let mut display = ['.'; 729];
+        for (cell, value) in [
+            (0, 2),
+            (9, 2),
+            (27, 2),
+            (28, 2),
+            (3, 1),
+            (12, 1),
+            (30, 1),
+            (31, 1),
+        ] {
+            display[cell * 9 + value - 1] = char::from(b'0' + value as u8);
+        }
+        let candidates = Puzzle::parse(&display.iter().collect::<String>()).unwrap();
+        let grid = Grid::from_snapshot(
+            Arc::new(ConstraintTopology::new(VariantConfig::default())),
+            &values,
+            &candidates,
+        )
+        .unwrap();
+
+        let later = find_direct_locking(&grid).unwrap();
+        assert_eq!(later.placement_cell().unwrap().raw(), 31);
+        assert_eq!(later.placement_digit().unwrap().get(), 1);
+
+        let se121 = find_direct_locking_se121(&grid).unwrap();
+        assert_eq!(se121.placement_cell().unwrap().raw(), 28);
+        assert_eq!(se121.placement_digit().unwrap().get(), 2);
+    }
+
+    #[test]
     fn direct_claiming_is_classified_from_the_primary_family() {
         let values = Puzzle::parse(&".".repeat(81)).unwrap();
         let mut display = ['.'; 729];
@@ -909,6 +1184,42 @@ mod tests {
                     .contains(sukaku_forge_core::Digit::new(1).unwrap())
             );
         }
+    }
+
+    #[test]
+    fn se121_locking_visits_regions_before_digits() {
+        let values = Puzzle::parse(&".".repeat(81)).unwrap();
+        let mut display = ['.'; 729];
+        for (cell, value) in [(0, 2), (9, 2), (27, 2), (3, 1), (12, 1), (30, 1)] {
+            display[cell * 9 + value - 1] = char::from(b'0' + value as u8);
+        }
+        let candidates = Puzzle::parse(&display.iter().collect::<String>()).unwrap();
+        let grid = Grid::from_snapshot(
+            Arc::new(ConstraintTopology::new(VariantConfig::default())),
+            &values,
+            &candidates,
+        )
+        .unwrap();
+
+        let later = find_locking(&grid).unwrap();
+        let Evidence::Locking {
+            digit: later_digit, ..
+        } = later.evidence()
+        else {
+            panic!("ordinary Locking evidence");
+        };
+        assert_eq!(later_digit.get(), 1);
+        assert_eq!(later.removals().iter().next().unwrap().cell().raw(), 30);
+
+        let se121 = find_locking_se121(&grid).unwrap();
+        let Evidence::Locking {
+            digit: se121_digit, ..
+        } = se121.evidence()
+        else {
+            panic!("SE 1.2.1 Locking evidence");
+        };
+        assert_eq!(se121_digit.get(), 2);
+        assert_eq!(se121.removals().iter().next().unwrap().cell().raw(), 27);
     }
 
     #[test]
