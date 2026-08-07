@@ -75,9 +75,10 @@ on fixtures where the old oracle is stable.
 
 ## Usage
 
-Version tags attach the portable rater builds to the same
+GUI version tags (`v<version>`) attach the portable rater builds to the same
 [GitHub Release](https://github.com/SlowLarry/sukaku-forge/releases) as the
-desktop packages:
+desktop packages. Rater-only milestones use `rater-v<version>` and publish the
+same portable archives without rebuilding a functionally unchanged GUI:
 
 - `sukaku-forge-rate-<version>-x86_64-pc-windows-msvc.zip`;
 - `sukaku-forge-rate-<version>-x86_64-unknown-linux-musl.tar.gz`, containing a

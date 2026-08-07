@@ -15,13 +15,15 @@ Web UI deployment target: [slowlarry.github.io/sukaku-forge](https://slowlarry.g
 
 Windows `.exe` and `.msi` packages are built by the
 [Windows desktop workflow](https://github.com/SlowLarry/sukaku-forge/actions/workflows/windows-desktop.yml).
-Version tags publish GitHub Releases after the tagged desktop build and
-headless-rater validation succeed. Current development packages are unsigned
-and may trigger a Windows SmartScreen warning.
+GUI version tags (`v<version>`) publish combined GitHub Releases after the
+tagged desktop build and headless-rater validation succeed. Rater-only tags
+(`rater-v<version>`) publish only the portable command-line archives when a
+milestone has no GUI functionality changes. Current development packages are
+unsigned and may trigger a Windows SmartScreen warning.
 
-The same versioned [GitHub Release](https://github.com/SlowLarry/sukaku-forge/releases)
-also carries portable fast-rater archives for Windows x64 MSVC and static Linux
-x64 musl, plus a SHA-256 checksum file.
+Relevant versioned [GitHub Releases](https://github.com/SlowLarry/sukaku-forge/releases)
+carry portable fast-rater archives for Windows x64 MSVC and static Linux x64
+musl, plus a SHA-256 checksum file.
 
 ## Fast Classic rater
 
