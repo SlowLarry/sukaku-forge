@@ -22,6 +22,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # Override the repository's moving `stable` toolchain file so the target
+  # installed below and every Cargo command use the same release compiler.
+  RUSTUP_TOOLCHAIN: 1.97.1
+
 concurrency:
   group: fast-classic-rater-release-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || inputs.tag }}
   cancel-in-progress: false
@@ -284,6 +289,12 @@ jobs:
         with:
           toolchain: 1.97.1
           targets: ${{ matrix.target }}
+
+      - name: Verify Rust target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target list --installed | grep -Fx '${{ matrix.target }}'
 
       - name: Install musl linker
         if: matrix.target == 'x86_64-unknown-linux-musl'
