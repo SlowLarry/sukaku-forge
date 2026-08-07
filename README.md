@@ -14,8 +14,13 @@ Web UI deployment target: [slowlarry.github.io/sukaku-forge](https://slowlarry.g
 
 Windows `.exe` and `.msi` packages are built by the
 [Windows desktop workflow](https://github.com/SlowLarry/sukaku-forge/actions/workflows/windows-desktop.yml).
-Version tags create draft GitHub Releases. Current development packages are
-unsigned and may trigger a Windows SmartScreen warning.
+Version tags publish GitHub Releases after the tagged desktop build and
+headless-rater validation succeed. Current development packages are unsigned
+and may trigger a Windows SmartScreen warning.
+
+The same versioned [GitHub Release](https://github.com/SlowLarry/sukaku-forge/releases)
+also carries portable fast-rater archives for Windows x64 MSVC and static Linux
+x64 musl, plus a SHA-256 checksum file.
 
 ## Fast Classic rater
 
@@ -31,6 +36,9 @@ target/rater/sukaku-forge-rate PUZZLE81
 make build-rater-native
 target/rater-native/rater/sukaku-forge-rate < puzzles.txt
 ```
+
+`build-rater-native` uses `target-cpu=native`; its host-specific output is for
+local use and is not distributed in releases.
 
 Unique Loops and BUG are disabled by default because they assume a unique
 solution. Add `--allow-uniqueness` only for puzzles known to have one.

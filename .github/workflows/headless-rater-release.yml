@@ -1,0 +1,800 @@
+name: Fast Classic rater release
+
+on:
+  workflow_run:
+    workflows:
+      - Windows desktop
+    types:
+      - completed
+  workflow_call:
+    inputs:
+      tag:
+        description: Existing SemVer release tag to build and publish
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing SemVer release tag to build and publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fast-classic-rater-release-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate release target
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
+      release_id: ${{ steps.release.outputs.release_id }}
+
+    steps:
+      - name: Validate tag, commit, and release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_API_URL: ${{ github.api_url }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          WORKFLOW_RUN_TAG: ${{ github.event.workflow_run.head_branch }}
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          event_name = os.environ["EVENT_NAME"]
+          if event_name == "workflow_run":
+              tag = os.environ.get("WORKFLOW_RUN_TAG", "")
+              expected_sha = os.environ.get("WORKFLOW_RUN_SHA", "").lower()
+          else:
+              tag = os.environ.get("INPUT_TAG", "")
+              expected_sha = ""
+
+          semver = re.compile(
+              r"^v(0|[1-9][0-9]*)\."
+              r"(0|[1-9][0-9]*)\."
+              r"(0|[1-9][0-9]*)"
+              r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+              r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+          )
+          if not semver.fullmatch(tag):
+              raise SystemExit(f"release tag is not valid v-prefixed SemVer: {tag!r}")
+          version_without_build = tag[1:].split("+", 1)[0]
+          if "-" in version_without_build:
+              prerelease = version_without_build.split("-", 1)[1]
+              if any(
+                  identifier.isdigit()
+                  and len(identifier) > 1
+                  and identifier.startswith("0")
+                  for identifier in prerelease.split(".")
+              ):
+                  raise SystemExit(
+                      "numeric SemVer prerelease identifiers must not have leading zeroes"
+                  )
+          if expected_sha and not re.fullmatch(r"[0-9a-f]{40}", expected_sha):
+              raise SystemExit("workflow_run did not provide a full commit SHA")
+
+          api_url = os.environ["GH_API_URL"].rstrip("/")
+          repository = os.environ["GH_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+
+          def api(path):
+              request = urllib.request.Request(
+                  f"{api_url}{path}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "sukaku-forge-rater-release",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as error:
+                  detail = error.read().decode("utf-8", "replace")
+                  raise SystemExit(
+                      f"GitHub API request failed ({error.code}) for {path}: {detail}"
+                  ) from error
+
+          encoded_tag = urllib.parse.quote(tag, safe="")
+          reference = api(f"/repos/{repository}/git/ref/tags/{encoded_tag}")
+          if reference.get("ref") != f"refs/tags/{tag}":
+              raise SystemExit("GitHub returned a different tag reference")
+
+          target = reference.get("object", {})
+          visited = set()
+          while target.get("type") == "tag":
+              object_sha = str(target.get("sha", "")).lower()
+              if not re.fullmatch(r"[0-9a-f]{40}", object_sha) or object_sha in visited:
+                  raise SystemExit("tag object chain is invalid or cyclic")
+              visited.add(object_sha)
+              if len(visited) > 10:
+                  raise SystemExit("tag object chain is unexpectedly deep")
+              target = api(f"/repos/{repository}/git/tags/{object_sha}").get("object", {})
+
+          sha = str(target.get("sha", "")).lower()
+          if target.get("type") != "commit" or not re.fullmatch(r"[0-9a-f]{40}", sha):
+              raise SystemExit("release tag does not dereference to a commit")
+          if expected_sha and sha != expected_sha:
+              raise SystemExit(
+                  f"tag {tag} resolves to {sha}, not successful Windows build {expected_sha}"
+              )
+
+          matching_releases = []
+          page = 1
+          while True:
+              releases = api(
+                  f"/repos/{repository}/releases?per_page=100&page={page}"
+              )
+              if not isinstance(releases, list):
+                  raise SystemExit("GitHub returned an invalid release list")
+              matching_releases.extend(
+                  release for release in releases if release.get("tag_name") == tag
+              )
+              if len(releases) < 100:
+                  break
+              page += 1
+          if len(matching_releases) != 1:
+              raise SystemExit(
+                  f"expected exactly one draft or public release for {tag}, "
+                  f"found {len(matching_releases)}"
+              )
+          release = matching_releases[0]
+          if release.get("draft") and event_name != "workflow_run":
+              raise SystemExit(
+                  "manual and reusable invocations cannot publish a draft release; "
+                  "wait for the successful Windows workflow_run path"
+              )
+          release_id = release.get("id")
+          if not isinstance(release_id, int) or release_id <= 0:
+              raise SystemExit("release does not have a valid numeric ID")
+
+          output_path = os.environ["GITHUB_OUTPUT"]
+          with open(output_path, "a", encoding="utf-8") as output:
+              output.write(f"tag={tag}\n")
+              output.write(f"version={tag[1:]}\n")
+              output.write(f"sha={sha}\n")
+              output.write(f"release_id={release_id}\n")
+          PY
+
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.release.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify source version
+        env:
+          EXPECTED_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          python3 <<'PY'
+          import os
+          import tomllib
+
+          with open("Cargo.toml", "rb") as manifest:
+              cargo = tomllib.load(manifest)
+          actual = cargo["workspace"]["package"]["version"]
+          expected = os.environ["EXPECTED_VERSION"]
+          if actual != expected:
+              raise SystemExit(
+                  f"workspace version {actual!r} does not match release version {expected!r}"
+              )
+          PY
+
+  validate:
+    name: Validate focused rater
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run focused Clippy gate
+        run: >-
+          cargo clippy --locked
+          --package sukaku-forge-core
+          --package sukaku-forge-engine
+          --package sukaku-forge-classic-rater
+          --all-targets -- -D warnings
+
+      - name: Run focused tests
+        run: >-
+          cargo test --locked
+          --package sukaku-forge-core
+          --package sukaku-forge-engine
+          --package sukaku-forge-classic-rater
+          --all-targets
+
+      - name: Test benchmark and oracle policy scripts
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: >-
+          python3 -m unittest
+          scripts/test_benchmark_classic_rater.py
+          scripts/test_verify_se121_oracle.py
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/rater/sukaku-forge-rate.exe
+            artifact: fast-classic-rater-windows-msvc
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary: target/x86_64-unknown-linux-musl/rater/sukaku-forge-rate
+            artifact: fast-classic-rater-linux-musl
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+
+      - name: Install musl linker
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+          musl-gcc --version
+
+      - name: Build portable optimized rater
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          if [[ "$target" == 'x86_64-unknown-linux-musl' ]]; then
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+          fi
+          cargo build --locked --profile rater \
+            --target "$target" \
+            --package sukaku-forge-classic-rater \
+            --bin sukaku-forge-rate
+
+      - name: Smoke-test release binary
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
+          RATER_BINARY: ${{ matrix.binary }}
+        run: |
+          set -euo pipefail
+          solved=123456789456789123789123456214365897365897214897214365531642978642978531978531642
+          bug=1.3.5..8...67.9.2.............3....7.6.......8...14..55316...7......8....7....6..
+          run_rater() {
+            "$RATER_BINARY" "$@" | tr -d '\r'
+          }
+          test "$(run_rater --version)" = "sukaku-forge-rate $EXPECTED_VERSION"
+          test "$(run_rater "$solved")" = "0.0/0.0/0.0"
+          test "$(run_rater "$bug")" = "7.1/1.2/1.2"
+          test "$(run_rater --allow-uniqueness "$bug")" = "5.7/1.2/1.2"
+
+      - name: Verify static Linux binary
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        env:
+          RATER_BINARY: ${{ matrix.binary }}
+        run: |
+          set -euo pipefail
+          file "$RATER_BINARY"
+          if readelf -l "$RATER_BINARY" | grep -q 'INTERP'; then
+            echo "Linux release binary unexpectedly contains a dynamic interpreter" >&2
+            exit 1
+          fi
+          if ldd "$RATER_BINARY" 2>&1 | grep -Evq 'not a dynamic executable|statically linked'; then
+            echo "Linux release binary unexpectedly has dynamic dependencies" >&2
+            ldd "$RATER_BINARY" || true
+            exit 1
+          fi
+
+      - name: Package Windows rater
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        env:
+          RATER_BINARY: ${{ matrix.binary }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rootName = "sukaku-forge-rate-$env:VERSION-$env:TARGET"
+          $stage = Join-Path $env:RUNNER_TEMP $rootName
+          $asset = "$rootName.zip"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item $env:RATER_BINARY (Join-Path $stage 'sukaku-forge-rate.exe')
+          Copy-Item 'LICENSE' (Join-Path $stage 'LICENSE')
+          Copy-Item 'docs/CLASSIC_RATER.md' (Join-Path $stage 'CLASSIC_RATER.md')
+          New-Item -ItemType Directory -Path 'dist' | Out-Null
+          Compress-Archive -Path $stage -DestinationPath (Join-Path 'dist' $asset)
+
+      - name: Package Linux rater
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        env:
+          RATER_BINARY: ${{ matrix.binary }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          root_name="sukaku-forge-rate-$VERSION-$TARGET"
+          stage="$RUNNER_TEMP/$root_name"
+          asset="$root_name.tar.gz"
+          mkdir -p "$stage" dist
+          install -m 0755 "$RATER_BINARY" "$stage/sukaku-forge-rate"
+          install -m 0644 LICENSE "$stage/LICENSE"
+          install -m 0644 docs/CLASSIC_RATER.md "$stage/CLASSIC_RATER.md"
+          tar -C "$RUNNER_TEMP" -czf "dist/$asset" "$root_name"
+
+      - name: Upload packaged rater
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Attach raters to GitHub release
+    needs:
+      - prepare
+      - validate
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packaged raters
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: fast-classic-rater-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          windows="sukaku-forge-rate-$VERSION-x86_64-pc-windows-msvc.zip"
+          linux="sukaku-forge-rate-$VERSION-x86_64-unknown-linux-musl.tar.gz"
+          checksums="sukaku-forge-rate-$VERSION-SHA256SUMS.txt"
+          cd dist
+          test -f "$windows"
+          test -f "$linux"
+          sha256sum "$windows" "$linux" > "$checksums"
+
+      - name: Validate and update exact release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_API_URL: ${{ github.api_url }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+        run: |
+          python3 <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          repository = os.environ["GH_REPOSITORY"]
+          api_url = os.environ["GH_API_URL"].rstrip("/")
+          server_url = os.environ["GH_SERVER_URL"].rstrip("/")
+          token = os.environ["GH_TOKEN"]
+          tag = os.environ["RELEASE_TAG"]
+          version = os.environ["RELEASE_VERSION"]
+          expected_sha = os.environ["RELEASE_SHA"].lower()
+          release_id_text = os.environ["RELEASE_ID"]
+
+          if not re.fullmatch(
+              r"v(0|[1-9][0-9]*)\."
+              r"(0|[1-9][0-9]*)\."
+              r"(0|[1-9][0-9]*)"
+              r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+              r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
+              tag,
+          ):
+              raise SystemExit("validated release tag was unexpectedly malformed")
+          version_without_build = tag[1:].split("+", 1)[0]
+          if "-" in version_without_build:
+              prerelease = version_without_build.split("-", 1)[1]
+              if any(
+                  identifier.isdigit()
+                  and len(identifier) > 1
+                  and identifier.startswith("0")
+                  for identifier in prerelease.split(".")
+              ):
+                  raise SystemExit("validated release tag is not strict SemVer")
+          if version != tag[1:]:
+              raise SystemExit("validated version no longer matches release tag")
+          if not re.fullmatch(r"[0-9a-f]{40}", expected_sha):
+              raise SystemExit("validated release commit is malformed")
+          if not release_id_text.isdigit() or int(release_id_text) <= 0:
+              raise SystemExit("validated release ID is malformed")
+          expected_release_id = int(release_id_text)
+
+          base_headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "sukaku-forge-rater-release",
+          }
+
+          def request_json(url, *, method="GET", payload=None):
+              data = None
+              headers = dict(base_headers)
+              if payload is not None:
+                  data = json.dumps(payload).encode("utf-8")
+                  headers["Content-Type"] = "application/json"
+              request = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(request) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as error:
+                  detail = error.read().decode("utf-8", "replace")
+                  raise SystemExit(
+                      f"GitHub API request failed ({error.code}) for {url}: {detail}"
+                  ) from error
+
+          def sha256_stream(stream):
+              digest = hashlib.sha256()
+              while chunk := stream.read(1024 * 1024):
+                  digest.update(chunk)
+              return digest.hexdigest()
+
+          def sha256_file(path):
+              with path.open("rb") as stream:
+                  return sha256_stream(stream)
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+                  return None
+
+          no_redirect = urllib.request.build_opener(NoRedirect)
+
+          def download_asset_sha256(asset):
+              asset_id = asset.get("id")
+              if type(asset_id) is not int or asset_id <= 0:
+                  raise SystemExit("release asset has an invalid numeric ID")
+              asset_url = (
+                  f"{api_url}/repos/{repository}/releases/assets/{asset_id}"
+              )
+              if asset.get("url") != asset_url:
+                  raise SystemExit("release asset returned an unexpected API URL")
+
+              headers = dict(base_headers)
+              headers["Accept"] = "application/octet-stream"
+              request = urllib.request.Request(asset_url, headers=headers)
+              redirect_url = None
+              try:
+                  response = no_redirect.open(request)
+              except urllib.error.HTTPError as error:
+                  if error.code not in (301, 302, 303, 307, 308):
+                      detail = error.read().decode("utf-8", "replace")
+                      raise SystemExit(
+                          f"asset download failed ({error.code}) for {asset_url}: {detail}"
+                      ) from error
+                  redirect_url = error.headers.get("Location")
+              else:
+                  with response:
+                      return sha256_stream(response)
+
+              parsed = urllib.parse.urlparse(redirect_url or "")
+              if parsed.scheme != "https" or not parsed.hostname:
+                  raise SystemExit("asset API returned an unsafe download redirect")
+              unsigned_request = urllib.request.Request(
+                  redirect_url,
+                  headers={"User-Agent": "sukaku-forge-rater-release"},
+              )
+              try:
+                  with urllib.request.urlopen(unsigned_request) as response:
+                      return sha256_stream(response)
+              except urllib.error.HTTPError as error:
+                  detail = error.read().decode("utf-8", "replace")
+                  raise SystemExit(
+                      f"asset redirect download failed ({error.code}): {detail}"
+                  ) from error
+
+          def list_release_assets():
+              result = []
+              page = 1
+              while True:
+                  assets_url = (
+                      f"{api_url}/repos/{repository}/releases/{expected_release_id}/assets"
+                      f"?per_page=100&page={page}"
+                  )
+                  page_assets = request_json(assets_url)
+                  if not isinstance(page_assets, list):
+                      raise SystemExit("GitHub returned an invalid release asset list")
+                  result.extend(page_assets)
+                  if len(page_assets) < 100:
+                      return result
+                  page += 1
+
+          encoded_tag = urllib.parse.quote(tag, safe="")
+          ref_url = f"{api_url}/repos/{repository}/git/ref/tags/{encoded_tag}"
+          reference = request_json(ref_url)
+          if reference.get("ref") != f"refs/tags/{tag}":
+              raise SystemExit("tag reference changed after validation")
+          target = reference.get("object", {})
+          visited = set()
+          while target.get("type") == "tag":
+              object_sha = str(target.get("sha", "")).lower()
+              if not re.fullmatch(r"[0-9a-f]{40}", object_sha) or object_sha in visited:
+                  raise SystemExit("tag object chain changed or became invalid")
+              visited.add(object_sha)
+              if len(visited) > 10:
+                  raise SystemExit("tag object chain is unexpectedly deep")
+              tag_url = f"{api_url}/repos/{repository}/git/tags/{object_sha}"
+              target = request_json(tag_url).get("object", {})
+          if target.get("type") != "commit" or target.get("sha", "").lower() != expected_sha:
+              raise SystemExit("release tag moved after the binaries were built")
+
+          release_url = (
+              f"{api_url}/repos/{repository}/releases/{expected_release_id}"
+          )
+          release = request_json(release_url)
+          if release.get("id") != expected_release_id or release.get("tag_name") != tag:
+              raise SystemExit("exact release changed after validation")
+
+          windows = f"sukaku-forge-rate-{version}-x86_64-pc-windows-msvc.zip"
+          linux = f"sukaku-forge-rate-{version}-x86_64-unknown-linux-musl.tar.gz"
+          checksums = f"sukaku-forge-rate-{version}-SHA256SUMS.txt"
+          asset_descriptions = [
+              (windows, "application/zip"),
+              (linux, "application/gzip"),
+              (checksums, "text/plain; charset=utf-8"),
+          ]
+          dist = pathlib.Path("dist")
+          expected_paths = {dist / name for name, _ in asset_descriptions}
+          actual_paths = {path for path in dist.iterdir() if path.is_file()}
+          if actual_paths != expected_paths:
+              raise SystemExit(
+                  "downloaded release files do not exactly match expected assets: "
+                  f"expected {sorted(map(str, expected_paths))}, "
+                  f"found {sorted(map(str, actual_paths))}"
+              )
+
+          local_assets = {}
+          for name, content_type in asset_descriptions:
+              path = dist / name
+              local_assets[name] = {
+                  "content_type": content_type,
+                  "path": path,
+                  "size": path.stat().st_size,
+                  "sha256": sha256_file(path),
+              }
+
+          def matching_assets_by_name(remote_assets):
+              matches = {}
+              for asset in remote_assets:
+                  name = str(asset.get("name", ""))
+                  if name not in local_assets:
+                      continue
+                  if name in matches:
+                      raise SystemExit(
+                          f"release contains multiple assets named {name}; refusing to continue"
+                      )
+                  matches[name] = asset
+              return matches
+
+          def verify_remote_asset(name, remote):
+              local = local_assets[name]
+              if remote.get("name") != name:
+                  raise SystemExit(f"GitHub returned the wrong release asset for {name}")
+              if remote.get("state") != "uploaded":
+                  raise SystemExit(f"release asset {name} is not in the uploaded state")
+              if type(remote.get("size")) is not int or remote["size"] != local["size"]:
+                  raise SystemExit(
+                      f"release asset {name} has size {remote.get('size')}, "
+                      f"expected {local['size']}"
+                  )
+
+              remote_digest = remote.get("digest")
+              if remote_digest is None:
+                  actual_sha256 = download_asset_sha256(remote)
+              else:
+                  if not isinstance(remote_digest, str) or not re.fullmatch(
+                      r"sha256:[0-9a-fA-F]{64}", remote_digest
+                  ):
+                      raise SystemExit(
+                          f"release asset {name} returned an unsupported digest"
+                      )
+                  actual_sha256 = remote_digest.split(":", 1)[1].lower()
+              if actual_sha256 != local["sha256"]:
+                  raise SystemExit(
+                      f"release asset {name} has SHA-256 {actual_sha256}, "
+                      f"expected {local['sha256']}"
+                  )
+
+          def delete_starter_asset(name, remote):
+              asset_id = remote.get("id")
+              if type(asset_id) is not int or asset_id <= 0:
+                  raise SystemExit(f"starter asset {name} has an invalid numeric ID")
+              asset_url = (
+                  f"{api_url}/repos/{repository}/releases/assets/{asset_id}"
+              )
+              if remote.get("url") != asset_url:
+                  raise SystemExit(f"starter asset {name} returned an unexpected API URL")
+              request = urllib.request.Request(
+                  asset_url,
+                  headers=base_headers,
+                  method="DELETE",
+              )
+              try:
+                  with urllib.request.urlopen(request) as response:
+                      if response.status != 204:
+                          raise SystemExit(
+                              f"deleting starter asset {name} returned HTTP "
+                              f"{response.status}, expected 204"
+                          )
+              except urllib.error.HTTPError as error:
+                  detail = error.read().decode("utf-8", "replace")
+                  raise SystemExit(
+                      f"deleting starter asset {name} failed ({error.code}): {detail}"
+                  ) from error
+              print(f"Deleted incomplete starter release asset {name}")
+
+          upload_base = str(release.get("upload_url", "")).split("{", 1)[0]
+          expected_upload_base = (
+              f"https://uploads.github.com/repos/{repository}/releases/"
+              f"{expected_release_id}/assets"
+          )
+          if upload_base != expected_upload_base:
+              raise SystemExit("exact release returned an unexpected asset upload URL")
+
+          existing_assets = matching_assets_by_name(list_release_assets())
+          starter_names = {
+              name
+              for name, remote in existing_assets.items()
+              if remote.get("state") == "starter"
+          }
+          for name in sorted(starter_names):
+              delete_starter_asset(name, existing_assets[name])
+          if starter_names:
+              existing_assets = matching_assets_by_name(list_release_assets())
+              remaining_starters = sorted(starter_names & set(existing_assets))
+              if remaining_starters:
+                  raise SystemExit(
+                      "starter assets still exist after deletion: "
+                      + ", ".join(remaining_starters)
+                  )
+          for name, local in local_assets.items():
+              if name in existing_assets:
+                  verify_remote_asset(name, existing_assets[name])
+                  print(f"Keeping identical existing release asset {name}")
+                  continue
+
+              path = local["path"]
+              upload_url = f"{upload_base}?name={urllib.parse.quote(name, safe='')}"
+              headers = dict(base_headers)
+              headers["Content-Type"] = local["content_type"]
+              headers["Content-Length"] = str(local["size"])
+              request = urllib.request.Request(
+                  upload_url,
+                  data=path.read_bytes(),
+                  headers=headers,
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(request) as response:
+                      uploaded = json.load(response)
+              except urllib.error.HTTPError as error:
+                  detail = error.read().decode("utf-8", "replace")
+                  raise SystemExit(
+                      f"asset upload failed ({error.code}) for {name}: {detail}"
+                  ) from error
+              verify_remote_asset(name, uploaded)
+
+          final_assets = matching_assets_by_name(list_release_assets())
+          missing_assets = sorted(set(local_assets) - set(final_assets))
+          if missing_assets:
+              raise SystemExit(
+                  "release is missing expected assets after upload: "
+                  + ", ".join(missing_assets)
+              )
+          for name in local_assets:
+              verify_remote_asset(name, final_assets[name])
+
+          release = request_json(release_url)
+          if release.get("id") != expected_release_id or release.get("tag_name") != tag:
+              raise SystemExit("exact release changed before publication")
+
+          marker = "<!-- sukaku-forge-fast-classic-rater -->"
+          body = release.get("body") or ""
+          marker_count = body.count(marker)
+          if marker_count > 1:
+              raise SystemExit("release body contains the Fast Classic rater marker twice")
+          if marker_count == 0:
+              section = (
+                  f"{marker}\n"
+                  "## Fast Classic rater\n\n"
+                  "Portable command-line builds for rating ordinary 9×9 Classic Sudoku "
+                  "are attached for Windows x64 (MSVC) and Linux x64 (static musl), "
+                  "together with SHA-256 checksums.\n\n"
+                  "Uniqueness-dependent techniques are disabled by default. Pass "
+                  "`--allow-uniqueness` only for puzzles known to have exactly one "
+                  "solution. These release assets use the portable fat-LTO `rater` "
+                  "profile; `make build-rater-native` remains available for maximum "
+                  "local CPU tuning."
+              )
+              body = f"{body.rstrip()}\n\n{section.strip()}\n" if body.strip() else f"{section.strip()}\n"
+
+          update_url = f"{api_url}/repos/{repository}/releases/{expected_release_id}"
+          updated = request_json(
+              update_url,
+              method="PATCH",
+              payload={"body": body, "draft": False},
+          )
+          if (
+              updated.get("id") != expected_release_id
+              or updated.get("tag_name") != tag
+              or updated.get("draft")
+              or (updated.get("body") or "").count(marker) != 1
+          ):
+              raise SystemExit("release update did not publish the exact release")
+          print(f"Published Fast Classic rater assets to {server_url}/{repository}/releases/tag/{tag}")
+          PY

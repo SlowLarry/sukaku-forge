@@ -22,9 +22,9 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 
-# Maximum-throughput local build for the dedicated rating-only binary. Keep
-# portable releases on Cargo's normal `release` profile; host CPU tuning is an
-# explicit Make target so benchmark results cannot accidentally mix the two.
+# Maximum-throughput portable profile for the dedicated rating-only binary.
+# Host CPU tuning is an explicit Make target so benchmark results and release
+# artifacts cannot accidentally mix portable and native builds.
 [profile.rater]
 inherits = "release"
 opt-level = 3

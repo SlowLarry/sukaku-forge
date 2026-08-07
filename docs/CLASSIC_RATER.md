@@ -73,6 +73,17 @@ on fixtures where the old oracle is stable.
 
 ## Usage
 
+Version tags attach the portable rater builds to the same
+[GitHub Release](https://github.com/SlowLarry/sukaku-forge/releases) as the
+desktop packages:
+
+- `sukaku-forge-rate-<version>-x86_64-pc-windows-msvc.zip`;
+- `sukaku-forge-rate-<version>-x86_64-unknown-linux-musl.tar.gz`, containing a
+  statically linked Linux x64 binary;
+- `sukaku-forge-rate-<version>-SHA256SUMS.txt`, covering both archives.
+
+Each archive includes the executable, `LICENSE` and this usage document.
+
 Build the portable maximum-optimization profile:
 
 ```sh
@@ -84,6 +95,10 @@ Or build for the current host CPU:
 ```sh
 make build-rater-native
 ```
+
+The native target sets `target-cpu=native` and may use instructions available
+only on the build host. It is intended for local rating and benchmarks, never
+for release distribution.
 
 The binary accepts one positional 81-character grid or a batch of nonempty
 stdin lines. `.` and `0` are empty cells. Its default output uses serate's
